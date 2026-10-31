@@ -287,6 +287,75 @@ fn valid_switch_repoints_active_through_the_blocking_task() {
     );
 }
 
+/// G82 (guest ledger): in guest mode the global `switch_profile` tool reaches
+/// `switch_profile_noninteractive`'s guest refusal, so it answers a tool error
+/// carrying the guest sentence and upstream's global files stay
+/// byte-identical: the live link, `~/.claude/settings.json` and
+/// `~/.claude.json`, and the recorded active profile does not move. The same
+/// seed switches cleanly outside guest mode
+/// (`valid_switch_repoints_active_through_the_blocking_task`), so the refusal
+/// is the gate.
+#[test]
+fn a_guest_mode_switch_refuses_and_leaves_the_global_files_byte_identical() {
+    let home = HomeSandbox::new();
+    seed_active_plus_target();
+    let claude = claude_dir().expect("claude dir");
+    let live = claude.join(".credentials.json");
+    let settings = claude.join("settings.json");
+    let claude_json = home.home().join(".claude.json");
+    std::fs::write(&settings, br#"{"env":{"KEEP":"1"}}"#).expect("seed settings.json");
+    std::fs::write(
+        &claude_json,
+        br#"{"oauthAccount":{"emailAddress":"op@example.com"}}"#,
+    )
+    .expect("seed .claude.json");
+    let snapshot = || {
+        (
+            std::fs::read_link(&live).ok(),
+            std::fs::read(&settings).ok(),
+            std::fs::read(&claude_json).ok(),
+        )
+    };
+    let before = snapshot();
+    assert!(
+        before.0.is_some(),
+        "fixture control: the live link is in place"
+    );
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage ~/.clauth for guest mode");
+    assert!(crate::identity::upstream_active(), "fixture reads as guest");
+
+    let result = call_switch("target");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a guest-mode global switch is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("switch reply text");
+    assert!(
+        text.contains(crate::identity::GUEST_REFUSAL),
+        "the reply carries the guest refusal: {text}"
+    );
+    assert_eq!(
+        snapshot(),
+        before,
+        "in guest mode upstream's global files stay byte-identical"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile
+            .as_deref(),
+        Some("active"),
+        "in guest mode the recorded active profile does not move"
+    );
+}
+
 // ── `session`: one live session, not the global link (hot-swap spec §2.3) ───
 
 mod session_form {
@@ -614,6 +683,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &crate::profile::ProfileName::from("target"),
+            &crate::testutil::profile_id("target"),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {
@@ -628,6 +698,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login mid-refresh");
@@ -656,7 +727,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
     let prose = text.split("\n\n").next().expect("prose paragraph");
     assert_eq!(
         prose,
-        "'target' login changed during its refresh and the new login expires soon · retry in a \
+        "'target' login changed during its refresh and the new login expires soon. Retry in a \
          moment; active profile `active`: 5h unknown, 7d unknown"
     );
 }

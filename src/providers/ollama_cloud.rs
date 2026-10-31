@@ -255,11 +255,13 @@ pub(crate) fn parse_usage(body: &str) -> Result<ThirdPartyStats, ThirdPartyError
                 resets_at: None,
                 used: None,
                 total: None,
+                inference_quota: false,
             }),
             None => rows.push(StatRow {
                 label: (*label).to_string(),
                 value: NOT_REPORTED.to_string(),
                 kind: StatRowKind::Faint,
+                raw: None,
             }),
         }
         if *label == LABEL_MONTH && w.pct.is_some_and(|p| p >= 100.0) {
@@ -267,6 +269,7 @@ pub(crate) fn parse_usage(body: &str) -> Result<ThirdPartyStats, ThirdPartyError
                 label: INCLUDED_USED_UP.to_string(),
                 value: INCLUDED_USED_UP_DETAIL.to_string(),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
     }
@@ -275,6 +278,7 @@ pub(crate) fn parse_usage(body: &str) -> Result<ThirdPartyStats, ThirdPartyError
             label: "resets".to_string(),
             value: "no reset time from API".to_string(),
             kind: StatRowKind::Faint,
+            raw: None,
         });
     }
 
@@ -291,12 +295,14 @@ pub(crate) fn parse_usage(body: &str) -> Result<ThirdPartyStats, ThirdPartyError
             label: format!("{label}{REQUESTS_SUFFIX}"),
             value: String::new(),
             kind: StatRowKind::Heading,
+            raw: None,
         });
         for (name, count) in &w.models {
             rows.push(StatRow {
                 label: name.clone(),
                 value: format!("{count}{REQUESTS_SUFFIX}"),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
     }
@@ -367,6 +373,7 @@ fn spend_rows(activity: &serde_json::Map<String, Value>) -> Vec<StatRow> {
         label,
         value: format!("{} USD", cost.as_str()),
         kind: StatRowKind::Body,
+        raw: None,
     }];
     let bound = |key: &str| {
         period
@@ -380,6 +387,7 @@ fn spend_rows(activity: &serde_json::Map<String, Value>) -> Vec<StatRow> {
             label: PERIOD_LABEL.to_string(),
             value: format!("{start}{PERIOD_SEP}{end}"),
             kind: StatRowKind::Faint,
+            raw: None,
         });
     }
     rows
@@ -394,6 +402,7 @@ pub(super) fn daemon_stats() -> ThirdPartyStats {
         label: String::new(),
         value: DAEMON_NEEDS_KEY.to_string(),
         kind: StatRowKind::Faint,
+        raw: None,
     }])
 }
 

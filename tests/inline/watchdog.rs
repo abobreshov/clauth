@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Inline tests for `crate::watchdog` — the event filter, the watch's survival
 //! of the rename every tollgate write publishes through, the two loop properties
 //! (cooldown measured from the reconcile's END, a cooled-down wake deferred
@@ -821,8 +822,9 @@ fn the_watched_list_names_both_spellings_when_they_differ() {
     let real = tmp.path().join("real");
     std::fs::create_dir_all(&real).expect("mkdir real");
     // Resolved, or the "resolves to itself" half is untrue wherever TMPDIR is
-    // itself symlinked, as on every macOS run.
-    let real = std::fs::canonicalize(&real).expect("realpath");
+    // itself symlinked, as on every macOS run; plain, as a user names a dir on
+    // Windows, where std's resolved form is `\\?\` verbatim.
+    let real = crate::testutil::plain_path(&real);
 
     // Gated for want of `std::os::unix::fs::symlink`, not because the rule is
     // unix-only. Ungated it is E0433 on windows, and a test module that cannot

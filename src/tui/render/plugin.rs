@@ -19,7 +19,7 @@
 //! than carrying a scrollbar — see [`delegate_lines`].
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -43,7 +43,7 @@ use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
 use crate::usage::humanize_duration;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let rows = delegate_cells(&app.plugin.delegates, crate::usage::now_ms());
     let [top, delegates] = Layout::vertical([
         Constraint::Min(MASTER_MIN),
@@ -54,7 +54,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (selector, detail) = master_detail(top, app.plugin.row_count());
 
     draw_selector(frame, selector, app);
-    draw_detail(frame, detail, app);
+    draw_detail(frame, detail, app, toast_rects);
     draw_delegates(frame, delegates, &rows);
 }
 
@@ -267,7 +267,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
 
 // ── Right panel: selected-row detail ────────────────────────────────────────────
 
-fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let focused = app.plugin.focus == PluginFocus::Detail;
 
     // Title + body for the selected check. Labels are lowercase prose, so they
@@ -318,7 +318,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_check()
         .is_some_and(|c| c.label == "herdr")
     {
-        draw_herdr_detail(frame, inner, app, lines);
+        draw_herdr_detail(frame, inner, app, lines, toast_rects);
         return;
     }
 
@@ -347,7 +347,13 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// `draw_scrolled_lines` shape, so the prose scrolls to follow the cursor
 /// rather than holding a manual offset. The section header underlines while
 /// focus rests on one of its rows.
-fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: Vec<Line<'static>>) {
+fn draw_herdr_detail(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &App,
+    mut lines: Vec<Line<'static>>,
+    toast_rects: &[Rect],
+) {
     let focused = app.plugin.focus == PluginFocus::Detail && !app.plugin.diagnostic_focus;
 
     lines.push(Line::from(""));
@@ -358,7 +364,7 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
     lines.push(Line::from(Span::styled("OPTIONS", section_style)));
 
     let settings = app.config().state.herdr.clone();
-    let editing = app.plugin.herdr_tag_draft.as_ref();
+    let editing = app.plugin.herdr_tag_draft.as_ref().map(|d| &d.input);
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.
@@ -437,7 +443,11 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+        super::panes::place_caret(
+            frame,
+            toast_rects,
+            Position::new(cx, inner.y.saturating_add(visible as u16)),
+        );
     }
 }
 
@@ -486,7 +496,11 @@ fn option_row(
         HerdrOption::TagRefresh => match editing {
             Some(input) => {
                 let invalid = parse_herdr_tag_secs(input.trimmed()).is_none();
-                spans.extend(value_caret(input, invalid));
+                spans.extend(value_caret(
+                    input,
+                    invalid,
+                    width.saturating_sub(row.label().len() + 6),
+                ));
                 let unit_style = if invalid {
                     theme::danger()
                 } else {
@@ -829,10 +843,10 @@ fn delegate_cells(stored: &[StoredJob], now: u64) -> Vec<DelegateCells> {
 }
 
 /// Render untrusted path and account text as visible terminal-safe escapes.
-fn escape_control(s: &str) -> String {
+pub(crate) fn escape_control(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+            if c.is_control() || crate::format::reorders_display(c) {
                 format!("\\u{{{:x}}}", c as u32)
             } else {
                 c.to_string()

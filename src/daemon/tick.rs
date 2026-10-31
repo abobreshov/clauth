@@ -15,8 +15,7 @@ use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::logline::logline;
 use crate::profile::{ProfileName, load_config, reload_fingerprint};
 use crate::usage::{
-    PendingSwitchTarget, collect_third_party_entries, collect_tokens, current_key_rejected_names,
-    is_idle, now_ms, queued_switch_away_is_stale,
+    PendingSwitchTarget, current_key_rejected_names, is_idle, now_ms, queued_switch_away_is_stale,
 };
 
 use super::{SwitchBackoff, active_diverged_unsaved, switch_backoff_ms};
@@ -54,14 +53,37 @@ impl super::Daemon {
         // heartbeat in time. The gates below skip the next drain once the
         // window or this deadline is spent.
         let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
+        // Safety net: a forget noted without an immediate drain still lands
+        // before this tick's status write; the per-site drains keep this a
+        // no-op.
+        self.apply_forgets();
         self.reload_if_changed();
+        // A dead-login record moves with no config change, cleared by the
+        // process that fetches usage or removed by hand, so the reload seed
+        // never sees it; the TUI runs the same pass.
+        crate::usage::sync_dead_logins(
+            &self.config,
+            &self.third_party_broken,
+            &mut self.dead_login_stats,
+        );
         self.log_day_claim_notices();
+        #[cfg(target_os = "macos")]
+        {
+            if self
+                .bare_item_scan_ticks
+                .is_multiple_of(super::BARE_ITEM_SCAN_EVERY_TICKS)
+            {
+                crate::claude::correct_bare_keychain_item_detached();
+            }
+            self.bare_item_scan_ticks = self.bare_item_scan_ticks.wrapping_add(1);
+        }
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
         }
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch_off();
         }
+        self.reconcile_background_holds();
         self.write_status();
         // Monitoring-only sources (`monitors.toml`): fetch the due ones on a
         // detached thread, so a slow provider never holds the tick.
@@ -69,9 +91,17 @@ impl super::Daemon {
         // Hermes homes' `state.db` ledgers, the same detached shape: at most
         // one read per profile a minute, `sqlite3` only (hermes spec §4.6).
         crate::usage::hermes_local::refresh_detached();
-        // Converge a broken plugin registration in the background. The gate is two
-        // registry reads inline and a needed heal runs detached (throttled inside
-        // `heal_detached`), so this never blocks the run loop.
+        // Honour a strip the switch-time strip deferred (its sync lock was held)
+        // with no live `tollgate start` wrapper to reconcile it. Try-once: never
+        // parks this tick behind a held sync lock, and no ranked lock is held
+        // here, so entering the JsonSync rank is legal. Guest mode is gated
+        // inside the honour (`claude_json::honor_pending_strip`, G19): the
+        // target, `~/.claude.json`, is upstream clauth's there.
+        crate::claude_json::try_honor_pending_strip();
+        // Converge a broken plugin registration in the background. The gate is
+        // agentgear's spawn-free pre-check (file reads, no `claude` spawn), and a
+        // needed heal runs detached (throttled inside `heal_detached`), so this
+        // never blocks the run loop.
         crate::plugin_host::heal_detached();
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`. Its saved
@@ -84,6 +114,25 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+    }
+
+    /// Hand this tick's background-tree work to the hold worker: adopt every
+    /// configured account's fixed `runtime-bg` whose tree a Claude Code job
+    /// names, and every handed-off `--with-fallback` per-launch tree a job
+    /// names; release every hold no job names any more.
+    ///
+    /// This reads the job store and a config snapshot and returns; the blocking
+    /// half — the rotation lock, the state flock, the tree build — runs on the
+    /// worker. A tick that waited for it here would spend the run loop's
+    /// watchdog budget on another process's lock.
+    fn reconcile_background_holds(&mut self) {
+        let Ok(cfg) = self.config.lock() else {
+            return;
+        };
+        let names: Vec<ProfileName> = cfg.profiles.iter().map(|p| p.name.clone()).collect();
+        let stale_env_keys = crate::actions::outgoing_env_keys(&cfg);
+        drop(cfg);
+        self.background.reconcile(names, stale_env_keys);
     }
 
     /// Log once, per day and per config change, what today's day lists are
@@ -154,11 +203,20 @@ impl super::Daemon {
     /// switch or a reload). Drops the `config` guard before taking the token
     /// lists — `TOKENS` is outer of `CONFIG`, so folding them inverts lock order.
     fn rebuild_tokens(&self) {
+        // Snapshot under the config guard, then read each profile's anchor +
+        // stored token off disk AFTER it drops — the anchor read must not widen
+        // the config-lock hold.
+        let (seeds, third_party) = {
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            let cfg = self.config.lock().expect("config poisoned");
+            (
+                crate::usage::collect_token_seeds(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        let tokens = crate::usage::build_token_entries(seeds);
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
-            let tokens = collect_tokens(&self.config.lock().expect("config poisoned"));
-            let third_party =
-                collect_third_party_entries(&self.config.lock().expect("config poisoned").profiles);
             *self.usage_tokens.lock().expect("usage_tokens poisoned") = tokens;
             *self
                 .third_party_tokens
@@ -175,19 +233,68 @@ impl super::Daemon {
         if current == self.last_reload_fp {
             return;
         }
-        self.last_reload_fp = current;
         match load_config() {
             Ok(new_config) => {
                 self.refresh_interval
                     .store(new_config.state.refresh_interval_ms, Ordering::Relaxed);
+                let profile_names: Vec<ProfileName> =
+                    new_config.profiles.iter().map(|p| p.name.clone()).collect();
+                let mut probes_off = Vec::new();
                 if let Ok(mut c) = self.config.lock() {
+                    probes_off = crate::usage::probes_switched_off(&c, &new_config);
                     *c = new_config;
                 }
+                // The reload re-read disk, so it adopts the fingerprint it just
+                // re-read. The token list is rebuilt BEFORE the compare's
+                // forget (the epoch bump): a partition landing between the two
+                // must clone the REBUILT entry, never the old entry under a
+                // post-bump epoch — that pairing stamps cadence for the old
+                // credential and delays the new login's first fetch. The
+                // reverse window, a partition between the rebuild and the
+                // compare while the snapshot half still holds the old identity,
+                // drops the rebuilt entry as stale for one tick; it self-heals
+                // on the next compare, never a wrong reading.
                 self.rebuild_tokens();
-                logline!("tollgate daemon: reloaded config after an external change");
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                self.dead_login_stats.clear();
+                // A probe switched off elsewhere leaves the account as a
+                // restart shows it. After the compare, since its forget
+                // re-seeds the reading from disk.
+                for name in &probes_off {
+                    crate::usage::forget_probe_reading(&self.memory_stores(), name);
+                }
+                self.last_reload_fp = current;
+                self.last_reload_error = None;
+                logline!("tollgate daemon: reloaded config");
             }
-            Err(e) => logline!("tollgate daemon: config reload failed: {e}"),
+            Err(e) => {
+                // The load failed, so the token list cannot rebuild. Still run
+                // the compare against the still-current config: it applies this
+                // process's pending forgets. An anchored copy-back leaves its
+                // stale entry (the identity compare reads clean because the
+                // anchor did not move), so that entry keeps fetching with its
+                // old token until a reload succeeds.
+                let profile_names: Vec<ProfileName> = self
+                    .config
+                    .lock()
+                    .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default();
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                // Keep the last-good fingerprint, so every tick retries the
+                // load until one succeeds, a repair that keeps the broken
+                // write's mtime included. The failure logs once per distinct
+                // text; re-reading the same broken write every tick must not
+                // re-log.
+                let text = e.to_string();
+                if self.last_reload_error.as_deref() != Some(text.as_str()) {
+                    logline!("tollgate daemon: config reload failed: {e}");
+                    self.last_reload_error = Some(text);
+                }
+            }
         }
+        // Either arm, after its forget: a verdict another process recorded
+        // since the last seed reaches the walks, against the config in force.
+        crate::usage::seed_dead_logins(&self.config, &self.third_party_broken);
     }
 
     /// Execute the queued switch. Drains the target set atomically and attempts
@@ -238,6 +345,35 @@ impl super::Daemon {
             return;
         }
 
+        // The drain re-reads the target's login ON DISK, lock-free — the
+        // in-memory `Profile` is stale until the next reload, and a login
+        // deleted out-of-process after the enqueue must still stop the link.
+        // `stored_login` answers through the same three facts as
+        // `Profile::holds_login`, off the committed store, never the state
+        // flock. Only the PROVEN-none outcome drops (linking it would install
+        // an empty login into the global slot); an unreadable store — one that
+        // exists but cannot be read or parsed — defers through the backoff
+        // below, and the give-up marks the member skipped until its store reads
+        // again, never linking on a guess.
+        let stored = crate::profile::stored_login(&target);
+        let unreadable = match stored {
+            crate::profile::StoredLogin::HoldsNone => {
+                logline!(
+                    "tollgate daemon: dropping queued switch to '{target}': it has no login or api key"
+                );
+                if self
+                    .switch_backoff
+                    .as_ref()
+                    .is_some_and(|b| b.target == target.as_str())
+                {
+                    self.switch_backoff = None;
+                }
+                return;
+            }
+            crate::profile::StoredLogin::HoldsLogin => false,
+            crate::profile::StoredLogin::Unknown => true,
+        };
+
         // Backoff gate: if this target is inside its backoff window from a prior
         // failure, re-queue without attempting or logging — this is what turns a
         // stuck switch's 1/tick retry+log storm into a spaced, deduped one. The
@@ -248,10 +384,32 @@ impl super::Daemon {
             && b.target == target.as_str()
         {
             if now >= b.retry_until {
-                logline!(
-                    "tollgate daemon: gave up switching to '{target}': {}",
-                    b.reason
-                );
+                if unreadable {
+                    // The give-up line is the only trace of why the member
+                    // leaves the walk, so it names the unreadable store whatever
+                    // the last deferral was.
+                    let last = if b.reason == crate::format::STORED_LOGIN_UNREADABLE {
+                        String::new()
+                    } else {
+                        format!(" (last deferral: {})", b.reason)
+                    };
+                    logline!(
+                        "tollgate daemon: gave up switching to '{target}': {}{last}; skipping it until it reads again",
+                        crate::format::STORED_LOGIN_UNREADABLE
+                    );
+                    self.mark_skipped_unreadable(&target);
+                } else if b.reason.is_empty() {
+                    // Only quiet waits deferred it (a bare-item lookup).
+                    logline!(
+                        "tollgate daemon: gave up switching to '{target}' (tollgate could not look \
+                         up whose login the macOS Keychain holds in time)"
+                    );
+                } else {
+                    logline!(
+                        "tollgate daemon: gave up switching to '{target}' (last deferral: {})",
+                        b.reason
+                    );
+                }
                 self.switch_backoff = None;
                 return;
             }
@@ -259,6 +417,16 @@ impl super::Daemon {
                 self.requeue_quiet(&decision);
                 return;
             }
+        }
+
+        // AFTER the backoff gate: a pass inside `not_before` re-queues quietly
+        // above. The first two retries are immediate (`switch_backoff_ms(1..=2)`
+        // is 0, so three consecutive drains each reach this defer), and only past
+        // that does the widening gap make it fire once per fresh retry, never once
+        // per tick.
+        if unreadable {
+            self.fail_switch(&decision, now, crate::format::STORED_LOGIN_UNREADABLE);
+            return;
         }
 
         // Still mid-fetch/rotation — switching now would race the worker on the
@@ -290,21 +458,56 @@ impl super::Daemon {
             return;
         }
 
+        // Above the AUTH-1 gate: when the target owns the bare item's login,
+        // the gate would refresh the target's consumed predecessor and
+        // quarantine it, while the settle saves the live successor into it
+        // first. Off the loop: a `/profile` lookup it needs runs on a worker,
+        // and the switch defers quietly until it answers. A refusal defers
+        // like any other failure, retried inside the backoff window.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::Switch,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("tollgate daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => {
+                self.defer_switch_quietly(&decision, now);
+                return;
+            }
+            Err(e) => {
+                self.fail_switch(&decision, now, &format!("{e:#}"));
+                return;
+            }
+        };
+
         // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
         // target before install; a revoked token is quarantined (`auth_broken`) and
         // dropped — retrying can't help until `tollgate login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
+        //
+        // The spend is claimed inside the gate, under the rotation lock, right
+        // before the POST: a stop signal that lands while the gate is parked on
+        // the lock refuses the spend (the gate answers `Stopping`) and the
+        // switch stays queued rather than failing.
         match crate::oauth::ensure_installable_from_main_loop(
             &self.config,
             &target,
             crate::oauth::refresh_result,
+            Some((&self.activity, &self.shutting_down)),
         ) {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
+            crate::oauth::AuthGate::Stopping => {
+                self.requeue_quiet(&decision);
+                return;
+            }
             crate::oauth::AuthGate::Broken => {
-                // The gate persisted `auth_broken`; adopt that fingerprint so the
-                // next tick's reload doesn't treat our own write as external.
-                // Terminal failure (drop, not retry) — clear any backoff.
-                self.last_reload_fp = reload_fingerprint();
+                // Terminal failure (drop, not retry) — clear any backoff. The
+                // quarantine write is left unadopted: the next tick's reload
+                // re-reads disk and rebuilds the token list with the flag.
                 logline!(
                     "tollgate daemon: {}",
                     crate::format::login_expired(&target).line()
@@ -325,12 +528,10 @@ impl super::Daemon {
             }
         }
 
-        // Hold the state flock across the switch AND the post-write fingerprint
-        // read, so an external write can't slip into the save→read window and be
-        // adopted as our own (the :354 self-adoption gap). The config guard is
-        // taken FIRST (Config ranks outer of the state flock — the order
-        // `lockorder` asserts), held across the switch, and dropped before the
-        // republish below so its disk sweep runs under no config guard.
+        // The config guard is taken FIRST (Config ranks outer of the state
+        // flock — the order `lockorder` asserts), held across the switch, and
+        // dropped before the republish below so its disk sweep runs under no
+        // config guard.
         let broken_snapshot: HashMap<String, u64> = self
             .third_party_broken
             .lock()
@@ -379,14 +580,23 @@ impl super::Daemon {
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
                 let changed = switch_profile_locked(&mut cfg, &target)?;
-                // Read while we still hold the flock, per the comment above.
-                Ok((reload_fingerprint(), returning, changed))
+                Ok((returning, changed))
             })
         };
         match result {
-            Ok((fp, returning, changed)) => {
+            Ok((returning, changed)) => {
+                // Strip AFTER the flock: the strip try-onces the .claude.json
+                // sync lock, ranked OUTSIDE the state flock, so it must never
+                // run under the hold above, and a strip it cannot take is
+                // deferred to the next reconcile (never a tick wait).
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
-                self.last_reload_fp = fp;
+                // Drain the switch's own forgets. The write is left unadopted:
+                // the next tick's reload re-reads disk, so a copy-back that
+                // landed on another profile is picked up instead of swallowed.
+                self.apply_forgets();
                 self.switch_backoff = None;
                 let reason = decision
                     .reason
@@ -407,17 +617,21 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
+                // Apply so a half-switched capture does not leave the old
+                // reading in the daemon's stores.
+                self.apply_forgets();
                 self.fail_switch(&decision, now, &format!("switch failed: {e}"));
             }
         }
     }
 
-    /// Handle a switch that couldn't execute (busy / diverged / transient / switch
-    /// error). Advances exponential backoff for this target, DEDUPS the failure
+    /// Handle a switch that couldn't execute (unreadable store / busy / diverged /
+    /// transient / switch error). Advances exponential backoff for this target, DEDUPS the failure
     /// log (emits only when the target or reason changes — a stuck switch never
-    /// logs 1/tick), and re-queues the decision until its retry window closes.
-    /// A change of target resets the backoff. The decision (target + cause) is
-    /// re-queued whole so a later repair still invalidates it at dispatch.
+    /// logs 1/tick), and re-queues the decision for the retry window the backoff
+    /// gate owns (the gate's give-up branch is the one that closes it). A change
+    /// of target resets the backoff. The decision (target + cause) is re-queued
+    /// whole so a later repair still invalidates it at dispatch.
     fn fail_switch(&mut self, decision: &PendingSwitchTarget, now: u64, reason: &str) {
         let target = decision.target.as_str();
         let (attempts, retry_until) = match &self.switch_backoff {
@@ -433,20 +647,35 @@ impl super::Daemon {
             logline!("tollgate daemon: deferring switch to '{target}': {reason}");
             self.switch_failure_logs += 1;
         }
-        if now < retry_until {
-            self.switch_backoff = Some(SwitchBackoff {
-                target: target.to_string(),
-                attempts,
-                not_before: now.saturating_add(switch_backoff_ms(attempts)),
-                reason: reason.to_string(),
-                retry_until,
-            });
-            self.requeue_quiet(decision);
-        } else {
-            // Retry window closed — give up and stop tracking this target.
-            logline!("tollgate daemon: gave up switching to '{target}': {reason}");
-            self.switch_backoff = None;
-        }
+        self.switch_backoff = Some(SwitchBackoff {
+            target: target.to_string(),
+            attempts,
+            not_before: now.saturating_add(switch_backoff_ms(attempts)),
+            reason: reason.to_string(),
+            retry_until,
+        });
+        self.requeue_quiet(decision);
+    }
+
+    /// [`Self::fail_switch`] for a wait that is no failure (a bare-item
+    /// lookup still running): the same backoff and retry window, logging
+    /// nothing and keeping the last reason a failure gave.
+    #[cfg(target_os = "macos")]
+    fn defer_switch_quietly(&mut self, decision: &PendingSwitchTarget, now: u64) {
+        let (attempts, retry_until, reason) = match &self.switch_backoff {
+            Some(b) if b.target == decision.target => {
+                (b.attempts + 1, b.retry_until, b.reason.clone())
+            }
+            _ => (1, now.saturating_add(SWITCH_RETRY_TTL_MS), String::new()),
+        };
+        self.switch_backoff = Some(SwitchBackoff {
+            target: decision.target.clone(),
+            attempts,
+            not_before: now.saturating_add(switch_backoff_ms(attempts)),
+            reason,
+            retry_until,
+        });
+        self.requeue_quiet(decision);
     }
 
     /// Re-queue a retry decision. A NEWER target that arrived since the drain
@@ -457,6 +686,15 @@ impl super::Daemon {
             && q.is_empty()
         {
             q.insert(decision.clone());
+        }
+    }
+
+    /// Mark a member whose stored login stays unreadable as skipped, so the
+    /// auto-switch walk passes over it until the scan's lock-free re-read drops
+    /// the name. In-memory only, never persisted.
+    fn mark_skipped_unreadable(&self, target: &crate::profile::ProfileName) {
+        if let Ok(mut s) = self.skipped_unreadable.lock() {
+            s.insert(target.as_str().to_string());
         }
     }
 
@@ -484,6 +722,26 @@ impl super::Daemon {
             );
             return;
         }
+        // Settled before the guard and the flock, off the loop, as in
+        // `drain_pending_switch`. A pending lookup or a refusal drops this
+        // switch-off: the scheduler's next scan queues it again while the
+        // chain stays spent, and settles off the memoized lookup then.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::SignOut,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("tollgate daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => return,
+            Err(e) => {
+                logline!("tollgate daemon: switch-off failed: {e:#}");
+                return;
+            }
+        };
         // Same guard-then-flock shape as `drain_pending_switch`: the guard is
         // taken first, held across the locked switch-off, and dropped before
         // the gated republish below.
@@ -495,19 +753,29 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|_held| {
                 let changed = switch_off_locked(&mut cfg)?;
-                Ok((reload_fingerprint(), changed))
+                Ok(changed)
             })
         };
         match result {
-            Ok((fp, changed)) => {
+            Ok(changed) => {
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
-                self.last_reload_fp = fp;
+                // Drain the switch-off's own forgets; the write is left
+                // unadopted, so the next tick's reload re-reads disk.
+                self.apply_forgets();
                 logline!("tollgate daemon: switched off: all accounts spent");
                 if changed {
                     crate::daemon::publish_status(&self.config);
                 }
             }
-            Err(e) => logline!("tollgate daemon: switch-off failed: {e}"),
+            Err(e) => {
+                // Apply so the dropped login's reading does not survive in the
+                // daemon's stores.
+                self.apply_forgets();
+                logline!("tollgate daemon: switch-off failed: {e}");
+            }
         }
     }
 }

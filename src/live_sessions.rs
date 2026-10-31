@@ -16,9 +16,10 @@
 //!   and written after would silently revert whatever the other writer put there
 //!   in between.
 //! - **Field ownership is a type, not a comment.** The daemon reaches its two
-//!   fields through [`DaemonFields`] and the session its three through
-//!   [`SessionFields`]; neither view can name the other's. Each still stores the
-//!   whole freshly-loaded row, so writing one side preserves the other's.
+//!   fields through [`DaemonFields`] and the session its execution fields
+//!   through [`SessionFields`]; neither view can name the other's. Each
+//!   still stores the whole freshly-loaded row, so writing one side preserves
+//!   the other's.
 //!
 //! Liveness is the session's flock, exactly as for its runtime tree: a row is
 //! dead once the marker named by its own `start_profile` + `isolated` +
@@ -32,7 +33,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, atomic_write_600, mkdir_700, tollgate_dir};
-use crate::runtime::{SessionId, is_session_id};
+use crate::runtime::{LaunchTransport, SessionId, is_session_id};
+
+/// Who launched a session. The end user's own sessions — `tollgate start` and
+/// codex — are [`Launcher::Own`]; a one-shot headless run the tollgate MCP
+/// server spawned for a `delegate` request is [`Launcher::Delegate`]. Carried
+/// into registration the way `follows_chain` is, so the mark is on the row
+/// before any tally can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launcher {
+    Own,
+    Delegate,
+}
 
 /// One live session's row. Every field is written by exactly one of the two
 /// writers; which one is enforced by the mutator views, not by this listing.
@@ -40,10 +52,11 @@ use crate::runtime::{SessionId, is_session_id};
 pub(crate) struct LiveSession {
     pub(crate) session_id: String,
     pub(crate) start_profile: String,
-    /// Which harness's session this row describes. Liveness gating
-    /// (delete/disable/rotation) never reads a row — it reads the flock-held
-    /// markers, which a codex session stamps identically — and the tally keys
-    /// on the name, which one namespace keeps unambiguous; both stay
+    /// Which harness's session this row describes. Liveness gating reads the
+    /// flock-held markers under the profile's `sessions*` dirs, whichever
+    /// harness stamped them (the macOS rotation gate also reads each live
+    /// marker's row, but only `background_hold` and `launch_store`), and the
+    /// tally keys on the name, which one namespace keeps unambiguous; both stay
     /// harness-blind with no help from this field. The tag exists for the
     /// consumers that must tell rows APART: the swap executor and the
     /// daemon's per-session decision leg skip codex rows when those sessions
@@ -57,7 +70,23 @@ pub(crate) struct LiveSession {
     #[serde(default)]
     pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
+    /// The spawned `claude` child's pid, written by `tollgate start` once the
+    /// child exists, in the same update as `launch_families`. `None` until
+    /// then, and for a row written by a tollgate that predates the field (or a
+    /// delegate row): such a row carries neither field, so the scheduler can
+    /// join no spend-cap 429 to it and reads no launch demand off it, and no
+    /// credit-cap trigger moves it. `serde` omits the key when absent, so a
+    /// row the older tollgate wrote round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claude_pid: Option<u32>,
+    /// The launch demand's resolved model families, written by `tollgate start`
+    /// in the same update as `claude_pid`. `None` exactly when `claude_pid` is
+    /// (see there). `serde` omits the key when absent, so an older row
+    /// round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_families: Option<Vec<String>>,
     pub(crate) started_at: u64,
+    #[serde(serialize_with = "serialize_cwd_lossy")]
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) isolated: bool,
     /// Whether this session follows the shared fallback chain. Set once at
@@ -71,12 +100,44 @@ pub(crate) struct LiveSession {
     /// Daemon-owned: the member the decision leg wants this session on.
     #[serde(default)]
     pub(crate) intended_member: Option<String>,
+    /// Daemon-owned: whether `intended_member` was chosen for a credit-cap leave
+    /// (a credit-billed launch on a capped account, or the session's own
+    /// spend-cap 429) — the one leave that may land on a member whose `[models]`
+    /// differ. `serde(default)` keeps a row written by an older tollgate or a
+    /// manual `tollgate switch` reading false, so every such move keeps the
+    /// models-equal rule. Serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave: bool,
+    /// Session-owned: whether the `tollgate start` that launched this session
+    /// understands the credit-leave reason (a same-binary capability written in
+    /// the same update as `launch_families`). The daemon merges members whose
+    /// `[models]` differ only for rows carrying this flag: a session still
+    /// running an older binary reads `false` and keeps the strict chain, so a
+    /// relaxed intent is never written where its executor would refuse it.
+    /// `serde(default)` is the upgrade gate; serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave_aware: bool,
     /// Daemon-owned: this session's position in the shared `fallback_chain`.
     #[serde(default)]
     pub(crate) chain_cursor: Option<usize>,
     /// Session-owned: the member this session's credential link resolves to.
     #[serde(default)]
     pub(crate) current_member: Option<String>,
+    /// Session-owned: every member the session has run on, in visit order, the
+    /// launch member first. Seeded by [`LiveSession::starting`] with the launch
+    /// member. The swap executor appends the incoming member in its own row
+    /// update before the link moves, then relinks the tree at that member's
+    /// store, and only then writes [`current_member`](Self::current_member) in
+    /// a second row update whose failure is logged and not raised. A swap that
+    /// dies between the two updates, or whose `current_member` write fails,
+    /// leaves this list naming a member `current_member` does not.
+    /// The live Claude Code child keeps every refresh token it was ever handed,
+    /// so a handed-off row keeps EVERY member in this list live, not only the
+    /// one it runs on now. `serde(default)` is the upgrade gate (a row written
+    /// by a tollgate that predates the field reads empty), and an empty list
+    /// serializes absent so such a row round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) visited_members: Vec<String>,
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
@@ -134,6 +195,56 @@ pub(crate) struct LiveSession {
     /// never reads an older refusal as no answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) intended_at: Option<u64>,
+    /// The transport the session booted with, recorded on every claude row as the
+    /// exact value the executor snapshots, and `None` on codex rows (codex never
+    /// swaps through this executor). The daemon's per-session decision leg judges
+    /// members against it; a row written by an older tollgate carries `None`, and
+    /// the leg reconstructs the transport from the start profile as it reads now.
+    /// Holds a digest of the `[env]` map, never the map itself, so no env VALUE
+    /// (an inference credential may live there) is written to the row.
+    #[serde(default)]
+    pub(crate) boot_transport: Option<LaunchTransport>,
+    /// Whether this row is a delegate: a one-shot headless run the tollgate MCP
+    /// server spawned. Set once at registration and never mutated, so the first
+    /// read of the row already carries it — no tally reads a delegate row as an
+    /// own session first. `serde(default)` is the upgrade gate: a row written
+    /// by an older tollgate reads as own until that server restarts.
+    #[serde(default)]
+    pub(crate) is_delegate: bool,
+    /// Whether this row holds the account's fixed background pair
+    /// (`runtime-bg`/`sessions-bg`) rather than a per-session tree. Set once at
+    /// registration and never mutated; callers resolving the row's paths branch
+    /// on it (its marker and tree dirs are the pair's, not `<sid>`-keyed).
+    /// `serde(default)` is the upgrade gate: a row from an older tollgate is a
+    /// per-session row, which is what it was.
+    #[serde(default)]
+    pub(crate) background: bool,
+    /// Whether this row is the DAEMON's hold of a tree it adopted — the fixed
+    /// background pair, or a handed-off `--with-fallback` per-launch tree — as
+    /// opposed to a `tollgate start` launcher's row. The daemon holds a tree
+    /// exactly while a Claude Code job names it, so the macOS rotation gate's
+    /// marker term skips it and the job term decides the tree; the pid joins
+    /// skip it because the hold is not a pane's process. An adopted per-launch
+    /// row keeps `background` false, so it still resolves its per-session tree
+    /// and stays switchable. `serde(default)` is the upgrade gate.
+    #[serde(default)]
+    pub(crate) background_hold: bool,
+}
+
+/// Serializes [`LiveSession::cwd`] as its lossy UTF-8 form, so a session whose
+/// working directory is not UTF-8 still registers and lists (a row is JSON,
+/// which is UTF-8; the lossy form is all it can hold).
+fn serialize_cwd_lossy<S: serde::Serializer>(
+    cwd: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match cwd {
+        Some(path) => {
+            let lossy = path.to_string_lossy();
+            serializer.serialize_str(&lossy)
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Executor B's last refusal of an intended member.
@@ -148,25 +259,32 @@ pub(crate) struct SwapRefusal {
 impl LiveSession {
     /// A row for a session starting now. Pid, start time, and cwd are read here
     /// rather than passed in, so every registration reports them the same way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn starting(
         session_id: &SessionId,
         start_profile: &str,
         harness: crate::harness::Harness,
         isolated: bool,
         follows_chain: bool,
+        launcher: Launcher,
         launch_store: Option<PathBuf>,
+        boot_transport: Option<LaunchTransport>,
     ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
             start_profile: start_profile.to_string(),
             harness,
             pid: std::process::id(),
+            claude_pid: None,
+            launch_families: None,
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
             isolated,
             follows_chain,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store,
@@ -178,6 +296,11 @@ impl LiveSession {
             relaunch_capable: false,
             relaunched_from: None,
             intended_at: None,
+            boot_transport,
+            is_delegate: matches!(launcher, Launcher::Delegate),
+            background: false,
+            background_hold: false,
+            visited_members: vec![start_profile.to_string()],
         }
     }
 
@@ -225,6 +348,30 @@ impl LiveSession {
         self.relaunched_from = from;
         self
     }
+
+    /// Whether the session this row names still runs: `current_member` first
+    /// (where a swapped session holds its marker) then `start_profile` (where a
+    /// session that never moved lives). One predicate, so a row can never be
+    /// live for one consumer and dead for another.
+    pub(crate) fn marker_is_held(&self) -> bool {
+        let probe = crate::profile::ProfileName::from(
+            self.current_member
+                .as_deref()
+                .unwrap_or(&self.start_profile),
+        );
+        crate::runtime::session_row_is_live(&probe, self.isolated, &self.session_id)
+    }
+
+    /// Whether this row is the daemon's hold of the account's FIXED background
+    /// pair — the tree that exists while a Claude Code job names that account,
+    /// one hold however many jobs, and ends with the last one. It is no `tollgate
+    /// start` session, so counting it would put a phantom session on screen and
+    /// in the stop-shunt confirm. An adopted per-launch `--with-fallback` hold
+    /// keeps `background` false and counts as the one real session it is; a
+    /// launcher's own background row carries no hold flag at all.
+    fn is_fixed_background_hold(&self) -> bool {
+        self.background_hold && self.background
+    }
 }
 
 /// The daemon's view of a row under [`update_as_daemon`]: the decision fields
@@ -237,14 +384,21 @@ impl DaemonFields<'_> {
     }
 
     /// An operator's request: the intent plus when it was asked for
-    /// ([`LiveSession::intended_at`]).
+    /// ([`LiveSession::intended_at`]). A manual move is never a credit-cap
+    /// leave, so it clears `credit_leave` and keeps the models-equal rule
+    /// whatever the last daemon write recorded.
     pub(crate) fn request_member(&mut self, member: impl Into<String>) {
         self.0.intended_member = Some(member.into());
         self.0.intended_at = Some(crate::usage::now_ms());
+        self.0.credit_leave = false;
     }
 
     pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
         self.0.chain_cursor = Some(cursor);
+    }
+
+    pub(crate) fn set_credit_leave(&mut self, on: bool) {
+        self.0.credit_leave = on;
     }
 }
 
@@ -255,6 +409,25 @@ pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
 impl SessionFields<'_> {
     pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
         self.0.current_member = Some(member.into());
+    }
+
+    /// Append a member to the session's visit history, in visit order. A
+    /// re-visit does not duplicate. The swap executor calls this in the same
+    /// update as [`set_current_member`](Self::set_current_member), so the
+    /// history always contains the member the row names.
+    pub(crate) fn record_visited_member(&mut self, member: impl Into<String>) {
+        let member = member.into();
+        if !self.0.visited_members.contains(&member) {
+            self.0.visited_members.push(member);
+        }
+    }
+
+    /// Record that this session's launcher understands the credit-leave reason.
+    /// Written by `tollgate start` in the same update as `launch_families`; an
+    /// older launcher leaves the field absent, and the daemon reads that as
+    /// false.
+    pub(crate) fn set_credit_leave_aware(&mut self) {
+        self.0.credit_leave_aware = true;
     }
 
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
@@ -298,6 +471,32 @@ impl SessionFields<'_> {
     pub(crate) fn clear_swap_refusal(&mut self) {
         self.0.swap_refusal = None;
     }
+
+    /// Record the directory the session's child actually runs in. A delegate's
+    /// row is registered by the `tollgate mcp` that spawns it, whose cwd is the
+    /// server's, not the child's; the re-key that moves the pid onto the child
+    /// must move the cwd with it, or a surface reading the row (`GET /panes`,
+    /// `tollgate sessions --live`) reports where the server sat until the child's
+    /// own record names its dir.
+    pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.0.cwd = Some(cwd.into());
+    }
+
+    /// Record the spawned `claude` child's pid, once `tollgate start` has it. The
+    /// daemon's join of the session's own spend-cap 429 keys off this: it reads
+    /// the child's session record and matches its `sessionId` to a transcript
+    /// conversation id.
+    pub(crate) fn set_claude_pid(&mut self, pid: u32) {
+        self.0.claude_pid = Some(pid);
+    }
+
+    /// Record the launch demand's resolved families, written by `tollgate start`
+    /// beside `claude_pid`. The daemon's credit-billed leave check reads this,
+    /// never re-deriving the demand from today's config (the launch env and
+    /// args are gone by the time the daemon scans).
+    pub(crate) fn set_launch_families(&mut self, families: Vec<String>) {
+        self.0.launch_families = Some(families);
+    }
 }
 
 /// Live sessions tallied by the account each one is CURRENTLY running as.
@@ -309,7 +508,13 @@ impl SessionFields<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LiveTally {
     members: std::collections::BTreeMap<String, MemberSessions>,
-    /// Bare sessions whose credential link resolves to no enabled profile.
+    /// Delegate sessions across the fleet: one-shot headless runs the tollgate
+    /// MCP spawned. Split out for the header chip's own/delegates count; every
+    /// per-account surface keeps counting them inside `MemberSessions::sessions`.
+    delegates: usize,
+    /// Bare sessions whose credential link resolves to no enabled profile:
+    /// live, but on no account tollgate attributes them to, so they reach
+    /// [`LiveTally::total`] only.
     unattributed: usize,
     /// The registry or bare-marker directory could not be listed.
     unread: bool,
@@ -339,12 +544,11 @@ impl LiveTally {
     pub(crate) fn collect(config: &AppConfig) -> Self {
         let rows = read_registry();
         let unread = rows.is_none();
-        let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
-            let probe = crate::profile::ProfileName::from(
-                row.current_member.as_deref().unwrap_or(&row.start_profile),
-            );
-            crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
-        }));
+        let mut tally = Self::from_live_rows(
+            rows.unwrap_or_default()
+                .into_iter()
+                .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held()),
+        );
         tally.unread = unread;
         tally.add_bare_sessions(config);
         tally
@@ -393,7 +597,9 @@ impl LiveTally {
     fn from_live_rows(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
+        let mut delegates = 0;
         for row in rows {
+            delegates += usize::from(row.is_delegate);
             // The SERVED member: a B session committed elsewhere still sends
             // the previous member's key until its helper serves the commit.
             // Only a B row has an ack worth reading.
@@ -420,6 +626,7 @@ impl LiveTally {
         }
         Self {
             members: per_member,
+            delegates,
             unattributed: 0,
             unread: false,
         }
@@ -440,6 +647,7 @@ impl LiveTally {
 
     /// Every live session, including deleted accounts and unattributed bare ones.
     /// `None` when one of the directories it counts could not be listed.
+    #[cfg(test)]
     pub(crate) fn total(&self) -> Option<usize> {
         (!self.unread)
             .then(|| self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed)
@@ -452,9 +660,31 @@ impl LiveTally {
             ..Self::default()
         }
     }
+
+    /// Own (non-delegate) live sessions across the fleet: `tollgate start` and
+    /// codex rows plus bare sessions. `None` when a dir it counts from could
+    /// not be listed.
+    pub(crate) fn own(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(
+            self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed
+                - self.delegates,
+        )
+    }
+
+    /// Delegate live sessions across the fleet. `None` when a dir it counts
+    /// from could not be listed.
+    pub(crate) fn delegates(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(self.delegates)
+    }
 }
 
-fn registry_dir() -> Result<PathBuf> {
+pub(crate) fn registry_dir() -> Result<PathBuf> {
     Ok(tollgate_dir()?.join("live_sessions"))
 }
 
@@ -503,6 +733,20 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// unparseable file is skipped rather than failing the sweep.
 pub(crate) fn list() -> Vec<LiveSession> {
     read_registry().unwrap_or_default()
+}
+
+/// The running sessions' rows: drop the daemon's hold of the account's fixed
+/// background pair, which stands for no launch session, and every row whose
+/// marker is no longer held, so a stale row awaiting GC never reads as live
+/// here. An adopted per-launch `--with-fallback` hold is a real session and
+/// stays. `None` when the registry cannot be listed or located, an empty vec
+/// when no row is live.
+pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
+    read_registry().map(|rows| {
+        rows.into_iter()
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
+            .collect()
+    })
 }
 
 /// An absent registry is empty; an unlistable registry has no reading.
@@ -691,8 +935,12 @@ fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
     with_state_lock(|_held| {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("no live-session row for {session_id}"))?;
-        let mut row: LiveSession = serde_json::from_slice(&bytes)
-            .with_context(|| format!("unreadable live-session row for {session_id}"))?;
+        let mut row: LiveSession = serde_json::from_slice(&bytes).map_err(|e| {
+            crate::format::parse_refusal(
+                format!("unreadable live-session row for {session_id}"),
+                crate::format::json_parse_position(&e),
+            )
+        })?;
         edit(&mut row);
         write_row(&row)
     })

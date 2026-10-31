@@ -6,90 +6,111 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
-fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
+fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            check_credit_cap: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
+            provider: None,
+        },
+        Some(UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: five_hour_pct,
                 resets_at: None,
             }),
             ..UsageInfo::default()
         }),
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+    )
 }
 
-fn provider_profile(name: &str) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: Some("https://api.example.com".to_string()),
-        api_key: Some("key".to_string()),
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("key".to_string()),
+            auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            check_credit_cap: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
+            provider: None,
+        },
+        None,
+    )
 }
 
-fn app_with(profiles: Vec<Profile>, active: Option<&str>) -> App {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+fn app_with(profiles: Vec<(Profile, Option<UsageInfo>)>, active: Option<&str>) -> App {
+    let names: Vec<ProfileName> = profiles.iter().map(|(p, _)| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
             active_profile: active.map(Into::into),
             profiles: names,
             ..AppState::default()
         },
-        profiles,
+        profiles: profiles.iter().map(|(p, _)| p.clone()).collect(),
     };
-    App::new(config)
+    let app = App::new(config);
+    // Seed the OAuth store so the per-frame snapshot the header reads picks
+    // each profile's reading up.
+    let mut store = app.usage_store.lock().unwrap();
+    for (p, usage) in &profiles {
+        if let Some(info) = usage {
+            store.insert(p.name.to_string(), info.clone());
+        }
+    }
+    drop(store);
+    app
 }
 
 /// Renders only the header block (sized by `header_height`).
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     let height = header_height(app);
     let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, app);
+        super::draw(f, area, app, &readings);
     })
     .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
@@ -107,7 +128,7 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
 
 #[test]
 fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
-    let fit = gauge_fit(100, 8, true);
+    let fit = gauge_fit(100, 8, Some(42.0));
     assert_eq!(
         fit,
         GaugeFit {
@@ -120,7 +141,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
 
 #[test]
 fn gauge_fit_shrinks_bar_first_before_name() {
-    let fit = gauge_fit(23, 8, true);
+    let fit = gauge_fit(23, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must stay full while bar still shrinks");
     assert_eq!(fit.bar_cells, 7, "bar must shrink first");
     assert!(fit.visible);
@@ -128,7 +149,7 @@ fn gauge_fit_shrinks_bar_first_before_name() {
 
 #[test]
 fn gauge_fit_drops_bar_entirely_before_touching_name() {
-    let fit = gauge_fit(18, 8, true);
+    let fit = gauge_fit(18, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must not shrink after bar drops");
     assert_eq!(fit.bar_cells, 0, "bar must drop before name trims");
     assert!(fit.visible);
@@ -136,7 +157,7 @@ fn gauge_fit_drops_bar_entirely_before_touching_name() {
 
 #[test]
 fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(12, 8, true);
+    let fit = gauge_fit(12, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 7);
     assert!(fit.visible);
@@ -144,7 +165,7 @@ fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(7, 8, true);
+    let fit = gauge_fit(7, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 0);
     assert!(fit.visible, "the percent figure alone should still render");
@@ -152,13 +173,13 @@ fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_hides_entirely_below_the_percent_width() {
-    let fit = gauge_fit(3, 8, true);
+    let fit = gauge_fit(3, 8, Some(42.0));
     assert_eq!(fit, GaugeFit::HIDDEN);
 }
 
 #[test]
 fn gauge_fit_provider_profile_never_shows_a_bar() {
-    let roomy = gauge_fit(100, 10, false);
+    let roomy = gauge_fit(100, 10, None);
     assert_eq!(
         roomy,
         GaugeFit {
@@ -168,11 +189,11 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         }
     );
 
-    let tight = gauge_fit(9, 10, false);
+    let tight = gauge_fit(9, 10, None);
     assert_eq!(tight.bar_cells, 0);
     assert_eq!(tight.name_w, 8);
 
-    let dash_only = gauge_fit(1, 10, false);
+    let dash_only = gauge_fit(1, 10, None);
     assert_eq!(dash_only.name_w, 0);
     assert!(
         !dash_only.visible,
@@ -212,18 +233,18 @@ fn row1_is_the_live_count_the_gauge_and_the_status_indicator_when_wide() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
 
-    // At 120 the text column is 110 cells: `[ 0 live ] · ` is 13, the gauge's
-    // widest rung renders 25 (8 name + ` ` + `42%` + ` ` + 12 bracketed bar),
-    // the indicator 18, and the 54 cells between them are the elastic gap. The
-    // fit budgets the pct at 4 (`100%`), so at a two-digit figure one spare
-    // cell falls to the gap.
+    // At 120 the text column is 110 cells: `[ 0 live ]  [ — tok/s ] · ` is 26,
+    // the gauge's widest rung renders 25 (8 name + ` ` + `42%` + ` ` + 12
+    // bracketed bar), the indicator 18, and the 41 cells between them are the
+    // elastic gap. The fit budgets the pct at 4 (`100%`), so at a two-digit
+    // figure one spare cell falls to the gap.
     let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
-    let left: String = chars[..38].iter().collect();
-    let gap: String = chars[38..92].iter().collect();
+    let left: String = chars[..51].iter().collect();
+    let gap: String = chars[51..92].iter().collect();
     let dot: String = chars[92..].iter().collect();
     assert_eq!(
-        left, "[ 0 live ] · uwuclxdy 42% [████░░░░░░]",
-        "the live count, then the gauge, lead row 1"
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "the live count, the tok/s chip, then the gauge, lead row 1"
     );
     assert!(
         gap.chars().all(|c| c == ' '),
@@ -263,25 +284,22 @@ fn row1_gauge_for_a_provider_profile_carries_no_bar() {
     let mut app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
     app.tab = Tab::Tokens;
 
-    // 90 - 10 = 80 text cells; the count is 13 of them, the gauge 5 (`z.ai`
-    // plus its 1-cell trailing gap), the indicator 18.
+    // 90 - 10 = 80 text cells; the count is 10 of them, the tok/s chip 13 with
+    // its gap, the gauge 5 (`z.ai` plus its 1-cell trailing gap), the
+    // indicator 18.
     let row = row_content(&app, 90, 1);
-    let left: String = row.chars().take(17).collect();
+    let left: String = row.chars().take(30).collect();
     assert_eq!(
-        left, "[ 0 live ] · z.ai",
-        "the live count leads, then the gauge: the name alone"
+        left, "[ 0 live ]  [ — tok/s ] · z.ai",
+        "the live count and the tok/s chip lead, then the gauge: the name alone"
     );
-    let rest: String = row.chars().skip(17).collect();
-    let (gap, dot) = rest.split_at(80 - 17 - 18);
+    let rest: String = row.chars().skip(30).collect();
+    let (gap, dot) = rest.split_at(80 - 30 - 18);
     assert!(
         gap.chars().all(|c| c == ' '),
         "the elastic gap carries whitespace alone: {gap:?}"
     );
     assert_eq!(dot, "● status.claude.ai", "the indicator closes the row");
-    assert!(
-        !row.contains('—'),
-        "provider shows no dash when usage is absent"
-    );
     assert!(!row.contains('█'), "provider must not render a bar");
     assert!(!row.contains('%'), "provider must not render a percent");
 }
@@ -299,9 +317,12 @@ fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
     let mut no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
     no_active.tab = Tab::Tokens;
 
-    // (90 - 10) - 10 - 18 = 52: the count alone on the left, the indicator
-    // right-aligned.
-    let expected = format!("[ 0 live ]{}● status.claude.ai", " ".repeat(52));
+    // (90 - 10) - 23 - 18 = 39: the count and the tok/s chip on the left, the
+    // indicator right-aligned.
+    let expected = format!(
+        "[ 0 live ]  [ — tok/s ]{}● status.claude.ai",
+        " ".repeat(39)
+    );
     for (case, app) in [("compact", &compact), ("no active profile", &no_active)] {
         let rows = render_header_rows(app, 90);
         assert_eq!(rows.len(), 3);
@@ -394,7 +415,10 @@ fn row1_keeps_the_live_count_in_compact_mode() {
 
     assert_eq!(
         row_content(&app, 90, 1),
-        format!("[ 3 live ]{}● status.claude.ai", " ".repeat(52)),
+        format!(
+            "[ 3 live ]  [ — tok/s ]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
     );
 }
 
@@ -403,13 +427,13 @@ fn row1_leads_with_the_fleet_live_count_before_the_gauge() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_three_live(Tab::Tokens);
 
-    // 120 - 10 = 110 text cells: `[ 3 live ] · ` is 13, the gauge 25, the
-    // indicator 18, and the 54 cells between them are the elastic gap.
+    // 120 - 10 = 110 text cells: `[ 3 live ]  [ — tok/s ] · ` is 26, the gauge
+    // 25, the indicator 18, and the 41 cells between them are the elastic gap.
     assert_eq!(
         row_content(&app, 120, 1),
         format!(
-            "[ 3 live ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
-            " ".repeat(54)
+            "[ 3 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(41)
         ),
     );
 }
@@ -419,11 +443,14 @@ fn row1_carries_the_live_count_alone_where_no_gauge_renders() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_three_live(Tab::Overview);
 
-    // No gauge on the Overview: the count stands alone, with no separator
-    // left dangling after it. (90 - 10) - 10 - 18 = 52 cells of gap.
+    // No gauge on the Overview: the count and the tok/s chip stand alone.
+    // (90 - 10) - 23 - 18 = 39 cells of gap.
     assert_eq!(
         row_content(&app, 90, 1),
-        format!("[ 3 live ]{}● status.claude.ai", " ".repeat(52)),
+        format!(
+            "[ 3 live ]  [ — tok/s ]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
     );
 }
 
@@ -468,24 +495,28 @@ fn row1_shows_zero_live_so_the_gauge_holds_its_place() {
     }
 }
 
-/// The shed seam: gauge 25 + chip and separator 13 + indicator 18 + reserve 3
-/// = 59 text cells, so 69 is the narrowest width holding the chip, and at 68
-/// the chip goes whole with its ` · ` while the gauge keeps its full bar.
+/// The shed seam: the max gauge + suffix charge (39) + the live chip's split
+/// ceiling 16 + separator 3 + indicator 18 + reserve 3 = 79 text cells, so 89
+/// is the narrowest width holding the live chip, and at 88 the chip drops whole
+/// with its ` · ` while the gauge keeps its full bar.
 #[test]
 fn row1_sheds_the_live_count_before_the_gauge_or_the_indicator() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_three_live(Tab::Tokens);
 
     assert_eq!(
-        row_content(&app, 69, 1),
-        "[ 3 live ] · uwuclxdy 42% [████░░░░░░]   ● status.claude.ai",
+        row_content(&app, 89, 1),
+        format!(
+            "[ 3 live ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(23)
+        ),
         "at its own fit width the chip renders"
     );
     assert_eq!(
-        row_content(&app, 68, 1),
+        row_content(&app, 88, 1),
         format!(
             "uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
-            " ".repeat(15)
+            " ".repeat(35)
         ),
         "one column narrower the count drops whole, the gauge untouched"
     );
@@ -494,6 +525,17 @@ fn row1_sheds_the_live_count_before_the_gauge_or_the_indicator() {
 fn tally_of(n: usize) -> crate::live_sessions::LiveTally {
     crate::live_sessions::LiveTally::of(
         (0..n).map(|i| crate::testutil::live_row(&format!("4242-{i}"), "uwuclxdy")),
+    )
+}
+
+fn split_tally(own: usize, delegates: usize) -> crate::live_sessions::LiveTally {
+    crate::live_sessions::LiveTally::of(
+        (0..own)
+            .map(|i| crate::testutil::live_row(&format!("4242-{i}"), "uwuclxdy"))
+            .chain((0..delegates).map(|i| crate::live_sessions::LiveSession {
+                is_delegate: true,
+                ..crate::testutil::live_row(&format!("91{i}-0"), "uwuclxdy")
+            })),
     )
 }
 
@@ -516,19 +558,20 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
         let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
         let cell = |col: usize| &buf.content[120 + 10 + col];
         let text_of: String = (0..13).map(|c| cell(c).symbol().to_string()).collect();
-        assert_eq!(text_of, format!("[ {n} live ] · "), "{n}: the chip's text");
+        assert_eq!(text_of, format!("[ {n} live ]  ["), "{n}: the chip's text");
         for (col, role) in [
             (0, "open bracket"),
             (4, "unit"),
             (7, "unit"),
             (9, "close bracket"),
-            (11, "separator"),
+            // The ` · ` before the gauge moved past the tok/s chip.
+            (24, "separator"),
         ] {
             assert_eq!(cell(col).fg, dim, "{n}: the {role} renders TEXT_DIM");
             assert!(
@@ -545,12 +588,11 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
     }
 }
 
-/// The width hold: once the chip has read `10`, a drop to `9` keeps the
-/// two-digit width, the freed cell standing blank after the closing bracket,
-/// so the gauge's first cell stays in its column. A fresh app that never read
-/// two digits renders the one-digit chip tight.
+/// The chips sit exactly two cells apart at every count: once the chip has
+/// read `10`, a drop to `9` renders the one-digit chip tight, no blank cell
+/// held after its closing bracket, and the gauge moves left one cell.
 #[test]
-fn the_live_chip_holds_its_widest_width_so_the_gauge_stays_put() {
+fn the_live_chip_renders_tight_after_a_wider_count() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
@@ -558,41 +600,32 @@ fn the_live_chip_holds_its_widest_width_so_the_gauge_stays_put() {
     app.set_live_sessions(tally_of(10));
     let at_ten = row_content(&app, 120, 1);
     assert!(
-        at_ten.starts_with("[ 10 live ] · uwuclxdy 42% [████░░░░░░]"),
+        at_ten.starts_with("[ 10 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
         "ten: {at_ten:?}"
     );
 
     app.set_live_sessions(tally_of(9));
     let at_nine = row_content(&app, 120, 1);
     assert!(
-        at_nine.starts_with("[ 9 live ]  · uwuclxdy 42% [████░░░░░░]"),
-        "nine after ten keeps the two-digit width: {at_nine:?}"
+        at_nine.starts_with("[ 9 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "nine after ten renders tight: {at_nine:?}"
     );
     assert_eq!(
         at_ten.chars().position(|c| c == 'u'),
-        Some(14),
+        Some(27),
         "the gauge's first cell sits after the two-digit chip and its separator"
     );
     assert_eq!(
         at_nine.chars().position(|c| c == 'u'),
-        Some(14),
-        "the gauge's first cell holds its column across 10 → 9"
-    );
-
-    let mut fresh = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    fresh.tab = Tab::Tokens;
-    fresh.set_live_sessions(tally_of(9));
-    assert!(
-        row_content(&fresh, 120, 1).starts_with("[ 9 live ] · uwuclxdy"),
-        "a chip that never read two digits renders tight"
+        Some(26),
+        "the gauge follows the one-digit chip across 10 → 9"
     );
 }
 
-/// The hold is seeded at construction: a TUI opening onto ten live sessions
-/// holds the two-digit width before its first re-tally, so a drop to nine
-/// assigned straight onto the field (no setter to widen it) still pads.
+/// A TUI opening onto ten live sessions and then reading nine renders the
+/// one-digit chip tight: the construction tally holds no width either.
 #[test]
-fn the_live_chip_hold_is_seeded_from_the_first_tally() {
+fn the_live_chip_after_a_ten_count_construction_renders_tight() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut markers = Vec::new();
     for i in 0..10 {
@@ -607,17 +640,17 @@ fn the_live_chip_hold_is_seeded_from_the_first_tally() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     assert!(
-        row_content(&app, 120, 1).starts_with("[ 10 live ] · uwuclxdy"),
+        row_content(&app, 120, 1).starts_with("[ 10 live ]  [ — tok/s ] · uwuclxdy"),
         "the construction tally reads all ten"
     );
-    app.live_sessions = tally_of(9);
+    app.set_live_sessions(tally_of(9));
     assert!(
-        row_content(&app, 120, 1).starts_with("[ 9 live ]  · uwuclxdy"),
-        "the seeded hold keeps the two-digit width"
+        row_content(&app, 120, 1).starts_with("[ 9 live ]  [ — tok/s ] · uwuclxdy"),
+        "nine after a ten-count construction renders tight"
     );
 }
 
-/// A count wider than the hold renders whole: the hold pads, never clips.
+/// A three-digit count renders whole, two cells before the tok/s chip.
 #[test]
 fn a_count_wider_than_the_hold_renders_whole() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -625,8 +658,8 @@ fn a_count_wider_than_the_hold_renders_whole() {
     app.tab = Tab::Tokens;
     app.live_sessions = tally_of(100);
     assert!(
-        row_content(&app, 120, 1).starts_with("[ 100 live ] · uwuclxdy"),
-        "a three-digit count past a one-digit hold"
+        row_content(&app, 120, 1).starts_with("[ 100 live ]  [ — tok/s ] · uwuclxdy"),
+        "a three-digit count renders whole, two cells before the tok/s chip"
     );
 }
 
@@ -644,7 +677,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -653,7 +686,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
         .skip(10)
         .collect();
     assert!(
-        row1.starts_with("[ — live ] · uwuclxdy 42% [████░░░░░░]"),
+        row1.starts_with("[ — live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
         "{row1:?}"
     );
     let dash = &buf.content[120 + 10 + 2];
@@ -683,11 +716,11 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
-    let cell = |col: usize| &buf.content[120 + 10 + 13 + col];
+    let cell = |col: usize| &buf.content[120 + 10 + 26 + col];
     let text_of: String = (0..25).map(|c| cell(c).symbol().to_string()).collect();
     assert_eq!(text_of, "uwuclxdy 80% [████████░░]", "{text_of:?}");
     let dim = super::theme::text_dim_color();
@@ -715,24 +748,145 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     }
 }
 
-/// The held width counts toward the shed gate: after `10`, a `9` chip still
-/// charges the two-digit width, so it sheds at the width the `10` chip did.
+/// The split form's cells by role: the own number `TEXT` + bold, the `+` dim,
+/// the delegates number `ACCENT` + bold, brackets and unit dim without bold.
+/// Pinned per cell off the theme's own colors, and the whole row by equality.
 #[test]
-fn the_held_live_chip_width_is_charged_to_the_shed_gate() {
+fn the_split_live_chip_renders_own_then_delegates_with_their_styles() {
+    use ratatui::style::Modifier;
     let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dim = super::theme::text_dim_color();
+    let text = super::theme::text_color();
+    let accent = super::theme::accent_color();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
-    app.set_live_sessions(tally_of(10));
-    app.set_live_sessions(tally_of(9));
-
-    // gauge 25 + held chip and separator 14 + indicator 18 + reserve 3 = 60.
-    assert!(
-        row_content(&app, 70, 1).starts_with("[ 9 live ]  · uwuclxdy"),
-        "70 holds the held-width chip"
+    app.set_live_sessions(split_tally(6, 7));
+    let height = header_height(&app);
+    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app, &app.readings_snapshot());
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let cell = |col: usize| &buf.content[120 + 10 + col];
+    let text_of: String = (0..15).map(|c| cell(c).symbol().to_string()).collect();
+    assert_eq!(text_of, "[ 6+7 live ]  [", "the split chip's text");
+    let row1: String = crate::testutil::buffer_rows(&buf)[1]
+        .chars()
+        .skip(10)
+        .collect();
+    assert_eq!(
+        row1,
+        format!(
+            "[ 6+7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
+        "the split chip leads row 1"
     );
+    assert_eq!(cell(2).fg, text, "the own number renders TEXT");
     assert!(
-        row_content(&app, 69, 1).starts_with("uwuclxdy 42%"),
-        "69 sheds it whole, as it shed the `10` chip"
+        cell(2).modifier.contains(Modifier::BOLD),
+        "the own number is bold"
+    );
+    assert_eq!(cell(3).fg, dim, "the + renders TEXT_DIM");
+    assert!(
+        !cell(3).modifier.contains(Modifier::BOLD),
+        "the + is unbolded"
+    );
+    assert_eq!(cell(4).fg, accent, "the delegates number renders ACCENT");
+    assert!(
+        cell(4).modifier.contains(Modifier::BOLD),
+        "the delegates number is bold"
+    );
+    for col in [0, 1, 5, 6, 7, 8, 9, 10, 11] {
+        assert_eq!(cell(col).fg, dim, "chrome renders TEXT_DIM at {col}");
+        assert!(
+            !cell(col).modifier.contains(Modifier::BOLD),
+            "chrome carries no bold at {col}"
+        );
+    }
+}
+
+/// A lone delegate part renders `[ 7 live ]` with the 7 in `ACCENT` + bold:
+/// the colour alone marks which part it is, no `0+` prefix. The whole row is
+/// pinned by equality — the chip is 2 cells narrower than the split form, so
+/// the gauge gap grows by 2 — and every chrome cell reads dim without bold.
+#[test]
+fn a_lone_delegate_part_renders_in_accent_alone() {
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dim = super::theme::text_dim_color();
+    let accent = super::theme::accent_color();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(0, 7));
+    let height = header_height(&app);
+    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app, &app.readings_snapshot());
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let cell = |col: usize| &buf.content[120 + 10 + col];
+    let row1: String = crate::testutil::buffer_rows(&buf)[1]
+        .chars()
+        .skip(10)
+        .collect();
+    assert_eq!(
+        row1,
+        format!(
+            "[ 7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(41)
+        ),
+        "the lone delegate part leads row 1 whole"
+    );
+    assert_eq!(cell(2).fg, accent, "the lone delegate number is ACCENT");
+    assert!(
+        cell(2).modifier.contains(Modifier::BOLD),
+        "the lone delegate number is bold"
+    );
+    for col in [0, 1, 3, 4, 5, 6, 7, 8, 9] {
+        assert_eq!(cell(col).fg, dim, "chrome renders TEXT_DIM at {col}");
+        assert!(
+            !cell(col).modifier.contains(Modifier::BOLD),
+            "chrome carries no bold at {col}"
+        );
+    }
+}
+
+/// The split form renders tight too: after `6+7`, a drop to `6` leaves no
+/// blank cell after the closing bracket, and the gauge moves left two cells.
+#[test]
+fn the_split_chip_renders_tight_after_the_split() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(6, 7));
+    let at_split = row_content(&app, 120, 1);
+    assert!(
+        at_split.starts_with("[ 6+7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "{at_split:?}"
+    );
+    app.set_live_sessions(split_tally(6, 0));
+    let at_six = row_content(&app, 120, 1);
+    assert!(
+        at_six.starts_with("[ 6 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "six after the split renders tight: {at_six:?}"
+    );
+    assert_eq!(
+        at_split.chars().position(|c| c == 'u'),
+        Some(28),
+        "the gauge's first cell sits after the split chip and its separator"
+    );
+    assert_eq!(
+        at_six.chars().position(|c| c == 'u'),
+        Some(26),
+        "the gauge follows the one-digit chip across 6+7 -> 6"
     );
 }
 
@@ -753,8 +907,8 @@ fn row2_is_tabs_only() {
 
 #[test]
 fn the_daemon_chip_is_always_present_and_maps_health_to_color() {
-    // `HomeSandbox` outermost: its `HOME_TEST_LOCK` must not be taken while a
-    // RankedMutex (here `TierSandbox`'s) is held.
+    // `HomeSandbox` outermost per the ranked-lock rule: `HOME_TEST_LOCK` before
+    // any ranked guard.
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::daemon::DaemonHealth;
@@ -813,7 +967,7 @@ fn the_daemon_chip_cells_carry_the_pill_grammar() {
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -893,8 +1047,9 @@ fn no_header_row_counts_accounts_at_any_width_tab_or_filter() {
         vec![oauth_profile("uwuclxdy", 42.0), provider_profile("z.ai")],
         Some("uwuclxdy"),
     );
-    // A live fleet puts the one sanctioned middot on row 1 (`[ 2 live ] · `), so
-    // the guard below runs with it present and strips exactly that one.
+    // A live fleet puts the one sanctioned middot on row 1 (`[ 2 live ]  [ — tok/s ] · `,
+    // or `[ 2 live ] · ` where the tok/s chip has shed), so the guard below runs
+    // with it present and strips exactly that one.
     app.live_sessions = crate::live_sessions::LiveTally::of([
         crate::testutil::live_row("4242-0", "uwuclxdy"),
         crate::testutil::live_row("4242-1", "z.ai"),
@@ -928,7 +1083,10 @@ fn no_header_row_counts_accounts_at_any_width_tab_or_filter() {
                          harness: {content:?}"
                     );
                     assert!(
-                        !content.replacen("[ 2 live ] · ", "", 1).contains('·'),
+                        !content
+                            .replacen("[ 2 live ]  [ — tok/s ] · ", "", 1)
+                            .replacen("[ 2 live ] · ", "", 1)
+                            .contains('·'),
                         "{filter:?} on {tab:?} at {width}: header row {row} carries a \
                          count middot: {content:?}"
                     );
@@ -1015,7 +1173,7 @@ fn render_header_at(anim_ms: u64, width: u16) -> (Vec<String>, ratatui::buffer::
     let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -1375,7 +1533,310 @@ fn the_header_gauge_keeps_a_wide_active_name_whole() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("日本語", 42.0)], Some("日本語"));
     app.tab = Tab::Tokens;
-    assert!(row_content(&app, 120, 1).contains("日 本 語  42% [████░░░░░░]"));
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..49].iter().collect();
+    assert_eq!(left, "[ 0 live ]  [ — tok/s ] · 日 本 語  42% [████░░░░░░]");
+}
+
+/// P1: the header gauge labels its reading with at most two nearest-rounded
+/// decimals, with and without its bar.
+#[test]
+fn the_header_gauge_label_keeps_two_rounded_decimals() {
+    for bar_cells in [10, 0] {
+        for (pct, want) in [
+            (73.42, "73.42%"),
+            (1.000_000_000_000_000_9, "1%"),
+            (99.999, "100%"),
+        ] {
+            let fit = GaugeFit {
+                name_w: 0,
+                bar_cells,
+                visible: true,
+            };
+            let spans = gauge_spans(fit, "", Some(pct), 0);
+            let labels: Vec<&str> = spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .filter(|c| c.ends_with('%'))
+                .collect();
+            assert_eq!(labels, [want], "{pct} with {bar_cells} bar cells");
+        }
+    }
+}
+
+// ── tps: `[ R tok/s ]` after the live chip, `(S t/s)` after the gauge ─────────
+
+fn tps_snapshot(age_ms: u64, rate: f64, active_speed: Option<f64>) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let figures = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures(rate, active_speed),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts
+        .insert("uwuclxdy".into(), figures(rate, active_speed));
+    snap
+}
+
+/// The tok/s counter chip renders at 0 and at 1 (one decimal below 10), right
+/// after the live chip; the gauge's speed suffix hides while the active
+/// account has no live speed and reads `(92 t/s)` once it has one.
+#[test]
+fn the_tps_chip_shows_at_zero_and_one_and_the_speed_suffix_hides_when_absent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (rate, speed, want) in [
+        (
+            0.0,
+            None,
+            "[ 0 live ]  [ 0 tok/s ] · uwuclxdy 42% [████░░░░░░]   ",
+        ),
+        (
+            1.0,
+            None,
+            "[ 0 live ]  [ 1.0 tok/s ] · uwuclxdy 42% [████░░░░░░]   ",
+        ),
+        (
+            67.2,
+            Some(92.4),
+            "[ 0 live ]  [ 67 tok/s ] · uwuclxdy 42% [████░░░░░░] (92 t/s)   ",
+        ),
+    ] {
+        let mut fresh = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+        fresh.tab = Tab::Tokens;
+        fresh.set_live_sessions(tally_of(0));
+        fresh.set_tps(Some(tps_snapshot(1_000, rate, speed)));
+        let row = row_content(&fresh, 120, 1);
+        assert!(row.starts_with(want), "{rate}: {row:?}");
+    }
+}
+
+/// No producer (no cache, or one past `STALE_AFTER_MS`) reads `—`, never a
+/// fabricated 0, and draws no speed suffix.
+#[test]
+fn the_tps_chip_reads_a_dash_without_a_fresh_producer() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(tally_of(0));
+    for snap in [
+        None,
+        Some(tps_snapshot(
+            crate::tps::STALE_AFTER_MS + 1_000,
+            50.0,
+            Some(90.0),
+        )),
+    ] {
+        let stale = snap.is_some();
+        app.set_tps(snap);
+        let row = row_content(&app, 120, 1);
+        assert!(
+            row.starts_with("[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]   "),
+            "stale={stale}: {row:?}"
+        );
+    }
+}
+
+/// The tok/s chip's cells by role: brackets and unit `TEXT_DIM` without bold,
+/// the number `TEXT` + bold at a non-zero rate, `TEXT_DIM` at zero. Pinned per
+/// cell off the theme's own colors.
+#[test]
+fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dim = super::theme::text_dim_color();
+    let text = super::theme::text_color();
+    for (rate, number_fg, number_bold) in [(0.0, dim, false), (67.2, text, true)] {
+        let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+        app.tab = Tab::Tokens;
+        app.set_live_sessions(tally_of(0));
+        app.set_tps(Some(tps_snapshot(1_000, rate, None)));
+        let height = header_height(&app);
+        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            super::draw(f, area, &app, &app.readings_snapshot());
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let cell = |col: usize| &buf.content[120 + 10 + col];
+        // `[ 0 live ]` is 10 cells, then the 2-cell chip gap, so the tok/s chip
+        // opens at column 12.
+        let chip_at = 12usize;
+        let number = crate::tps::format_figure(rate);
+        let chip_len = 2 + number.chars().count() + 1 + 5 + 1 + 1;
+        let text_of: String = (chip_at..chip_at + chip_len)
+            .map(|c| cell(c).symbol().to_string())
+            .collect();
+        assert_eq!(
+            text_of,
+            format!("[ {number} tok/s ]"),
+            "{rate}: the chip's text"
+        );
+        let close = chip_at + chip_len - 1;
+        for (col, role) in [
+            (chip_at, "open bracket"),
+            (chip_at + 1, "inner gap"),
+            (close, "close bracket"),
+        ] {
+            assert_eq!(cell(col).fg, dim, "{rate}: the {role} renders TEXT_DIM");
+            assert!(
+                !cell(col).modifier.contains(Modifier::BOLD),
+                "{rate}: the {role} carries no bold"
+            );
+        }
+        let unit_t = chip_at + 2 + number.chars().count() + 1;
+        assert_eq!(cell(unit_t).fg, dim, "{rate}: the unit renders TEXT_DIM");
+        assert!(
+            !cell(unit_t).modifier.contains(Modifier::BOLD),
+            "{rate}: the unit carries no bold"
+        );
+        assert_eq!(
+            cell(chip_at + 2).fg,
+            number_fg,
+            "{rate}: the number's color"
+        );
+        assert_eq!(
+            cell(chip_at + 2).modifier.contains(Modifier::BOLD),
+            number_bold,
+            "{rate}: the number's weight"
+        );
+    }
+
+    // The no-reading `—` renders TEXT_DIM without bold, never the bright
+    // non-zero style.
+    {
+        let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+        app.tab = Tab::Tokens;
+        app.set_live_sessions(tally_of(0));
+        app.set_tps(None);
+        let height = header_height(&app);
+        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            super::draw(f, area, &app, &app.readings_snapshot());
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let dash = &buf.content[120 + 10 + 14];
+        assert_eq!(dash.fg, dim, "the dash renders TEXT_DIM");
+        assert!(
+            !dash.modifier.contains(Modifier::BOLD),
+            "the dash carries no bold"
+        );
+    }
+}
+
+/// The tok/s chip renders tight after a wider rate: `1.0` (three cells) leaves
+/// no blank cell behind when the rate falls to `67`, and the ` · ` before the
+/// gauge follows the closing bracket directly in every state.
+#[test]
+fn the_tps_chip_renders_tight_after_a_wider_rate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(tally_of(0));
+    app.set_tps(Some(tps_snapshot(1_000, 1.0, None)));
+    app.set_tps(Some(tps_snapshot(1_000, 67.2, None)));
+    let row = row_content(&app, 120, 1);
+    assert!(
+        row.starts_with("[ 0 live ]  [ 67 tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "{row:?}"
+    );
+    // The quiet `0` and `—` states render tight too.
+    app.set_tps(Some(tps_snapshot(1_000, 0.0, None)));
+    let row = row_content(&app, 120, 1);
+    assert!(
+        row.starts_with("[ 0 live ]  [ 0 tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "{row:?}"
+    );
+    app.set_tps(None);
+    let row = row_content(&app, 120, 1);
+    assert!(
+        row.starts_with("[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "{row:?}"
+    );
+}
+
+/// The line-2 ladder at the widths where each piece sheds: the tok/s chip
+/// first, then the live chip, then the speed suffix, then the gauge's bar.
+#[test]
+fn the_line_two_ladder_sheds_the_tps_chip_then_the_live_chip_then_the_suffix() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(tally_of(0));
+    app.set_tps(Some(tps_snapshot(1_000, 67.2, Some(92.4))));
+    for (w, expected) in [
+        (
+            120,
+            "[ 0 live ]  [ 67 tok/s ] · uwuclxdy 42% [████░░░░░░] (92 t/s)                               ● status.claude.ai",
+        ),
+        (
+            80,
+            "uwuclxdy 42% [████░░░░░░] (92 t/s)                  ● status.claude.ai",
+        ),
+        (
+            70,
+            "uwuclxdy 42% [████░░░░░░] (92 t/s)        ● status.claude.ai",
+        ),
+        (60, "uwuclxdy 42% [████░░░░░░]       ● status.claude.ai"),
+        (56, "uwuclxdy 42% [████░░░░░]    ● status.claude.ai"),
+    ] {
+        assert_eq!(
+            row_content(&app, w, 1).trim_end(),
+            expected,
+            "row 1 at {w} cols"
+        );
+    }
+}
+
+/// Freshness is judged at render time, never cached at set time: the same
+/// snapshot reads fresh at 29 s and stale at 31 s once the pinned clock passes
+/// the 30 s window.
+#[test]
+fn a_snapshot_ages_past_the_stale_window_per_frame() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(tally_of(0));
+    let now = crate::usage::now_ms();
+    app.set_tps(Some(tps_snapshot(29_000, 67.2, Some(92.4))));
+
+    app.tps_now_override = Some(now);
+    assert!(
+        row_content(&app, 120, 1).starts_with("[ 0 live ]  [ 67 tok/s ] · uwuclxdy"),
+        "29 s reads fresh"
+    );
+
+    app.tps_now_override = Some(now + 2_000);
+    assert!(
+        row_content(&app, 120, 1).starts_with("[ 0 live ]  [ — tok/s ] · uwuclxdy"),
+        "31 s reads stale without a re-set"
+    );
+}
+
+/// The ` (S t/s)` suffix renders through the chip's capped figure, so it never
+/// outgrows the ` (9999 t/s)` width the chip shed checks charge.
+#[test]
+fn the_speed_suffix_stays_inside_its_charged_ceiling() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(tally_of(0));
+    app.set_tps(Some(tps_snapshot(1_000, 1.0, Some(12_345.0))));
+    let row = row_content(&app, 160, 1);
+    assert!(row.contains("[████░░░░░░] (12k t/s)"), "{row:?}");
 }
 
 #[test]

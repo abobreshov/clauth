@@ -1040,6 +1040,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
         label: "credits".to_string(),
         value: String::new(),
         kind: StatRowKind::Heading,
+        raw: None,
     }];
     let mut funded = true;
     match &usage.wallet {
@@ -1075,6 +1076,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
                 } else {
                     StatRowKind::Danger
                 },
+                raw: None,
             });
             rows.push(body_row("used", &w.total_usage));
             rows.push(body_row("purchased", &w.total_credits));
@@ -1083,6 +1085,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
             label: "wallet".to_string(),
             value: "unavailable".to_string(),
             kind: StatRowKind::Faint,
+            raw: None,
         }),
     }
     for (label, figure) in [
@@ -1105,6 +1108,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
             label: "free tier".to_string(),
             value: String::new(),
             kind: StatRowKind::Faint,
+            raw: None,
         });
     }
     for note in &usage.notes {
@@ -1112,6 +1116,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
             label: String::new(),
             value: note.clone(),
             kind: StatRowKind::Faint,
+            raw: None,
         });
     }
 
@@ -1127,6 +1132,7 @@ pub(crate) fn stats(usage: &OpenRouterUsage, now_secs: i64) -> ThirdPartyStats {
                 resets_at: w.resets_at.map(|t| t.to_rfc3339()),
                 used: w.used,
                 total: w.limit,
+                inference_quota: false,
             })
         })
         .collect();
@@ -1149,6 +1155,7 @@ fn body_row(label: &str, a: &Amount) -> StatRow {
         label: label.to_string(),
         value: dollars(a),
         kind: StatRowKind::Body,
+        raw: None,
     }
 }
 

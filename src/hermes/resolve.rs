@@ -368,7 +368,7 @@ pub(crate) fn version_verdict(
     }
     match policy {
         super::profiles::VersionPolicy::Warn => VersionVerdict::Warn(format!(
-            "tollgate: note — Hermes {version} is installed; tollgate's guards were verified \
+            "tollgate: note: Hermes {version} is installed; tollgate's guards were verified \
              against 0.19.x"
         )),
         super::profiles::VersionPolicy::Refuse => VersionVerdict::Refuse(format!(

@@ -107,7 +107,7 @@ fn minutes_from_now(minutes: i64) -> i64 {
 /// The stderr both arms print for a `split` setup token inside the five-minute
 /// window: the gate's re-mint line, then the re-login error.
 fn split_expiry_stderr() -> &'static str {
-    "tollgate: 'split' long-lived token has expired (or sits inside Claude Code's own five-minute refresh window) — re-mint with `claude setup-token` (tollgate login split --setup-token)\nError: login for 'split' has expired: refresh token revoked or invalid: run `tollgate login split`\n"
+    "tollgate: 'split' long-lived token has expired (or sits inside Claude Code's own five-minute refresh window). Re-mint with `claude setup-token` (tollgate login split --setup-token)\nError: login for 'split' has expired: refresh token revoked or invalid: run `tollgate login split`\n"
 }
 
 fn profiles_toml(home: &Path) -> String {
@@ -580,7 +580,7 @@ fn oauth_token_refuses_a_token_holding_a_control_character() {
     assert_eq!(out.stdout, Vec::<u8>::new());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "Error: oauth token contains whitespace or control characters — a bad paste or an edited config\n"
+        "Error: oauth token contains whitespace or control characters, likely a bad paste or an edited config\n"
     );
 }
 

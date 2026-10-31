@@ -41,7 +41,7 @@ To upgrade, re-run the cargo command above. A fork-signed updater (its own relea
 
 ## Shell completions
 
-The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.tollgate/.completions_installed`. The completion functions are tollgate's own, so they do not replace upstream clauth's.
+The first TUI launch offers to install completions for your shell. bash and zsh get a `source` line appended to the rc file, asked for with `[Y/n]` first; fish writes straight into `~/.config/fish/completions/`. The answer is remembered in `~/.tollgate/.completions_installed`. The completion functions are tollgate's own, so they do not replace upstream clauth's. A declined prompt is not asked again, but the Plugin tab's `plugin` row keeps offering `install completions` without warning.
 
 Install or refresh them any time:
 
@@ -53,9 +53,11 @@ tollgate completions bash             # print the script to stdout instead
 
 `TOLLGATE_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
+`tollgate resume` and `tollgate info` complete session ids (and `latest`), and codex profile names complete beside the Claude Code ones after `tollgate`, `start`, `delete` and `switch`, and alone after `limit-reset`. An installed script never updates by itself: when the script at the path `tollgate completions install` writes (`~/.tollgate/completions/tollgate.<shell>`; fish `~/.config/fish/completions/tollgate.fish`) differs from what this tollgate prints, select the Plugin tab's `plugin` row and press <kbd>f</kbd> (its fix is `update completions` once the plugin itself needs nothing), or run `tollgate completions install`.
+
 ## Claude Code plugin
 
-The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants. In guest mode the install is refused, since the plugin registry is upstream's until an import.
+The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants. In guest mode the install still runs and writes only tollgate's own entries, since the plugin registry is upstream's until an import ([Guest mode](Guest-Mode#tollgates-own-entries)).
 
 ## Uninstall
 

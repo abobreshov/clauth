@@ -1021,6 +1021,13 @@ fn fill_if_empty(cfg: &super::config::MonitorConfig, http: &dyn MonitorHttp, now
     let _ = super::cache::refresh_one(cfg, &deps, true);
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "called only from #[cfg(not(test))] legs: monitor::poll_detached and the TUI's usage-extras poll"
+    )
+)]
 pub(crate) fn ensure_official_antigravity_config(now_ms: u64) {
     let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
     if !single_official_login(now_secs) {

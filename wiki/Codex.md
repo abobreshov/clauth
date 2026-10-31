@@ -6,7 +6,7 @@ Requires the `codex` CLI on `PATH` and a ChatGPT login (`codex login`); an API-k
 
 ## Add an account
 
-Two ways in. Neither switches to the profile, and neither needs Claude Code.
+Three ways in: adopt the login your own codex holds, mint a fresh one in the browser, or create one from the Setup tab. None switches to the profile, and the two CLI forms need no Claude Code.
 
 ### Adopt the login your own codex holds
 
@@ -21,15 +21,15 @@ tollgate reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json` when that variab
 
 ```
 tollgate: captured the operator codex login into codex profile 'work'
-tollgate: /home/you/.codex/auth.json now follows the profile store — your own codex and tollgate sessions share one chain
-tollgate: while it does, `codex login` and `codex logout` reach 'work's chain through that link and revoke it server-side — remove the link first if you mean to mint a chain for a different account
+tollgate: /home/you/.codex/auth.json now follows the profile store. Your own codex and tollgate sessions share one chain
+tollgate: while it does, `codex login` and `codex logout` reach 'work's chain through that link and revoke it server-side. Remove the link first if you mean to mint a chain for a different account
 ```
 
 One physical file is the point. A codex refresh token is single-use and rotates on every refresh, so two copies of one chain kill each other: the first copy to refresh spends the token the other still holds. With the link in place your own `codex`, every `tollgate start work` session and tollgate's own refresher all read and write the same file, and codex reloads it before spending, so they cooperate.
 
 Do not run `codex login` or `codex logout` through that link. codex's own login and logout revoke the login they find at `~/.codex/auth.json` on the server (tollgate refuses a capture through such a link for the same reason), and through the link that login is the profile's chain: the profile dies on the server, and no re-capture brings it back. To log your own codex into a different ChatGPT account, remove the link first (`rm ~/.codex/auth.json` leaves the profile intact), then `codex login`, then capture that into a second profile.
 
-Running the capture again on an existing codex name re-captures in place. It refuses to swap the ChatGPT account under a name (`'work' stores ChatGPT account <old>, but this login is account <new> — log into a new profile, or delete 'work' first`), and it refuses while a session of that profile is live.
+Running the capture again on an existing codex name re-captures in place. It refuses to swap the ChatGPT account under a name (`'work' stores ChatGPT account <old>, but this login is account <new>. Log into a new profile, or delete 'work' first`), and it refuses while a session of that profile is live.
 
 ### Mint a fresh login in the browser
 
@@ -42,12 +42,16 @@ tollgate runs codex's browser login itself and lands the minted chain straight i
 ```
 tollgate: logged a fresh codex chain into codex profile 'spare'
 tollgate: ChatGPT account <id>
-tollgate: run it with `tollgate start spare` — your own ~/.codex is untouched
+tollgate: run it with `tollgate start spare`. Your own ~/.codex is untouched
 ```
 
-The sign-in page sends the browser back to `http://localhost:1455/auth/callback` (port 1457 when 1455 is taken), and the listener binds the loopback address alone, so the browser has to run on the machine tollgate runs on, or have that port forwarded to it. With both ports held: `codex's login ports (1455 and 1457) are both in use — close whatever holds them (another codex or tollgate login?) and retry`. Five minutes without a callback ends in `timed out waiting for the codex login callback`; declining the consent page ends in `you declined the authorization request`. Either way nothing is written and the command can be re-run.
+The sign-in page sends the browser back to `http://localhost:1455/auth/callback` (port 1457 when 1455 is taken), and the listener binds the loopback address alone, so the browser has to run on the machine tollgate runs on, or have that port forwarded to it. With both ports held: `codex's login ports (1455 and 1457) are both in use. Close whatever holds them (another codex or tollgate login?) and retry`. Five minutes without a callback ends in `timed out waiting for the codex login callback`; declining the consent page ends in `you declined the authorization request`. Either way nothing is written and the command can be re-run.
 
-A name already held by a Claude Code profile is refused for either form: `'work' is a claude profile — profile names span both harnesses, pick another`. Profile names are one namespace across both rosters, which is what lets every other command take a bare name.
+A name already held by a Claude Code profile is refused for either form: `'work' is a claude profile. Profile names span both harnesses, so pick another`. Profile names are one namespace across both rosters, which is what lets every other command take a bare name.
+
+### From the Setup tab
+
+Open the Setup tab, pick `+ new`, cycle the `type` row to `codex`, and fill the name. `+ login` runs codex's browser login itself (as `--browser` above) and stages the mint; `+ capture current login` (shown only while your own codex login exists and is uncaptured) stages your `~/.codex` login the way `--codex` does. `create account` lands the staged login under the name; `+ login` and `+ capture current login` refuse a name either roster already holds on the name row, `create account` with nothing staged refuses on its own `└` line, and a name held by then refuses at `create account` with a `create failed` toast. A codex account's Setup row also offers `re-login` (the same browser login) and `delete account` (press twice) beside the CLI verbs.
 
 ## Run
 
@@ -72,9 +76,9 @@ A thread is in the profile's store the moment codex writes it, so a later sessio
 
 The environment is scrubbed before the spawn: `CODEX_HOME`, `CODEX_SQLITE_HOME`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE`, `CODEX_REVOKE_TOKEN_URL_OVERRIDE` and `CODEX_APP_SERVER_LOGIN_CLIENT_ID` are dropped, as are the active Claude Code profile's own `[env]` keys and a `CLAUDE_CONFIG_DIR` naming a tollgate runtime, so the session spends the account it names and nothing inherited.
 
-`--with-fallback` is refused: `--with-fallback is not available on a codex profile: codex reads auth.json once at start, so a chain lands at the NEXT start, not mid-session — start without the flag`. `--explain` prints `would start on 'work'` and exits. `--auto` walks the Claude Code chain and never lands on a codex profile. A chain tollgate has declared dead is refused before anything is built ([below](Codex#when-a-chain-dies)). ``failed to launch codex — is the `codex` CLI installed and on PATH?`` is what a missing `codex` looks like.
+`--with-fallback` is refused: `--with-fallback is not available on a codex profile: codex reads auth.json once at start, so a chain lands at the NEXT start, not mid-session. Start without the flag`. `--explain` prints `would start on 'work'` and exits. `--auto` walks the Claude Code chain and never lands on a codex profile. A chain tollgate has declared dead is refused before anything is built ([below](Codex#when-a-chain-dies)). ``failed to launch codex. Is the `codex` CLI installed and on PATH?`` is what a missing `codex` looks like.
 
-Inside the session, `tollgate which` prints the profile name, and `tollgate which --json` answers `{"profile": "work", "source": "codex_home", "harness": "codex", ...}`.
+Inside the session, `tollgate which` prints the profile name, and `tollgate which --json` answers `{"profile": "work", "source": "codex_home", "harness": "codex", "tps": null, ...}` — `tps` stays `null` because token speed reads Claude Code transcripts, never codex's.
 
 ## Switch
 
@@ -85,7 +89,7 @@ tollgate work
 # tollgate: switched codex to 'work'
 ```
 
-A codex switch moves the active marker in `codex-profiles.toml`. When your own `~/.codex/auth.json` is the link tollgate installed into a profile's store, the link follows the switch (`tollgate: /home/you/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link tollgate did not install, is left alone. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `tollgate start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `tollgate: note — 'work' also names a codex profile; switching the CLAUDE one`.
+A codex switch moves the active marker in `codex-profiles.toml`. When your own `auth.json` (in `~/.codex`, or in your `CODEX_HOME` when you set one) is the link tollgate installed into a profile's store, the link follows the switch (`tollgate: /home/you/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link tollgate did not install, is left alone. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `tollgate start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `tollgate: note: 'work' also names a codex profile. This switches the CLAUDE one`.
 
 ## Remove
 
@@ -94,7 +98,7 @@ tollgate delete work
 # tollgate: delete profile 'work' and all its credentials? [y/N]
 ```
 
-The same gate as a Claude Code delete: `--yes` skips the prompt and is required on a non-TTY stdin (`refusing to delete 'work' without confirmation; pass --yes for a non-interactive delete`), `--force` is the only way past `'work' has a live session, pass --force to remove it anyway`, and anything but `y` or `yes` leaves it with `tollgate: aborted. 'work' left in place.` A confirmed delete removes `~/.tollgate/profiles/work/` whole, the profile's threads and state stores under `codex-home/` included, then drops the roster row, and prints `tollgate: removed codex profile 'work'.`
+The same gate as a Claude Code delete: `--yes` skips the prompt and is required on a non-TTY stdin (`refusing to delete 'work' without confirmation; pass --yes for a non-interactive delete`), `--force` is the only way past `'work' has a live session, pass --force to remove it anyway`, and anything but `y` or `yes` leaves it with `tollgate: aborted. 'work' left in place.` A confirmed delete removes `~/.tollgate/profiles/work/` whole, the profile's threads and state stores under `codex-home/` included, then drops the roster row, and prints `tollgate: removed codex profile 'work'.` The Setup tab's `delete account` row runs the same delete behind a two-press confirm and refuses an account with a live session (there is no `--force` here).
 
 When `~/.codex/auth.json` is the link a capture installed onto this profile, the delete removes that link too and says what that means:
 
@@ -108,17 +112,17 @@ A link onto another profile, or a real file (you logged your own codex back in),
 
 The codex chain is separate from the Claude Code one and lives in `~/.tollgate/codex-profiles.toml`, hand-edited: `fallback_chain` in walk order, `wrap_off`, and its own `weekly_switch_threshold` ([Configuration](Configuration#codex-profilestoml)). It is walked with the same rules ([Auto-switch](Auto-Switch#codex)): the active codex profile has to be a chain member, it has to be exhausted (5h past 95%, or the weekly window past the codex file's line) or dead, and the walk takes the next member with headroom, preferring one whose usage was read live. A dead member is one whose chain tollgate has quarantined, or whose usage polls keep answering 401 past two forced refreshes.
 
-What differs is when the switch lands. codex reads `auth.json` once at start, so a switch moves the active marker and takes effect at the next `tollgate start`; a running session finishes on the account it started with. The daemon log reads `tollgate: codex auto-switched to '<name>' — live at the next codex session`. With `wrap_off = true` and every member spent, the active slot is cleared (`tollgate: every codex account is spent — codex active slot cleared`) and stays clear until you switch to a member by hand.
+What differs is when the switch lands. codex reads `auth.json` once at start, so a switch moves the active marker and takes effect at the next `tollgate start`; a running session finishes on the account it started with. codex 0.157 and later run every task inside one shared app-server daemon (`codex app-server --managed-daemon`), and `codex resume` reconnects to it, so a switch reaches those tasks only once that daemon restarts: it read the login when it started. When a switch moves tollgate's `auth.json` link, tollgate checks the codex home whose link it moved (your `CODEX_HOME` when you set one, else `~/.codex`) for a daemon that started at or before the move. A hand switch prints how to restart it (`codex app-server daemon restart`, which stops running tasks' current turn and leaves them resumable); an auto-switch moves off a spent or dead account, whose tasks are stalled on it anyway, so it restarts the daemon itself (`tollgate: restarted codex's app-server daemon (…)`), one restart at a time. The check needs the daemon's unix control socket, so on Windows tollgate neither prints the note nor restarts anything. A stale daemon never writes its old login into the new account's store: codex re-reads `auth.json` before every refresh and refuses on an account mismatch, so it errors once its token expires instead. The daemon log reads `tollgate: codex auto-switched to '<name>' (<reason>). Live at the next codex session`, or `. Restarting codex's app-server daemon so its tasks resume on it` when it restarts one. With `wrap_off = true` and every member spent, the active slot is cleared (`tollgate: every codex account is spent (<reason>). Codex active slot cleared`) and stays clear until you switch to a member by hand.
 
 ## Usage and refresh
 
-The refresh loop, an open TUI or `tollgate daemon`, whichever holds the fetch lease, polls each codex profile's usage once per refresh interval from ChatGPT's usage endpoint, using the profile's own chain. The two windows it reports fill the Overview's 5h and 7d columns and `status.json`'s `windows[]`; when the server reports the account as blocked, the fuller window reads 100% whatever its own percentage says. The plan cell is the ChatGPT plan word the account reports.
+The refresh loop, an open TUI or `tollgate daemon`, whichever holds the fetch lease, polls each codex profile's usage once per refresh interval from ChatGPT's usage endpoint, using the profile's own chain. The two windows it reports fill the Overview's 5h and 7d columns and `status.json`'s `windows[]`; when the server reports the account as blocked, the fuller window reads 100% whatever its own percentage says. The plan cell is the ChatGPT plan word the account reports. The Usage tab lists codex accounts in their own `codex` section, with a detail pane per account: its plan, a re-login pill while its chain is quarantined, any banked resets, how long ago its usage was read, and its 5h and 7d bars ([Interface and keys](Interface-And-Keys#tabs)). <kbd>r</kbd> on a codex row does nothing; codex usage refreshes on the refresh interval alone.
 
 The same loop rotates a profile's chain ten minutes before its access token expires, under three rules:
 
 - **No replay.** A refresh token works once. A failed refresh is never retried with the same token on the routine pass; the token tollgate last spent is remembered in `auth.attempt`, which survives a restart. A usage poll answered 401 buys one forced attempt past that memo, and after two such attempts in a row tollgate stops forcing until a poll succeeds again.
 - **Stand down for a live session.** Inside the five minutes before expiry codex refreshes on its own, and a running session that holds the chain gets that window to itself. On a host without symlinks the session holds a separate copy, so tollgate stands down for the whole session.
-- **Keep a last-known-good copy.** Every well-formed read of the store is copied to `auth.lkg.json`; the copy is restored only after the store reads unreadable for 30 seconds with no session live, logged as `tollgate: '<name>' codex auth.json read bad for <n>s — restored the last-known-good copy`.
+- **Keep a last-known-good copy.** Every well-formed read of the store is copied to `auth.lkg.json`; the copy is restored only after the store reads unreadable for 30 seconds with no session live, logged as `tollgate: '<name>' codex auth.json read bad for <n>s. Restored the last-known-good copy`.
 
 A landed rotation logs `tollgate: rotated codex chain for '<name>'`; a failed one, `tollgate: codex refresh for '<name>' failed: <why>`.
 
@@ -137,7 +141,7 @@ A verdict the server calls final quarantines the chain. From then on the Overvie
 | `invalidated` | the chain was revoked on the server side |
 | `lost` | tollgate's own verdict: the server accepted a rotation, but the new pair could not be written to the store, so the token the store holds is spent (``tollgate: '<name>' codex rotation succeeded on the wire but the store write failed (<why>); the chain is spent, run `tollgate login <name> --codex --browser` ``) |
 
-No refresh revives a dead chain; a new login is the only exit, and the browser form is the one that works for every profile (a re-capture finds `~/.codex/auth.json` already pointing at the profile and captures nothing). The verdict is bound to the token it judged, so a fresh chain clears it however it lands. A refusal the server does not spell out about the chain itself (an unrecognized 4xx) never quarantines: those keep the no-replay memo and the two forced retries and nothing more.
+No refresh revives a dead chain; a new login is the only exit, and the browser form is the one that works for every profile (a re-capture finds `~/.codex/auth.json` already pointing at the profile and captures nothing). The Setup tab's codex detail shows the same verdict as a `login  [ needs re-login ]` pill while the chain is quarantined, with `re-login` running the browser form. The verdict is bound to the token it judged, so a fresh chain clears it however it lands. A refusal the server does not spell out about the chain itself (an unrecognized 4xx) never quarantines: those keep the no-replay memo and the two forced retries and nothing more.
 
 ## Use a usage-limit reset
 
@@ -148,18 +152,24 @@ tollgate limit-reset work --list   # the account's resets; spends nothing
 tollgate limit-reset work          # spend one, after a [y/N]
 ```
 
-`--list` prints the count and every reset with its status, expiry and grant time in local time, `*` marking the one a spend would use:
+`--list` prints the count and every reset with its status, expiry and grant time in local time (a status or grant time with nothing to show is left out), `*` marking the one a spend would use:
 
 ```
 tollgate: 'work' has 2 usage-limit resets available.
-  * Full reset (Weekly + 5 hr) — available, expires 2026-10-01 09:00:00, granted 2026-09-01 09:00:00  (used next)
-    usage-limit reset — available, no expiry, granted 2026-09-10 09:00:00
+  * Full reset (Weekly + 5 hr): available, expires 2026-10-01 09:00:00, granted 2026-09-01 09:00:00  (used next)
+    usage-limit reset: available, no expiry, granted 2026-09-10 09:00:00
 ```
 
 A spend uses a codex usage-limit (`codex_rate_limits`) reset before any other kind, and among those the one that expires first (one with no expiry waits until the dated ones are gone), and asks before it sends anything that spends:
 
 ```
-tollgate: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr) · expires 2026-10-01 09:00:00 · 1 of 2 available. It reopens the account's usage windows now and cannot be undone. [y/N]
+tollgate: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr), expires 2026-10-01 09:00:00, 1 of 2 available. It reopens the account's usage windows now and cannot be undone. [y/N]
+```
+
+Once that one is spent, the untitled reset is next; with no title to name, its question opens on its expiry:
+
+```
+tollgate: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reopens the account's usage windows now and cannot be undone. [y/N]
 ```
 
 `--yes` (`-y`) skips the question and is required on a non-TTY stdin, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` leaves the resets alone: `tollgate: aborted. no reset was used on 'work'.`
@@ -170,7 +180,7 @@ tollgate: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr) · expir
 | nothing to reset | `there is nothing to reset on 'work' right now, so no reset was used` | 1 |
 | none held | `no usage-limit resets available on 'work'` (`--list` prints it as `tollgate: no usage-limit resets available on 'work'.` and exits 0) | 1 |
 | taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `tollgate limit-reset work --list` to see what is left`` | 1 |
-| token refused | `codex rejected the stored access token for 'work' — the daemon refreshes it for a parked account and codex does for the one in use; try again after that; no reset was used` | 1 |
+| token refused | `codex rejected the stored access token for 'work'. The daemon refreshes it for a parked account and codex does for the one in use. Try again after that. No reset was used` | 1 |
 | no answer, or an answer tollgate cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; check `tollgate limit-reset work --list` before retrying`` | 1 |
 
 Nothing is retried on its own, since a lost answer may still have spent the reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
@@ -184,25 +194,25 @@ Before every codex start tollgate reads `/etc/codex/managed_config.toml`, the fi
 | Refusal | What to do |
 |---------|------------|
 | `the operator codex does not keep its login in auth.json (cli_auth_credentials_store = "<mode>" in <home>/config.toml), so there is nothing current to capture there` | set that key to `"file"` in your `~/.codex/config.toml`, run `codex login`, capture again |
-| ``no codex login to capture — <path> does not exist; run `codex login` first`` | log your own codex in first |
-| `failed to parse <path> — codex writes this file in place, so a login caught mid-write reads half-written; re-run the capture` | run it again |
-| ``<path> holds no ChatGPT token chain (an API-key-only setup?) — only a `codex login` chain can be captured`` | this setup has no chain; log in with `codex login` |
-| `tollgate: <path> already follows codex profile '<name>' — nothing to capture` | not a refusal: that login is already this profile |
-| `<path> is already captured as codex profile '<other>' — one chain, one profile.` | the slot is another profile's link; the line names the steps (remove the link, `codex login`, capture into the new name) |
-| ``CODEX_HOME points into a tollgate codex session home — run the capture from a shell outside `tollgate start` `` | run it from a shell that is not inside a tollgate codex session |
-| `'<name>' has a live codex session, which holds the chain this capture would replace — close it first` | close that session |
-| `'<name>' has a live codex session — close it before re-authenticating` | the browser form's spelling of the same |
+| ``no codex login to capture: <path> does not exist. Run `codex login` first`` | log your own codex in first |
+| `failed to parse <path>: codex writes this file in place, so a login caught mid-write reads half-written. Re-run the capture` | run it again |
+| ``<path> holds no ChatGPT token chain (an API-key-only setup?). Only a `codex login` chain can be captured`` | this setup has no chain; log in with `codex login` |
+| `tollgate: <path> already follows codex profile '<name>'. Nothing to capture` | not a refusal: that login is already this profile |
+| `<path> is already captured as codex profile '<other>': one chain, one profile.` | the slot is another profile's link; the line names the steps (remove the link, `codex login`, capture into the new name) |
+| ``CODEX_HOME points into a tollgate codex session home. Run the capture from a shell outside `tollgate start` `` | run it from a shell that is not inside a tollgate codex session |
+| `'<name>' has a live codex session, which holds the chain this capture would replace. Close it first` | close that session |
+| `'<name>' has a live codex session. Close it before re-authenticating` | the browser form's spelling of the same |
 | ``'<name>': codex chain is broken (<kind> since <time>), run `tollgate login <name> --codex --browser` `` | the browser login |
 | `'<name>' is a codex profile; <verb> is claude-only` | `disable`, `enable`, `rolling-token` and `static-token` take Claude Code profiles alone |
 | `'<name>' is a claude profile; limit-reset is codex-only` | the reverse: `limit-reset` takes codex profiles alone |
 | ``'<name>' has no stored codex login to use a reset with; run `tollgate login <name> --codex --browser` `` | the profile's `auth.json` is missing, unreadable, or holds no access token |
-| `tollgate: could not repoint <path> (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain` | a host without symlinks: run codex only through `tollgate start <name>` from then on, or `codex login` again for your own use |
+| `tollgate: could not repoint <path> (no symlink support?). It is now a SEPARATE copy of a single-use rotating chain` | a host without symlinks: run codex only through `tollgate start <name>` from then on, or `codex login` again for your own use |
 
 ## Files
 
 | Path | Holds |
 |------|-------|
-| `~/.tollgate/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold` |
+| `~/.tollgate/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold`, and `[ids]` (written by tollgate, one per profile; leave it as written) |
 | `~/.tollgate/profiles/<name>/auth.json` | the chain, owner-only, written atomically by tollgate and in place by codex through the links |
 | `~/.tollgate/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` when you set it |
 | `~/.tollgate/profiles/<name>/auth.lkg.json` | the last-known-good copy of the chain |
@@ -218,9 +228,9 @@ Everything under `~/.tollgate` is owner-only, as on the [Security](Security#wher
 
 ## What stays Claude Code only
 
-The Tokens tab and `tollgate sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `tollgate list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `tollgate status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#tollgate-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. The Setup, Usage and Fallback tabs list no codex rows, and there is no TUI form for creating one: the shell verbs above are the whole surface.
+The Tokens tab and `tollgate sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in; `tollgate sessions --live` still lists a running codex session, with `codex` as its harness and no transcript id, and `tollgate switch <sid> <profile>` refuses it as `session '<sid>' is a codex session; switch is claude-only`. `tollgate list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `tollgate status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#tollgate-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. Fallback lists no codex rows; Usage lists them in their own `codex` section. Setup lists every codex account after the Claude Code ones: <kbd>⏎</kbd> opens its detail pane — `type` and `plan`, a `login [ needs re-login ]` row while the chain is quarantined — with `re-login` (the browser login of `tollgate login <name> --codex --browser`: `r` opens the browser again, `c` copies the link) and `delete account` (the delete of `tollgate delete <name>` behind the two-press arm; a live session still refuses). Setup's `+ new` → `type  codex` creates one ([Add an account](Codex#add-an-account)); the shell verbs are the other way in.
 
-On the Overview, codex accounts sit in a read-only section under the Claude Code rows, and <kbd>c</kbd> cycles which harness the tab shows ([Interface and keys](Interface-And-Keys#tab-dependent)).
+On the Overview, codex accounts sit in selectable rows under the Claude Code rows; <kbd>↑</kbd> and <kbd>↓</kbd> reach each one, but <kbd>⏎</kbd> cannot switch a codex account and <kbd>a</kbd> offers tab-wide actions only.
 
 ## Windows and hosts without symlinks
 

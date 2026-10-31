@@ -217,6 +217,13 @@ fn single_official_login(home: &Path, now_secs: i64) -> bool {
     read_auth(&home.join(".codex"), now_secs).is_ok()
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "called only from #[cfg(not(test))] legs: monitor::poll_detached and the TUI's usage-extras poll"
+    )
+)]
 pub(crate) fn ensure_official_codex_config(now_ms: u64) {
     let Ok(home) = crate::profile::home_dir() else {
         return;

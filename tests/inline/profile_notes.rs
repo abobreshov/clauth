@@ -22,6 +22,8 @@ fn mini_profile(name: &str) -> Profile {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -33,15 +35,15 @@ fn mini_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 

@@ -81,21 +81,15 @@ pub(crate) mod rank {
     }
 
     ranks! {
-        // Test-only scaffolding locks, ranked OUTERMOST (below every production
-        // rank): the RAII sandboxes that hold them (`testutil::HomeSandbox` /
-        // `TierSandbox`, `showcase::ShowcaseHome`, runtime's `with_fake_home`)
-        // wrap the whole test, so the code under test still legally acquires any
-        // production lock inside them. Two ranks, not one, so a future test that
-        // needs both cannot invert them into a deadlock: acquire `HomeTest`
-        // before `TierTest`, both before any real lock.
+        // Test-only scaffolding lock, ranked OUTERMOST (below every production
+        // rank): the RAII sandboxes that hold it (`testutil::HomeSandbox`,
+        // `showcase::ShowcaseHome`, runtime's `with_fake_home`) wrap the whole
+        // test, so the code under test still legally acquires any production
+        // lock inside it.
         /// `profile::HOME_TEST_LOCK` — serializes `home_dir()` redirects across
         /// the threads a `cargo test` fallback shares.
         #[cfg(test)]
         HomeTest = 20;
-        /// `theme::TIER_TEST_LOCK` — serializes color-tier pins across those
-        /// same threads.
-        #[cfg(test)]
-        TierTest = 40;
         /// The REST API's in-process switch gate (`daemon::api`). One
         /// `POST /api/v1/switch` at a time: a second concurrent request gets an
         /// immediate 409 instead of parking 25s on the cross-process state flock
@@ -132,6 +126,10 @@ pub(crate) mod rank {
         /// the HTTP round trip; ranked just inside `Rotation` because the
         /// post-rotation retry reserves a slot while the rotation flock is held.
         UsageThrottle = 150;
+        /// Per-process forget epoch (`(name, half)`, monotonic, never removed):
+        /// the seeds hold it from compare through their store writes (ranks
+        /// 200-350), so it must sit OUTERMOST of every reading lock it gates.
+        Epoch = 160;
         LastFetched = 200;
         /// Per-profile poll-health streaks (consecutive 429s, consecutive
         /// transient token-refresh failures) driving exponential backoff in
@@ -168,15 +166,26 @@ pub(crate) mod rank {
         ThirdPartyStreak = 290;
         /// Per-profile third-party key-rejection set
         /// (`usage::scheduler::ThirdPartyBroken`): members whose api KEY the
-        /// provider rejected, treated as auth-broken by the chain walks. Live
-        /// only (never persisted); leaf — written/cleared in the third-party
-        /// leg, plus the TUI's stood-down seed (construction/reload plus the
-        /// once-per-second stat-gated re-sync, add-only and
+        /// provider rejected or whose setup token the usage probe found
+        /// refused, treated as auth-broken by the chain walks. Live, with a
+        /// durable twin (`profile_cache::DEAD_KEY_FILE` for a key,
+        /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token); leaf —
+        /// written/cleared in the third-party and probe legs, plus the durable
+        /// twin's seed and re-sync (add-only at construction and reload,
+        /// replacing on the first tick under a lease taken, and stat-gated on
+        /// every later tick — the TUI once a second, the daemon every tick —
         /// fingerprint-intersected at every read), and read by the scans, the
         /// TUI/daemon key-rejected helpers (chain walks and day notices), and
         /// both switch drains, each comparing the recorded fingerprint with
         /// the current profile under one config snapshot.
         ThirdPartyBroken = 295;
+        /// Members the auto-switch walk passes over because their stored login
+        /// read [`crate::profile::StoredLogin::Unknown`] at the last drain
+        /// (daemon: after give-up; TUI: at first skip). In-memory only, never
+        /// persisted — written alone by the two drains, read alone by the scans
+        /// (which re-read each name's `stored_login` lock-free and drop the
+        /// healed ones) before `Config`. Leaf like [`ThirdPartyBroken`].
+        SkippedUnreadable = 296;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;
@@ -198,6 +207,34 @@ pub(crate) mod rank {
         /// Move an `expire_profile_ttl` back inside a `with_state_lock` and this
         /// asserts.
         ProfileTtl = 450;
+        /// `claude_json::JsonSyncLock` (the `.claude.json` merge flock, at
+        /// `~/.tollgate/.claude-json-sync.lock`). Serializes the carried-rank
+        /// merge across every wrapper process so N live `tollgate start`
+        /// sessions reconciling one `$HOME/.claude.json` event do not all read
+        /// the stale members and each rewrite every copy. A true leaf — nothing
+        /// is acquired while it is held — ranked OUTSIDE `State` (500) for the
+        /// same reason `ProfileTtl` is: the hold does N reads, parses and
+        /// writes of MB-sized files, and a cross-process flock is a
+        /// serialization point nothing should hold across that IO. Its takers
+        /// are the watchdog's config leg (try-once, no ranked lock held),
+        /// `ProfileRuntime::drop` (wait, no ranked lock held), the switch
+        /// paths' `strip_home_oauth_account` (try-once, taken AFTER both
+        /// `Config` and `State` are released and gated on the switch actually
+        /// moving the active profile, so the strip never runs under `State`),
+        /// the Services-tab wire (try-once), and the runtime seed (wait, taken
+        /// OUTSIDE the state flock: `JsonSync` (480) ranks OUTSIDE `State`
+        /// (500), taken with no state flock held, so the seed's record write
+        /// cannot run under `with_state_lock`).
+        JsonSync = 480;
+        /// `sessions::RescueFileLock` (`~/.tollgate/rescue.lock`), held across
+        /// one global file's rescue: the compare, the copy or append, and the
+        /// verify. A true leaf — nothing is acquired while it is held — ranked
+        /// OUTSIDE `State` (500) like `JsonSync`: the hold is file-sized IO,
+        /// and a rescue never waits on it with the state flock held, which the
+        /// rank turns into an assertion. Its takers are every rescue tail (the
+        /// GC, `acquire`, `Drop`, a profile's delete, the isolated teardown),
+        /// each after its state-flock hold has dropped.
+        RescueFile = 490;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —
@@ -217,6 +254,11 @@ pub(crate) mod rank {
         Activity = 600;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
+        /// Codex poll-cadence memo (`usage::scheduler::CODEX_POLLED_AT`). Taken
+        /// alone by `forget_codex_polled`, and under the epoch guard (160) by the
+        /// codex landing's section 2, which also takes the usage stores (300/350)
+        /// — so it ranks above them all as a leaf.
+        CodexPolled = 1150;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
@@ -259,12 +301,27 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
+        /// Process-global queue of forgets a change site noted
+        /// (`usage::forget::PENDING_FORGETS`): recorded inside the state flock
+        /// (rank 500), drained with no ranked lock held.
+        ForgetQueue = 1805;
+        /// The per-process identity snapshot every reload compare reads
+        /// (`usage::forget::MemoryStores::snapshot`). A leaf ABOVE
+        /// [`ForgetQueue`]: the compare computes its diff under it, releases it,
+        /// then forgets into the store locks (ranks 200-350), which would
+        /// otherwise invert the order.
+        Snapshot = 1810;
         /// The managed gateway's published slot (`daemon::gateway`): the
         /// supervisor thread replaces it, the status writer and
         /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is
         /// one clone or one assignment, with no IO, probe or child wait under
         /// it.
         GatewayPublished = 1900;
+        /// Who holds control of each pane, and the contention records `/events`
+        /// relays (`daemon::api::terminal::TerminalHolders`). A true leaf: every
+        /// acquisition is one bookkeeping step, and the warning line it decides
+        /// on is written after the guard drops.
+        TerminalHolders = 1902;
         /// A B session helper's ack lock (`live_sessions/<sid>.helper.lock`,
         /// `hot_swap::run_session_helper`). A leaf only the helper process
         /// takes: it holds no other lock, and nothing is taken under it but

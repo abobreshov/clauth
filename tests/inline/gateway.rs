@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway engine: the record and token file, discovery in shunt's order,
 //! bind resolution, the env file, the version floor and `/health`, the admin
 //! edit behind its `shunt check` gate, and the store move. Every test holds a
@@ -104,6 +104,37 @@ fn the_record_refuses_a_config_it_cannot_edit_in_place() {
         let err = GatewayRecord::new(PathBuf::from(config)).expect_err(config);
         assert_eq!(err.to_string(), message, "{config}");
     }
+}
+
+/// Windows canonicalizes to a `\\?\C:\…` verbatim path, which the record, the
+/// `status.json` slot, the card and every error would then show; the record
+/// holds the plain path that verbatim form stands for.
+#[test]
+fn an_adopted_record_holds_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let plain = crate::testutil::plain_path(&home.home().join("etc").join("shunt.toml"));
+    assert_eq!(record.config(), plain);
+}
+
+/// A record an older tollgate wrote holds the verbatim form; it loads as the
+/// plain path, so no surface shows the prefix before a fresh adoption.
+#[cfg(windows)]
+#[test]
+fn a_record_holding_a_verbatim_config_path_loads_plain() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\n");
+    let verbatim = fs::canonicalize(&config).expect("canonical");
+    let verbatim = verbatim.to_str().expect("utf-8 path");
+    assert!(
+        verbatim.starts_with(r"\\?\"),
+        "std canonicalizes to the verbatim form here: {verbatim}"
+    );
+    let path = record_path().expect("record path");
+    write(&path, &format!("config = {}\n", toml_edit::value(verbatim)));
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    assert_eq!(record.config(), crate::testutil::plain_path(&config));
 }
 
 /// Every path the record holds resolves against whatever working directory
@@ -1344,7 +1375,7 @@ fn a_config_that_does_not_parse_names_the_line_never_its_text() {
         .expect_err("a bare value is not TOML");
     assert_eq!(
         format!("{err:#}"),
-        "the adopted shunt config does not parse as TOML (line 2)"
+        "the shunt config does not parse as TOML (line 2, column 11)"
     );
 }
 
@@ -1478,8 +1509,9 @@ fn gate(fixture: &str) -> Gate {
     );
     let token = admin_token_path().expect("token path");
     let body = format!(
-        "d='{stub}'\n\
-         if [ -e \"$d/slow\" ]; then echo $$ > \"$d/pid\"; exec sleep 60; fi\n\
+        "{record}\n\
+         d='{stub}'\n\
+         if [ -e \"$d/slow\" ]; then echo $$ > \"$d/pid\"; record_start $$ \"$d/pid.start\"; exec sleep 60; fi\n\
          echo call >> \"$d/calls\"\n\
          printf '%s\\n' \"$@\" > \"$d/args\"\n\
          pwd -P > \"$d/cwd\"\n\
@@ -1491,8 +1523,9 @@ fn gate(fixture: &str) -> Gate {
          if [ -e \"$d/fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
          if [ -e \"$d/loud\" ]; then head -c 70000 /dev/zero | tr '\\000' x >&2; exit 1; fi\n\
          if [ -e \"$d/loud-success\" ]; then head -c 200000 /dev/zero | tr '\\000' x >&2 || exit 1; fi\n\
-         if [ -e \"$d/held\" ]; then echo 'config error: boom' >&2; sleep 60 >&2 & echo $! > \"$d/held-pid\"; exit 1; fi\n\
+         if [ -e \"$d/held\" ]; then echo 'config error: boom' >&2; sleep 60 >&2 & echo $! > \"$d/held-pid\"; record_start $! \"$d/held-pid.start\"; exit 1; fi\n\
          exit 0",
+        record = crate::testutil::RECORD_START_SH,
         stub = stub.display(),
         token = token.display(),
         config = config.display(),
@@ -1687,6 +1720,7 @@ fn adoption_records_a_symlinked_configs_target_and_the_link_survives_the_edit() 
 fn a_check_that_outruns_its_bound_is_stopped_and_writes_nothing() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("slow"), "");
+    let _sleep = crate::testutil::SleepGuard(g.stub.join("pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 
@@ -1772,6 +1806,7 @@ fn a_check_that_passes_after_writing_past_the_cap_lands_its_edit() {
 fn a_checks_stderr_is_read_within_the_checks_bound() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("held"), "");
+    let _held_guard = crate::testutil::SleepGuard(g.stub.join("held-pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 
@@ -3183,6 +3218,42 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
                 .exists()
         );
     }
+}
+
+/// A store source under `~/.tollgate` stays tollgate's own however long its path:
+/// `dunce` keeps a canonical path's `\\?\` prefix past 260 characters and
+/// drops it below, so both sides of the prefix check must resolve the same
+/// way or a tollgate file reads as foreign and moves.
+#[cfg(windows)]
+#[test]
+fn a_long_store_source_under_tollgate_stays_tollgate_owned() {
+    let home = HomeSandbox::new();
+    let mut path = home.home().join(".tollgate").join("codex");
+    for segment in ["a", "b", "c", "d", "e"] {
+        path.push(segment.repeat(60));
+    }
+    path.push("auth.json");
+    assert!(
+        path.as_os_str().len() > 260,
+        "the source path is long: {path:?}"
+    );
+    write(&path, "tollgate-profile-login");
+    let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&path)));
+
+    assert_eq!(
+        move_stores(&record).map_err(|e| format!("{e:#}")),
+        Ok(StoreMove {
+            moved: Vec::new(),
+            kept: vec![KeptFile::At {
+                path: path.clone(),
+                reason: KeptReason::TollgateOwned,
+            }],
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("still there"),
+        "tollgate-profile-login"
+    );
 }
 
 /// A hard link onto the codex CLI's login is another owner's login even though

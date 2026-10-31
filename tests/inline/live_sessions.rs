@@ -11,12 +11,16 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         start_profile: profile.to_string(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: Some(PathBuf::from("/w/proj")),
         isolated: false,
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -28,6 +32,11 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         relaunch_capable: false,
         relaunched_from: None,
         intended_at: None,
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+        visited_members: vec![],
     }
 }
 
@@ -49,6 +58,63 @@ fn a_row_predating_the_opt_in_key_deserializes_as_not_following_the_chain() {
         row.harness,
         crate::harness::Harness::Claude,
         "a row with no `harness` key predates the axis, so it is a claude row"
+    );
+}
+
+/// A row predating the child-pid and launch-families fields parses as unjoined
+/// and unknown-demand, and a `None` of either serializes ABSENT (not `null`),
+/// so an older tollgate's row round-trips byte-identical. The serialized-absence
+/// half is what binds the serde pair: a parse-only pin would pass with
+/// `#[serde(default)]` deleted, since serde implicitly defaults a missing
+/// `Option`.
+#[test]
+fn a_row_predating_the_child_pid_key_reads_unjoined_and_omits_the_key() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+    assert_eq!(row.claude_pid, None, "no key must read as unjoined");
+    assert_eq!(
+        row.launch_families, None,
+        "no key must read as unknown demand"
+    );
+
+    let written = serde_json::to_value(&row).expect("serialize");
+    let obj = written.as_object().expect("object");
+    assert!(
+        !obj.contains_key("claude_pid"),
+        "a None child pid must serialize absent, not as null"
+    );
+    assert!(
+        !obj.contains_key("launch_families"),
+        "a None launch demand must serialize absent, not as null"
+    );
+}
+
+/// A row predating the credit-leave keys reads both as false, and a false of
+/// either serializes ABSENT (not `false`), so an older tollgate's row
+/// round-trips byte-identical — the serde pair's serialized-absence half.
+#[test]
+fn a_row_predating_the_credit_leave_keys_omits_them() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+    assert!(!row.credit_leave, "no key must read as not a credit leave");
+    assert!(
+        !row.credit_leave_aware,
+        "no key must read as not credit-leave-aware"
+    );
+
+    let written = serde_json::to_value(&row).expect("serialize");
+    let obj = written.as_object().expect("object");
+    assert!(
+        !obj.contains_key("credit_leave"),
+        "a false credit_leave must serialize absent, not as false"
+    );
+    assert!(
+        !obj.contains_key("credit_leave_aware"),
+        "a false credit_leave_aware must serialize absent, not as false"
     );
 }
 
@@ -74,6 +140,47 @@ fn a_codex_row_round_trips_its_harness_tag() {
     assert!(
         raw.contains("\"harness\":\"codex\""),
         "the on-disk spelling is lowercase: {raw}"
+    );
+}
+
+/// A row written by a tollgate that predates the delegate mark must not read as
+/// a delegate on upgrade — the header's split would then file every
+/// already-running session under the delegates side.
+#[test]
+fn a_row_predating_the_delegate_key_deserializes_as_own() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+
+    assert!(
+        !row.is_delegate,
+        "a row with no `is_delegate` key must default to own"
+    );
+}
+
+/// The mark survives the registry round-trip and spells itself a bare bool, the
+/// stable on-disk form a mixed-version window reads back.
+#[test]
+fn a_delegate_row_round_trips_its_mark() {
+    let _home = HomeSandbox::new();
+    let mut written = row("4242-0", "work");
+    written.is_delegate = true;
+
+    register(&written).expect("register");
+
+    let listed = list().pop().expect("one row");
+    assert_eq!(listed, written, "the mark must survive the round-trip");
+    let raw = std::fs::read_to_string(
+        crate::profile::tollgate_dir()
+            .expect("tollgate dir")
+            .join("live_sessions")
+            .join("4242-0.json"),
+    )
+    .expect("read row file");
+    assert!(
+        raw.contains("\"is_delegate\":true"),
+        "the on-disk spelling carries the mark: {raw}"
     );
 }
 
@@ -122,6 +229,28 @@ fn each_writers_update_preserves_the_others_fields() {
     );
     assert_eq!(after.last_swap_at, Some(1_700_000_009_000));
     assert_eq!(after.chain_cursor, Some(2));
+}
+
+/// A string where the `pid` number belongs would otherwise quote it in the
+/// parser's message; the update names the position alone.
+#[test]
+fn an_unreadable_row_names_the_position() {
+    let _home = HomeSandbox::new();
+    let path = row_path("4242-0").expect("row path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "{\"pid\": \"sk-c2probe-NOTAKEY\"}").expect("mistyped row");
+
+    let err = update_as_daemon("4242-0", |d| d.set_intended_member("kerry"))
+        .expect_err("a mistyped row must fail the update");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "unreadable live-session row for 4242-0 (line 1, column 28)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
 }
 
 /// A delegate's row is registered by the `tollgate mcp` that spawns it (that
@@ -388,6 +517,47 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
             .sessions,
         1,
         "only the row whose marker is still held is a live session"
+    );
+}
+
+/// F8: the daemon's background hold is not a tollgate start session — one row per
+/// fixed tree however many jobs, and it exists while a job names the tree, not
+/// while a launch runs. A LAUNCHER's own background row (no hold flag) is still
+/// a session, for its launch.
+#[test]
+fn collect_excludes_the_daemons_background_hold() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+
+    let hold = LiveSession {
+        background: true,
+        background_hold: true,
+        ..row("4242-0", "work")
+    };
+    register(&hold).expect("register the hold row");
+    let _hold_marker = crate::runtime::hold_background_row_marker(&name, "4242-0")
+        .expect("hold the daemon's marker");
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member(&name)
+            .sessions,
+        0,
+        "the daemon's hold is no session"
+    );
+
+    let launcher = LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    };
+    register(&launcher).expect("register the launcher row");
+    let _launcher_marker = crate::runtime::hold_background_row_marker(&name, "4243-0")
+        .expect("hold the launcher's marker");
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member(&name)
+            .sessions,
+        1,
+        "a launcher's own background row still counts"
     );
 }
 
@@ -875,6 +1045,28 @@ fn an_unattributed_bare_session_still_counts_toward_the_fleet_total() {
         "no account hosts it"
     );
     assert_eq!(tally.total(), Some(1));
+    assert_eq!(
+        tally.own(),
+        Some(1),
+        "an unattributed bare session counts as own"
+    );
+    assert_eq!(tally.delegates(), Some(0));
+}
+
+/// A bare `claude` is the end user's own session, never a delegate: the split
+/// folds it into the own side, and `total` stays the sum of both parts.
+#[test]
+fn a_bare_session_counts_as_own() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-work");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(tally.total(), Some(1));
+    assert_eq!(tally.own(), Some(1), "a bare session is an own session");
+    assert_eq!(tally.delegates(), Some(0));
 }
 
 /// `total` counts sessions, never `following`, and a session whose account was
@@ -894,6 +1086,38 @@ fn the_fleet_total_counts_every_session_whatever_its_account_or_chain_flag() {
     ]);
 
     assert_eq!(tally.total(), Some(3));
+}
+
+/// The header splits the fleet count into own (non-delegate) and delegate
+/// sessions. A codex row is own, and `total` keeps counting both, so every
+/// existing caller of `total` keeps its meaning.
+#[test]
+fn the_tally_splits_own_from_delegates_and_total_is_unchanged() {
+    let mut codex = row("4242-2", "work");
+    codex.harness = crate::harness::Harness::Codex;
+    let mut delegate = crate::testutil::live_row("9999-0", "work");
+    delegate.is_delegate = true;
+    let mut other_delegate = crate::testutil::live_row("9999-1", "work");
+    other_delegate.is_delegate = true;
+
+    let tally = LiveTally::of([
+        crate::testutil::live_row("4242-0", "work"),
+        crate::testutil::live_row("4242-1", "work"),
+        codex,
+        delegate,
+        other_delegate,
+    ]);
+
+    assert_eq!(tally.total(), Some(5), "total keeps counting every row");
+    assert_eq!(tally.own(), Some(3), "own is the non-delegate rows");
+    assert_eq!(tally.delegates(), Some(2), "delegates is the marked rows");
+}
+
+/// An unread tally gives neither part a reading — the split chip's `—` form.
+#[test]
+fn an_unread_tally_reads_neither_part() {
+    assert_eq!(LiveTally::unread().own(), None);
+    assert_eq!(LiveTally::unread().delegates(), None);
 }
 
 /// Put a regular file where a dir tollgate lists should be: `read_dir` then fails

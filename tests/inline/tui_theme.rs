@@ -43,8 +43,8 @@ green = "#00ff00"
 cyan = "#00ffff"
 "##;
 
-/// Holds the tier lock (every palette-pinning test shares it with
-/// `TierSandbox`) and puts the process palette back on drop.
+/// Pins the thread's tier and restores its palette after a test. Both holders
+/// are thread-local, so parallel render tests keep their own palette.
 struct PaletteGuard {
     _tier: crate::testutil::TierSandbox,
     prev: Option<Palette>,
@@ -363,4 +363,38 @@ fn the_palette_key_round_trips_and_defaults_to_auto() {
     assert_eq!(default.palette_setting(), PaletteSetting::Auto);
     // Unset stays unwritten, so an untouched profiles.toml is unchanged.
     assert!(!toml::to_string(&default).unwrap().contains("palette"));
+}
+
+#[test]
+fn compatible_toast_blending_resolves_the_installed_palette_and_reset_background() {
+    let _guard = PaletteGuard::new(Tier::Compatible);
+    let mut palette = CATPPUCCIN;
+    palette.kind = PaletteKind::Omarchy;
+    palette.swatches[Role::Bg as usize] = Swatch::new(10, 30, 50, 35);
+    palette.swatches[Role::BgSunken as usize] = Swatch::new(60, 80, 100, 90);
+    install_palette(&palette);
+
+    // The installed RGB pair blends to (35,55,75), nearest xterm index 237.
+    // Neither the terminal's standard RGB for indices 35/90 nor Catppuccin's
+    // background gives that result.
+    assert_eq!(blend_over(bg(), bg_sunken(), 0.5), Color::Indexed(237));
+    assert_eq!(
+        blend_over(Color::Reset, bg_sunken(), 0.5),
+        Color::Indexed(237),
+    );
+}
+
+#[test]
+fn a_test_palette_and_tier_do_not_leak_into_another_thread() {
+    let _guard = PaletteGuard::new(Tier::Compatible);
+    install_palette(&parse_omarchy_colors(TOKYO_NIGHT).unwrap());
+    let parent_background = bg();
+    assert_eq!(
+        std::thread::spawn(|| (tier(), current_palette(), bg()))
+            .join()
+            .unwrap(),
+        (Tier::Full, CATPPUCCIN, Color::Rgb(30, 30, 46)),
+    );
+    assert_eq!(tier(), Tier::Compatible);
+    assert_eq!(bg(), parent_background);
 }

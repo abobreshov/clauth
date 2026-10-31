@@ -66,9 +66,10 @@ const HEALTH_CONNECT_SECS: u64 = 4;
 /// and this is what keeps a wedged answerer from parking the caller.
 const HEALTH_RESPONSE_SECS: u64 = 2;
 
-/// The probe's end-to-end ceiling, the two phase bounds added: ureq re-arms
-/// its response deadline before every wait (`oauth::TOKEN_HTTP_DEADLINES`),
-/// so the sum is enforced as one global bound as well.
+/// The probe's end-to-end ceiling, the two phase bounds added:
+/// [`probe_health`] also sets `timeout_global` to this sum, which is what
+/// enforces it as one end-to-end bound (the header deadline alone stops at the
+/// headers; see `oauth::TOKEN_HTTP_DEADLINES` for the 3.4.2 measurement).
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration =
     Duration::from_secs(HEALTH_CONNECT_SECS + HEALTH_RESPONSE_SECS);
 
@@ -109,7 +110,7 @@ impl GatewayRecord {
     /// re-pointed link takes a fresh adoption.
     pub(crate) fn new(config: PathBuf) -> Result<Self> {
         check_adoptable(&config)?;
-        let config = std::fs::canonicalize(&config)
+        let config = crate::canonical::plain(&config)
             .with_context(|| format!("cannot resolve the shunt config {}", config.display()))?;
         check_adoptable(&config)?;
         Ok(Self {
@@ -140,7 +141,11 @@ impl GatewayRecord {
         {
             return Ok(None);
         }
-        let record: Self = read_toml_file(&path)?;
+        let mut record: Self = read_toml_file(&path)?;
+        // A record an older tollgate wrote holds Windows' verbatim `\\?\` form;
+        // load it by the rule a fresh adoption follows (plain wherever a plain
+        // form exists).
+        record.config = crate::canonical::display(&record.config).to_path_buf();
         check_record(&record)
             .with_context(|| format!("invalid gateway record {}", path.display()))?;
         Ok(Some(record))
@@ -1506,15 +1511,17 @@ fn read_config_text(config: &Path) -> Result<String> {
 /// The user's config may hold literal upstream keys, so a parse error names
 /// the line and never quotes it the way the parser's own message does.
 fn parse_config(text: &str) -> Result<DocumentMut> {
-    text.parse::<DocumentMut>().map_err(|e| {
-        match e.span().and_then(|span| text.get(..span.start)) {
-            Some(head) => anyhow!(
-                "the adopted shunt config does not parse as TOML (line {})",
-                head.matches('\n').count() + 1
-            ),
-            None => anyhow!("the adopted shunt config does not parse as TOML"),
-        }
-    })
+    text.parse::<DocumentMut>()
+        .map_err(|e| config_parse_error(text, &e))
+}
+
+/// The error for a config `text` that does not parse: the line and column,
+/// never the parser's own message, which quotes the text.
+fn config_parse_error(text: &str, e: &toml_edit::TomlError) -> anyhow::Error {
+    let position = e
+        .span()
+        .and_then(|span| crate::format::toml_position_from_span(text, span.start));
+    crate::format::parse_refusal("the shunt config does not parse as TOML", position)
 }
 
 fn need_in(doc: &DocumentMut, key_ref: &str) -> Result<AdminNeed, ConfigEditRefusal> {
@@ -2647,9 +2654,12 @@ fn another_owners_login(
     Ok(None)
 }
 
-/// `path` canonicalized; `None` when it does not exist.
+/// `path` canonicalized; `None` when it does not exist. `std`, never `dunce`:
+/// these paths are only compared with each other, and on Windows `dunce`
+/// keeps the `\\?\` prefix past 260 characters but drops it below, so a long
+/// source would stop matching a short `~/.tollgate`.
 fn canonical(path: &Path) -> Result<Option<PathBuf>> {
-    match std::fs::canonicalize(path) {
+    match crate::canonical::identity(path) {
         Ok(path) => Ok(Some(path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to resolve {}", path.display())),

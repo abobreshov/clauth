@@ -32,6 +32,7 @@ fn stats(balance: &str) -> ThirdPartyStats {
             label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: format!("{balance} USD"),
             kind: StatRowKind::Body,
+            raw: None,
         }],
         bars: Vec::new(),
         plan: None,
@@ -257,6 +258,7 @@ fn a_refresh_notifies_once_per_crossing_and_window() {
             label: "this month".into(),
             value: format!("{v} USD"),
             kind: StatRowKind::Body,
+            raw: None,
         });
         Ok(s)
     });

@@ -1,7 +1,7 @@
 use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -643,6 +643,86 @@ fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 }
 
+/// A torn codex roster names the position alone in the roster line, never the
+/// api key in the parser's message — and the path only once, the line's own
+/// copy, not re-quoted from the parse error.
+#[test]
+fn a_torn_codex_roster_names_the_position_and_never_the_secret() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\nFOO = \"1\"\n");
+    let tollgate = home.home().join(".tollgate");
+    // `api_key = "sk-c2probe-NOTAKEY` is an unterminated string: the span sits
+    // at end-of-input, so the position is line 1, column 30.
+    fs::write(
+        tollgate.join("codex-profiles.toml"),
+        "api_key = \"sk-c2probe-NOTAKEY",
+    )
+    .expect("write torn roster");
+    CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    assert_eq!(
+        per_profile_env_keys().expect("the roster is not a claude file: never a pause"),
+        BTreeSet::from(["FOO".to_string()])
+    );
+    drop(capture);
+
+    let path = tollgate.join("codex-profiles.toml");
+    let expected = format!(
+        "tollgate: {} did not yield the codex roster (line 1, column 30); settings.json sync \
+         reads every profile dir as claude until it reads cleanly",
+        path.display()
+    );
+    let snapshot = lines.snapshot();
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the roster line names the position and the path once: expected {expected:?} in {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
+        "the api key must never reach the log: {snapshot:?}"
+    );
+}
+
+/// A directory at the roster path is a read failure, not a parse failure: the
+/// roster line keeps the io root cause in the parens, and the path appears
+/// once. The expected parenthesised part is built from the same
+/// `std::io::Error` the code sees (read-to-string over a directory), never a
+/// hard-coded OS message, so it is portable across linux and windows.
+#[test]
+fn a_directory_at_the_roster_path_names_the_io_failure_once() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\nFOO = \"1\"\n");
+    let tollgate = home.home().join(".tollgate");
+    fs::create_dir_all(tollgate.join("codex-profiles.toml")).expect("mkdir at the roster path");
+    CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    assert_eq!(
+        per_profile_env_keys().expect("the roster is not a claude file: never a pause"),
+        BTreeSet::from(["FOO".to_string()])
+    );
+    drop(capture);
+
+    let roster = tollgate.join("codex-profiles.toml");
+    let io = std::fs::read_to_string(&roster).expect_err("a directory cannot be read as text");
+    let expected = format!(
+        "tollgate: {} did not yield the codex roster ({}); settings.json sync \
+         reads every profile dir as claude until it reads cleanly",
+        roster.display(),
+        io
+    );
+    let snapshot = lines.snapshot();
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the io roster line names the io cause and the path once: expected {expected:?} in {snapshot:?}"
+    );
+}
+
 #[test]
 fn a_config_that_does_not_parse_aborts_the_tick() {
     let home = HomeSandbox::new();
@@ -692,6 +772,154 @@ fn the_pause_warning_latches_and_clears_on_recovery() {
     assert!(
         !ENV_KEYS_WARNED.load(Ordering::Relaxed),
         "a clean read must clear the latch so a recurrence is reported again"
+    );
+}
+
+/// A torn `[env]` value would otherwise quote the api key in the pause
+/// warning; the line names the position alone.
+#[test]
+fn a_torn_config_toml_pause_warning_names_the_position_and_never_the_secret() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\napi_key = \"sk-c2probe-NOTAKEY");
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    assert!(
+        per_profile_env_keys().is_none(),
+        "the torn env pauses the tick"
+    );
+    drop(capture);
+
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join("profiles")
+        .join("p1")
+        .join("config.toml");
+    let expected = format!(
+        "tollgate: settings.json sync paused: {} is not valid TOML (line 2, column 30). \
+         The affected profiles' custom [env] keys are unknown, so no settings are synced \
+         until it reads cleanly",
+        path.display()
+    );
+    let snapshot = lines.snapshot();
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the pause line names the position: expected {expected:?} in {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
+        "the api key must never reach the log: {snapshot:?}"
+    );
+}
+
+/// The same mtime tie on the shared writer: a Claude Code write to the base
+/// `settings.json` landing within one timestamp tick of tollgate's copy write ties
+/// the copy on mtime, and the tie must never go to tollgate's own echo. The hook
+/// stamps the base with the copy's mtime, so the tie holds on any filesystem.
+#[test]
+fn a_claude_code_write_tying_a_copy_write_on_mtime_wins_the_next_pass() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(10));
+    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(5));
+
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::jsonsync::set_post_write_hook(Some(Box::new({
+        let base = base.clone();
+        let p1 = p1.clone();
+        let fired = std::sync::Arc::clone(&fired);
+        move || {
+            if fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                return;
+            }
+            let copy_mtime = fs::metadata(&p1)
+                .expect("copy metadata")
+                .modified()
+                .expect("copy mtime");
+            write_json(
+                &base,
+                &json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+                copy_mtime,
+            );
+        }
+    })));
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::jsonsync::set_post_write_hook(None);
+        }
+    }
+    let _hook_guard = HookGuard;
+
+    sync();
+    crate::jsonsync::set_post_write_hook(None);
+
+    assert_eq!(
+        fired.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "precondition: tollgate wrote the copy exactly once"
+    );
+    assert_eq!(
+        fs::metadata(&base)
+            .expect("meta")
+            .modified()
+            .expect("mtime"),
+        fs::metadata(&p1).expect("meta").modified().expect("mtime"),
+        "precondition: the base's write and the copy tie on mtime"
+    );
+
+    sync();
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+        "the Claude Code write survives the tie"
+    );
+    assert_eq!(
+        read_json(&p1),
+        json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+        "the copy converges on the Claude Code write"
+    );
+}
+
+/// The settings written-copy record is owner-only and holds no member
+/// bytes — only path, mtime (secs + nanos), size, and digest.
+#[cfg(unix)]
+#[test]
+fn the_settings_record_is_owner_only_and_holds_no_member_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(10));
+
+    sync();
+
+    let record = home.home().join(".tollgate/.settings-sync-written.json");
+    let meta = fs::metadata(&record).expect("the record exists");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the settings record is owner-only"
+    );
+
+    let text = String::from_utf8(fs::read(&record).expect("read")).expect("utf-8");
+    assert!(
+        !text.contains("theme"),
+        "the settings record holds no member bytes"
+    );
+
+    let entries: Vec<Value> = serde_json::from_str(&text).expect("record parses");
+    assert_eq!(entries.len(), 1, "one copy was written (the base)");
+    assert_eq!(
+        entries[0]["path"],
+        json!(base.to_string_lossy().into_owned())
     );
 }
 

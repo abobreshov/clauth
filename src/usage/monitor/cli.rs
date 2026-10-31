@@ -304,7 +304,7 @@ fn list(json: bool) -> Result<()> {
     }
     if rows.is_empty() {
         outln!(
-            "no monitors; add one with `tollgate monitor add <id> --kind <nous|openrouter|provider|ollama_cloud> …`"
+            "no monitors; add one with `tollgate monitor add <id> --kind <nous|openrouter|provider|ollama_cloud> ...`"
         );
         return Ok(());
     }

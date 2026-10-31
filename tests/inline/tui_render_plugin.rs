@@ -73,7 +73,7 @@ fn app_with(check: Check) -> App {
 
 fn render(app: &App) -> (Vec<String>, ratatui::buffer::Buffer) {
     let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
     (crate::testutil::buffer_rows(&buf), buf)
 }
@@ -974,7 +974,7 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(healthy_config());
     app.plugin.herdr_options_cursor = 2;
-    app.plugin.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    app.plugin.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
     let tag_row = rows

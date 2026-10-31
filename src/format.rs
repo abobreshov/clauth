@@ -10,10 +10,10 @@
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 
-use crate::fallback::{StartBlock, StartCandidate};
-use crate::profile::Profile;
+use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
+use crate::profile::{Profile, ProfileName};
 use crate::profile_json::OauthAge;
-use crate::usage::{PlanTier, humanize_duration};
+use crate::usage::{PlanTier, UsageInfo, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -22,6 +22,8 @@ use crate::usage::{PlanTier, humanize_duration};
 // same event its own way and they drifted (one condition printed four different
 // sentences). `head` is the at-a-glance summary; `detail` the cause and the
 // recovery step.
+
+pub(crate) const DAEMON_STOPPING: &str = "the daemon is stopping; retry once it is back";
 
 /// One diagnostic, rendered per surface. Keep `head` short enough to read on a
 /// toast's bold first line without wrapping; put the cause and next step in
@@ -141,6 +143,22 @@ pub(crate) enum Cause {
     /// locked and nothing is broken. The next step is the operator's, and it is
     /// specific enough that a generic retry hint would be wrong.
     LiveSessionOnRotatingChain(String),
+    /// An UNFINISHED Claude Code background job still reads this profile's
+    /// rotating pair, so rotating would strand it the same way a live session is
+    /// stranded. Distinct from [`Self::LiveSessionOnRotatingChain`] because the
+    /// next step is the operator's and different: no session is running, so
+    /// waiting changes nothing — only `claude stop` (or letting the job
+    /// finish) frees the chain.
+    BackgroundJobOnRotatingChain(String),
+    /// Claude Code's background-job store could not be read, so tollgate cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL store failure
+    /// blocks every profile on macOS until it clears; a tree-local failure
+    /// blocks only the profile whose store failed. Same fail-closed direction
+    /// as the other two arms, and its own copy because none of their next steps
+    /// apply: nothing is running to wait for and nothing is there to stop. The
+    /// `store` is the dir the refusal names (the global store or the account's
+    /// own `jobs/`).
+    UnreadableJobStoreOnRotatingChain { profile: String, store: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -227,12 +245,22 @@ impl Cause {
             }
             Self::SidecarWriteFailed(profile) => {
                 format!(
-                    "could not write '{profile}' session token · check permissions on ~/.tollgate"
+                    "could not write '{profile}' session token. Check permissions on ~/.tollgate"
                 )
             }
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
                     "'{profile}' has a live tollgate start session still on its rotating login; retry in a moment"
+                )
+            }
+            Self::BackgroundJobOnRotatingChain(profile) => {
+                format!(
+                    "'{profile}' has a background session still on its rotating login; end it with claude stop to rotate"
+                )
+            }
+            Self::UnreadableJobStoreOnRotatingChain { profile, store } => {
+                format!(
+                    "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
                 )
             }
             Self::RotationLockHeld(profile) => {
@@ -241,19 +269,19 @@ impl Cause {
             Self::RollingGrantUnrecorded(profile) => {
                 format!(
                     "'{profile}' usage chain has no recorded grant beyond the setup-token \
-                     scopes, so a rolling bearer cannot be told from a mint · run \
+                     scopes, so a rolling bearer cannot be told from a mint. Run \
                      `tollgate login {profile}` to record the chain's real grant"
                 )
             }
             Self::SidecarMisfilled(profile) => {
                 format!(
                     "'{profile}' session token holds a rotating pair and no live mint backup \
-                     exists to heal it · re-capture with `tollgate login {profile} --setup-token`"
+                     exists to heal it. Re-capture with `tollgate login {profile} --setup-token`"
                 )
             }
             Self::StateLockBusy(profile) => {
                 format!(
-                    "another tollgate process holds ~/.tollgate's state lock · '{profile}' left \
+                    "another tollgate process holds ~/.tollgate's state lock. '{profile}' left \
                      unchanged"
                 )
             }
@@ -268,7 +296,7 @@ impl Cause {
             Self::LoginChanged(profile) => {
                 format!(
                     "'{profile}' login changed during its refresh and the new login expires \
-                     soon · retry in a moment"
+                     soon. Retry in a moment"
                 )
             }
         }
@@ -401,14 +429,31 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// (`tollgate login` is the documented quarantine recovery, AUTH-1 in
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
-/// line, so the surfaces cannot spell one state two ways. Those last three
-/// render it for a key the profile's `AuthExpired` verdict pronounces dead,
-/// too — Alibaba excepted, whose verdict records a dead console session:
-/// `oauth::third_party_dead_chain_copy` treats such a key as no credential, and
-/// routes a console-carrying Alibaba profile to [`third_party_dead_console`]
-/// instead, which says the opposite about the key.
+/// line, so the surfaces cannot spell one state two ways. A key the provider
+/// refused renders [`api_key_rejected`] on those surfaces instead.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
     format!("profile has no api key: {name} (run `tollgate login {name} --api-key <key>`)")
+}
+
+/// A third-party api key the provider's dead-key record names rejected
+/// ([`crate::fallback::third_party_key_rejected`] is the predicate): the key is
+/// the credential its sessions spend, so the fix re-captures it with
+/// `--api-key`, the command that also lifts a keyless profile — a bare
+/// `tollgate login <name>` runs the browser flow and leaves the key untouched.
+/// Rendered by the MCP pre-flight's key-rejected arm and by
+/// `oauth::third_party_dead_chain_copy`'s callers.
+pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
+    format!("api key rejected: {name} (run `tollgate login {name} --api-key <key>`)")
+}
+
+/// An OAuth account's setup token that the usage probe found refused
+/// ([`crate::fallback::third_party_key_rejected`] is the predicate, split by
+/// [`crate::usage::dead_login_is_setup_token`]): the token is the credential
+/// its sessions spend, so the fix re-mints it with `--setup-token`. The
+/// api-key sentence ([`api_key_rejected`]) names a credential the account
+/// does not hold. Rendered by the MCP pre-flight's token-rejected arm.
+pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String {
+    format!("setup token rejected: {name} (run `tollgate login {name} --setup-token`)")
 }
 
 /// A third-party profile whose stored OAuth chain is dead while it still has
@@ -549,6 +594,9 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the tollgate TUI";
 
+/// The one spelling for a stored login that exists but cannot be read.
+pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
+
 /// The `s` a count needs: singular at one.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
@@ -577,25 +625,69 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    if max == 0 {
-        return String::new();
+    // Three ASCII dots stand in for the ellipsis, so the content budget shrinks
+    // by three to keep the total at `max` columns.
+    if max < 3 {
+        return "...".chars().take(max).collect();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    let mut out: String = s.chars().take(max - 3).collect();
+    out.push_str("...");
     out
+}
+
+/// Untrusted text with its control and bidi formatting characters dropped: it
+/// reaches a terminal, where an escape sequence could retitle it or hide a
+/// line, and a bidi override could reorder the line to read as something it is
+/// not.
+pub(crate) fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !reorders_display(*c))
+        .collect()
+}
+
+/// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
+/// overrides (`U+202A..=U+202E`), the isolates (`U+2066..=U+2069`), and the
+/// three directional marks — `U+200E` LRM, `U+200F` RLM, and `U+061C` ALM, the
+/// Arabic-script twin of RLM.
+///
+/// Spelled out rather than tested by general category, because the crate carries
+/// no Unicode tables. The cost of spelling it out is that it is only closed
+/// against the Unicode version it was written from; `Bidi_Control` has been
+/// stable for many releases, and a new member would surface as a codepoint
+/// reaching the terminal rather than as a wrong figure.
+///
+/// Legitimate right-to-left text needs none of them: the implicit bidi algorithm
+/// renders a plain Arabic or Hebrew tail correctly on its own, measured on
+/// both.
+pub(crate) fn reorders_display(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+    )
+}
+
+/// `text` with every character `keep` rejects written as its `\u{..}` escape.
+pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
+    text.chars()
+        .map(|c| {
+            if keep(c) {
+                c.to_string()
+            } else {
+                format!("\\u{{{:04x}}}", u32::from(c))
+            }
+        })
+        .collect()
 }
 
 /// The account's tier: a fetched plan wins when classified, else the OAuth
 /// token's `subscription_type` claim, else `None` when neither names one. A
 /// surface renders its own no-data form on `None` rather than a bare "Claude"
 /// that reads as a real plan.
-pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
+pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanTier> {
     // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
     // the way `profile_json::tier_label` does, or this surface reads "no data"
     // while that one shows the token's tier for the very same account.
-    let fetched = profile
-        .usage
-        .as_ref()
+    let fetched = usage
         .and_then(|u| u.plan.as_ref())
         .map(|p| p.tier.clone())
         .filter(|t| *t != PlanTier::Unknown);
@@ -648,6 +740,43 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
     }
 }
 
+/// Group the integer part of non-negative `n` with `,` thousands separators,
+/// keeping `decimals` fractional digits: `(12345.6, 2)` → `12,345.60`. The one
+/// shared grouping helper behind every full-precision detail-pane count.
+pub(crate) fn group_thousands(n: f64, decimals: usize) -> String {
+    let s = format!("{n:.decimals$}");
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(i, f)| (i, f));
+    let digits = int.len();
+    let mut out = String::with_capacity(digits + digits / 3 + 1 + frac.len());
+    for (i, ch) in int.chars().enumerate() {
+        if i > 0 && (digits - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    out
+}
+
+/// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age
+/// spelling (an ISO date, no time). [`local_stamp`] is this plus the time of
+/// day. Returns `None` when the instant falls outside chrono's representable
+/// range.
+pub(crate) fn local_date(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        naive.year(),
+        naive.month(),
+        naive.day(),
+    ))
+}
+
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
@@ -659,10 +788,8 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         .with_timezone(&Local)
         .naive_local();
     Some(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        naive.year(),
-        naive.month(),
-        naive.day(),
+        "{} {:02}:{:02}:{:02}",
+        local_date(epoch)?,
         naive.hour(),
         naive.minute(),
         naive.second(),
@@ -676,17 +803,76 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
 /// so the same account state never wears two words on two tabs.
 pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
+pub(crate) const DIAG_ORG_REFUSED: &str = "org refused";
+/// The fix line under [`DIAG_ORG_REFUSED`], on the Fallback card and the Usage
+/// card alike.
+pub(crate) const FIX_ORG_REFUSED: &str =
+    "its organization refuses this account, no login fixes that";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
+pub(crate) const DIAG_TOKEN_REJECTED: &str = "token rejected";
+pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
+
+/// The word a dead usage credential (`FetchStatus::AuthExpired`) wears on the
+/// Usage tab and in `tollgate list`, by its cause. An account whose dead login is
+/// its setup token ([`crate::usage::dead_login_is_setup_token`]) only gets the
+/// verdict from the usage probe, so that token was refused. "expired" only
+/// when a session actually lapsed; an account that
+/// never stored one reaches this state too (a working api key does not
+/// authenticate the usage gateway), and telling that operator something expired
+/// sends them hunting for what to renew instead of to the login they have not
+/// run. Past a refused setup token and a captured console, a non-Alibaba
+/// profile has no session at all, so its verdict can only mean the api key
+/// itself was rejected.
+pub(crate) fn auth_expired_label(profile: &Profile) -> &'static str {
+    if crate::usage::dead_login_is_setup_token(profile) {
+        DIAG_TOKEN_REJECTED
+    } else if profile.console.is_some() {
+        "login expired"
+    } else if profile.provider != Some(crate::providers::Provider::Alibaba) {
+        DIAG_KEY_REJECTED
+    } else {
+        "login needed"
+    }
+}
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
+/// The legend names the whole state in one row, where the card's pill and its
+/// faint suffix carry the two halves.
+pub(crate) const DIAG_CREDIT_CAP_LEGEND: &str = "credit cap spent, other models ok";
+/// A member on record as refusing a credit-billed request: the Usage card's
+/// pill, its age trailing as a bare suffix, and the start walk's verdict,
+/// followed by how long ago ([`credit_refused_label`]).
+pub(crate) const DIAG_CREDITS_REFUSED: &str = "credits refused";
+/// The qualifier a still-serving rung trails outside its brackets: a model's
+/// spent week and a spent credit cap both leave the rest of the account usable.
+pub(crate) const DIAG_OTHER_MODELS_OK: &str = "other models ok";
+/// The `⊘` legend row's scoped-week sense: each legend row's full text lives in
+/// one constant.
+pub(crate) const DIAG_SCOPED_SPENT_LEGEND: &str = "one model's week spent, other models ok";
 pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
 pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
+/// The monthly-quota spellings of the two weekly pill words above: a
+/// monthly-only member blocked by its marked 30d quota is never called
+/// "weekly", whatever surface renders the block.
+pub(crate) const DIAG_MONTHLY_SPENT: &str = "30d spent";
+pub(crate) const DIAG_MONTHLY_SOFT: &str =
+    "monthly quota past the weekly switch line, still serving";
 pub(crate) const DIAG_STALE: &str = "stale data";
+/// The Fallback pill for a member tollgate cannot measure: it says what tollgate
+/// CANNOT DO, not what has not happened yet. "no usage yet" reads as "the first
+/// poll is still coming", the opposite of this state, and it is what the
+/// `--explain` age cell prints for an account whose first poll really is
+/// coming. The verb is the one the add confirm and
+/// the daemon line already use ("can't read ... usage"), so every surface says
+/// one thing.
+pub(crate) const DIAG_NO_USAGE: &str = "can't read usage";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
-/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) calls
-/// this under its own 30-day local-stamp arm.
+/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) and the
+/// CLI's session/device age cells call [`spoken_age`], which switches to the
+/// local ISO date at 30 days.
 pub(crate) fn humanize_age(secs: u64) -> String {
     let mins = secs / 60;
     let hours = mins / 60;
@@ -704,6 +890,29 @@ pub(crate) fn humanize_age(secs: u64) -> String {
     }
 }
 
+/// The 30-day line where [`spoken_age`] switches from the relative ladder to
+/// the local ISO date. Shared so a stamp-paired cell drops its age half at the
+/// same instant the age itself becomes a date (the full stamp already carries
+/// it), and the start walk derives the same arm.
+pub(crate) fn age_takes_a_date(age_secs: u64) -> bool {
+    age_secs >= 30 * 24 * 3600
+}
+
+/// A point-in-time age as a person reads it: one relative unit under 30 days
+/// (`4m ago`, `just now` under a minute), the local ISO date (`2026-04-12`) at
+/// 30 days and beyond. `age_secs` is the elapsed seconds; `epoch` is the
+/// instant's epoch seconds, used only for the date arm. The one shared
+/// formatter behind the TUI's `relative_age` and the CLI's `tollgate sessions` /
+/// `tollgate devices` age cells, so every person-facing age reads the same shape.
+/// `None` when the instant falls outside chrono's representable range.
+pub(crate) fn spoken_age(age_secs: u64, epoch: i64) -> Option<String> {
+    if age_takes_a_date(age_secs) {
+        local_date(epoch)
+    } else {
+        Some(humanize_age(age_secs))
+    }
+}
+
 /// The one-line label for a start verdict, sharing the TUI's chip words where
 /// one exists ([`crate::fallback::StartBlock`]).
 pub(crate) fn start_block_label(block: &StartBlock) -> String {
@@ -714,16 +923,39 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
         StartBlock::SameAccount { profile } => format!("same account as {profile}"),
         StartBlock::Disabled => DIAG_DISABLED.to_string(),
         StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),
+        StartBlock::LoggedOut => DIAG_LOGGED_OUT.to_string(),
         StartBlock::Canceled => DIAG_CANCELED.to_string(),
+        StartBlock::OrgRefused => DIAG_ORG_REFUSED.to_string(),
         StartBlock::KickRejected => DIAG_KICK.to_string(),
         StartBlock::NotOauth => "not an oauth account".to_string(),
-        StartBlock::WeeklySpent => DIAG_WEEKLY_SPENT.to_string(),
-        StartBlock::WeeklySoft { pct } => format!("weekly {}", format_pct(*pct)),
+        StartBlock::WeeklySpent { monthly } => {
+            if *monthly {
+                DIAG_MONTHLY_SPENT.to_string()
+            } else {
+                DIAG_WEEKLY_SPENT.to_string()
+            }
+        }
+        StartBlock::WeeklySoft { pct, monthly } => format!(
+            "{} {}",
+            if *monthly { "30d" } else { "weekly" },
+            format_pct(*pct)
+        ),
         StartBlock::FiveHour { pct } => format!("5h {}", format_pct(*pct)),
         StartBlock::ScopedSpent { label, pct } => {
-            format!("{label} {}, other models ok", format_pct(*pct))
+            format!("{label} {}, {DIAG_OTHER_MODELS_OK}", format_pct(*pct))
         }
+        StartBlock::CreditCap => DIAG_CREDIT_CAP_LEGEND.to_string(),
+        StartBlock::CreditRefused { at_ms } => credit_refused_label(*at_ms),
     }
+}
+
+/// [`DIAG_CREDITS_REFUSED`] with the refusal's age, `credits refused 2h ago`,
+/// read as the age cell beside it reads its own ([`spoken_age`]): the date
+/// from 30 days on.
+pub(crate) fn credit_refused_label(at_ms: u64) -> String {
+    let age_secs = crate::usage::now_ms().saturating_sub(at_ms) / 1000;
+    let age = spoken_age(age_secs, (at_ms / 1000) as i64).unwrap_or_else(|| "-".to_string());
+    format!("{DIAG_CREDITS_REFUSED} {age}")
 }
 
 fn start_verdict(row: &StartCandidate) -> String {
@@ -736,7 +968,13 @@ fn start_verdict(row: &StartCandidate) -> String {
 fn start_age_cell(row: &StartCandidate) -> String {
     match row.age {
         OauthAge::Dated(ms) => {
-            let cell = format!("usage {}", humanize_age(ms / 1000));
+            let age_secs = ms / 1000;
+            // The date arm is `now - age` (the reading's own instant, derived,
+            // never a fresh fetch); `now` is the walk's reference instant.
+            let cell = format!(
+                "usage {}",
+                spoken_age(age_secs, row.now - age_secs as i64).unwrap_or_else(|| "-".to_string())
+            );
             if row.stale {
                 format!("{cell} (stale)")
             } else {
@@ -744,7 +982,15 @@ fn start_age_cell(row: &StartCandidate) -> String {
             }
         }
         OauthAge::Undated => "usage undated (stale)".to_string(),
-        OauthAge::Absent => "no usage yet".to_string(),
+        // The default absence is "not read yet". When the walk found no fetch
+        // leg will ever read this member's usage, its answer rides the row and
+        // the cell names why instead, in the fallback pill's own words where it
+        // has them.
+        OauthAge::Absent => match row.no_poll {
+            Some(NoPollReason::CannotMeasure) => DIAG_NO_USAGE.to_string(),
+            Some(NoPollReason::ApiKeyOnly) => "api key, no usage windows".to_string(),
+            None => "no usage yet".to_string(),
+        },
     }
 }
 
@@ -799,20 +1045,156 @@ pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
     )
 }
 
-/// The `--auto` no-member refusal: the first line plus, when rows exist, the
-/// explain rows rendered with no `*` on any of them.
+/// The `--auto` no-member refusal: the first line plus the explain rows
+/// rendered with no `*` on any of them. `rows` is never empty: its one caller
+/// refuses a chain with no resolved member first.
 pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> String {
-    let rendered = render_start_walk(rows, None);
-    if rendered.is_empty() {
-        format!(
-            "--auto found no chain member with headroom{}",
-            start_demand_suffix(demand)
-        )
-    } else {
-        format!(
-            "--auto found no chain member with headroom{}\n{rendered}",
-            start_demand_suffix(demand)
-        )
+    format!(
+        "--auto found no chain member with headroom{}\n{}",
+        start_demand_suffix(demand),
+        render_start_walk(rows, None)
+    )
+}
+
+/// The `--auto` refusal when the fallback chain names no configured profile at
+/// all: every chain name, in chain order, so the user sees the chain to repair
+/// rather than a headroom verdict on members that do not exist. No explain
+/// rows exist to print — nothing in the chain was judged. A chain entry is
+/// never re-validated on load, so every character a profile name cannot hold
+/// prints as its `\u{..}` escape: the line cannot drive or reorder the
+/// terminal, and a dangling name never reads as another, valid one. An empty
+/// entry prints as `""` so it stays visible.
+pub(crate) fn start_missing_refusal(names: &[ProfileName]) -> String {
+    let names = names
+        .iter()
+        .map(|name| {
+            if name.is_empty() {
+                "\"\"".to_owned()
+            } else {
+                escape_unless(name, crate::actions::is_name_char)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("--auto found no chain member that exists ({names})")
+}
+
+// ── Parse-position diagnostics ─────────────────────────────────────────────
+//
+// A parse error of a file tollgate reads can carry the parser's own message,
+// which quotes the offending source line (toml) or the offending value
+// (serde_json), and that text can hold a credential. Every surface therefore
+// renders only the position — `failed to parse <label> at line L, column C`,
+// `failed to parse <label> at line L` for a json error at column 0, or the
+// bare `failed to parse <label>` for an empty file (an end-of-input error at
+// line 1, column 0), an io failure, a `from_value` error (which carries line
+// 0), or a span-less toml error — so a secret in the file never reaches a log
+// line or an error print. The json position is the parser's own line and
+// column; the toml column is a char count from the line start.
+
+/// A parse position to render: a 1-based line and column, or a line alone
+/// when the error names a line but no column. `Copy` so callers pass it by
+/// value like the `(usize, usize)` pair it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsePosition {
+    /// A 1-based line and column.
+    LineColumn { line: usize, column: usize },
+    /// A 1-based line alone — a serde_json error with `column() == 0`, which
+    /// is never a real 1-based column.
+    Line(usize),
+}
+
+/// The 1-based `(line, column)` of a byte `start` in `text`, counted in chars
+/// from the line start. `None` when `start` falls past the end of `text` or
+/// sits off a UTF-8 char boundary. The shared core the toml and toml_edit
+/// helpers call, so the column math lives once. toml's own column also counts
+/// chars from the line start, but falls back to the byte offset from the line
+/// start when the char at the span's start is multi-byte; the two differ there
+/// after multi-byte text, and at EOF after a trailing newline.
+pub(crate) fn toml_position_from_span(text: &str, start: usize) -> Option<ParsePosition> {
+    let head = text.get(..start)?;
+    let line = head.matches('\n').count() + 1;
+    let column = match head.rfind('\n') {
+        Some(nl) => head[nl + 1..].chars().count() + 1,
+        None => head.chars().count() + 1,
+    };
+    Some(ParsePosition::LineColumn { line, column })
+}
+
+/// The 1-based `(line, column)` of a `toml::de::Error`, via
+/// [`toml_position_from_span`]. `None` when the error carries no span (a typed
+/// deserialize over a `toml::Value`).
+pub(crate) fn toml_parse_position(text: &str, e: &toml::de::Error) -> Option<ParsePosition> {
+    toml_position_from_span(text, e.span()?.start)
+}
+
+/// The position of a `serde_json::Error`: a 1-based line and column, a line
+/// alone when the error reports `column() == 0` (a whole-value type error or a
+/// file torn right after a newline), or `None` when there is nothing to name —
+/// an io failure, a `line() == 0` error, or an unexpected end of input at line
+/// 1 column 0 (an empty file).
+pub(crate) fn json_parse_position(e: &serde_json::Error) -> Option<ParsePosition> {
+    if e.line() == 0 {
+        return None;
+    }
+    match e.classify() {
+        serde_json::error::Category::Io => None,
+        // An unexpected end of input at line 1 column 0 is an empty file: no
+        // line has content to name, so the bare frame stays bare. A file torn
+        // right after a newline ends at column 0 on line >= 2 and names the
+        // line.
+        serde_json::error::Category::Eof if e.line() == 1 && e.column() == 0 => None,
+        _ if e.column() == 0 => Some(ParsePosition::Line(e.line())),
+        _ => Some(ParsePosition::LineColumn {
+            line: e.line(),
+            column: e.column(),
+        }),
+    }
+}
+
+/// The position of a `serde_json::Error` in a network body — never a file:
+/// a body names serde's line whenever serde has one, so an empty reply (an
+/// end-of-input error at line 1, column 0) renders `line 1` where
+/// [`json_parse_position`] keeps the empty-file carve-out and stays bare. Every
+/// other error renders exactly as [`json_parse_position`] renders it.
+pub(crate) fn json_body_position(e: &serde_json::Error) -> Option<ParsePosition> {
+    json_parse_position(e).or_else(|| (e.line() > 0).then_some(ParsePosition::Line(e.line())))
+}
+
+/// The shared position fragment — `line L, column C` or `line L` — or `None`
+/// when there is no position to name.
+pub(crate) fn parse_position(position: Option<ParsePosition>) -> Option<String> {
+    position.map(|pos| match pos {
+        ParsePosition::LineColumn { line, column } => format!("line {line}, column {column}"),
+        ParsePosition::Line(line) => format!("line {line}"),
+    })
+}
+
+/// A fresh `failed to parse <label>` error carrying no parser error as its
+/// source: every surface printing `{e}`/`{e:#}` renders the position and
+/// nothing else (`{e:?}` can append a backtrace under `RUST_BACKTRACE`).
+pub(crate) fn parse_error(
+    label: impl std::fmt::Display,
+    position: Option<ParsePosition>,
+) -> anyhow::Error {
+    match parse_position(position) {
+        Some(pos) => anyhow::anyhow!("failed to parse {label} at {pos}"),
+        None => anyhow::anyhow!("failed to parse {label}"),
+    }
+}
+
+/// A sentence-framed parse refusal — `<frame> (line L, column C)`, or
+/// `<frame> (line L)` for a line-only position — as a fresh, source-free
+/// error, for the sites whose own copy states the failure in a sentence rather
+/// than the `failed to parse <label>` frame. A `None` position renders the
+/// bare frame.
+pub(crate) fn parse_refusal(
+    frame: impl std::fmt::Display,
+    position: Option<ParsePosition>,
+) -> anyhow::Error {
+    match parse_position(position) {
+        Some(pos) => anyhow::anyhow!("{frame} ({pos})"),
+        None => anyhow::anyhow!("{frame}"),
     }
 }
 

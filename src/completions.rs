@@ -12,9 +12,10 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
-        local profiles
+        local profiles codex
         profiles=$(tollgate __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor secret api status mcp herdr hermes import plugin completions --theme --prefer-store" -- "${cur}") )
+        codex=$(tollgate __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices usage monitor secret api status mcp herdr hermes import plugin presets completions --theme --prefer-store" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -23,28 +24,36 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--isolated --with-fallback --auto --explain" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --dump-openapi" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "start" ] && { [ "$prev" = "--isolated" ] || [ "$prev" = "--explain" ]; } && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '--(isolated|explain)' >/dev/null; then
+        local profiles codex
+        profiles=$(tollgate __complete 2>/dev/null)
+        codex=$(tollgate __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ] || [ "$prev" = "--explain" ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
-        local profiles
+        local profiles codex
         profiles=$(tollgate __complete 2>/dev/null)
         { [ "$prev" = "start" ] || [ "$prev" = "delete" ]; } && profiles="${profiles} $(tollgate __complete --hermes 2>/dev/null)"
-        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+        [ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex=$(tollgate __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(tollgate __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
-        COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --tokens --live" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "switch" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--wait --relaunch --yes --conversation" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
-        local profiles sids
+        local profiles codex sids
         profiles=$(tollgate __complete 2>/dev/null)
+        codex=$(tollgate __complete --codex 2>/dev/null)
         sids=$(tollgate __complete --live-sessions 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
+        COMPREPLY+=( $(compgen -W "${codex}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
         local profiles
         profiles=$(tollgate __complete 2>/dev/null)
@@ -103,10 +112,27 @@ const BASH_TEMPLATE: &str = r#"_tollgate() {
         COMPREPLY=( $(compgen -W "--yes -y --step" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "plugin" ]; then
         COMPREPLY=( $(compgen -W "install uninstall" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "presets" ]; then
+        COMPREPLY=( $(compgen -W "rebind" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ]; then
+        local profiles
+        profiles=$(tollgate __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "${COMP_WORDS[1]}" = "resume" ] || [ "${COMP_WORDS[1]}" = "info" ]; }; then
+        COMPREPLY=( $(compgen -W "$(tollgate __complete --resumable 2>/dev/null)" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "resume" ] && [ "${COMP_WORDS[2]}" = "--profile" ]; then
+        COMPREPLY=( $(compgen -W "$(tollgate __complete --resumable 2>/dev/null)" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "delete" ] && ! printf '%s\n' "${COMP_WORDS[@]:2:COMP_CWORD-2}" | grep -vxE -- '(--yes|-y|--force)' >/dev/null; then
+        local profiles codex
+        profiles=$(tollgate __complete 2>/dev/null)
+        codex=$(tollgate __complete --codex 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${codex}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "static-token" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
@@ -155,10 +181,14 @@ complete -F _tollgate tollgate
 
 const ZSH_TEMPLATE: &str = r#"#compdef tollgate
 _tollgate() {
+    local profile_on_line=0
+    (( ${${(@)words[1,CURRENT-1]}[(I)--profile]} + ${${(@)words[CURRENT+1,-1]}[(I)--profile]} != 0 )) && profile_on_line=1
     if (( CURRENT == 2 )); then
-        local -a profiles
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
+        local -a profiles codex
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+        codex=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _values 'subcommand' \
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
@@ -188,30 +218,37 @@ _tollgate() {
             'hermes[manage Hermes Agent profiles: one isolated Hermes home per account]' \
             'import[import upstream clauth'"'"'s accounts, undo or inspect an import]' \
             'plugin[install or remove tollgate'"'"'s Claude Code plugin]' \
+            'presets[built-in preset maintenance]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]' '--prefer-store[prefer stored secrets over the environment]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
-        local -a profiles hermes
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
+        local -a profiles hermes codex
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+        [[ "${words[2]}" == (start|delete) ]] && codex=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
-        [[ "${words[2]}" == (start|delete) ]] && hermes=("${(@f)$(tollgate __complete --hermes 2>/dev/null)}") && _describe 'hermes profile' hermes
+        [[ "${words[2]}" == (start|delete) ]] && hermes=(${(f)"$(tollgate __complete --hermes 2>/dev/null)"}) && (( ${#hermes} )) && _describe 'hermes profile' hermes
+        [[ "${words[2]}" == (start|delete) ]] && _describe 'codex' codex
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
             '--explain[print the account that would be launched, without launching]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(tollgate __complete --codex 2>/dev/null)}")
+        profiles=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
         _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} )); then
+        local -a profiles codex
+        local ret=1
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+        (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--explain)}} )) && codex=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
+        _describe 'profile' profiles && ret=0
+        _describe 'codex' codex && ret=0
+        return ret
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == resume && "${words[CURRENT-1]}" == --profile ]]; then
         local -a profiles
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
-        _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
-        local -a profiles
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == hermes ]]; then
         _values 'subcommand' 'new[create a Hermes profile and its home]' \
@@ -223,7 +260,7 @@ _tollgate() {
             'delete[remove a Hermes profile and its home]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == hermes && "${words[3]}" == (key|auth|show|pool|delete) ]]; then
         local -a hermes
-        hermes=("${(@f)$(tollgate __complete --hermes 2>/dev/null)}")
+        hermes=(${(f)"$(tollgate __complete --hermes 2>/dev/null)"})
         _describe 'hermes profile' hermes
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == hermes && "${words[3]}" == auth ]]; then
         _values 'action' 'add[add a credential; Hermes prompts for the key]' 'remove[remove one credential]' 'reset[clear a provider'"'"'s exhaustion state]'
@@ -280,6 +317,13 @@ _tollgate() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == plugin ]]; then
         _values 'subcommand' 'install[install the plugin into ~/.claude]' \
             'uninstall[remove tollgate'"'"'s plugin and its MCP wiring]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == presets ]]; then
+        _values 'subcommand' 'rebind[move accounts onto the model ids the built-in presets bind now]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
+        local -a profiles
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+        _describe 'profile' profiles
+        _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
@@ -293,16 +337,19 @@ _tollgate() {
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]' \
-            '--tokens[add token totals + cost; reads every transcript in full]'
+            '--tokens[add token totals + cost; reads every transcript in full]' \
+            '--live[only the sessions running now; opens no transcript]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
-        local -a profiles sids
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
-        sids=("${(@f)$(tollgate __complete --live-sessions 2>/dev/null)}")
+        local -a profiles codex sids
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+        codex=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
+        sids=(${(f)"$(tollgate __complete --live-sessions 2>/dev/null)"})
         _describe 'profile' profiles
+        _describe 'codex' codex
         _describe 'session' sids
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles
-        profiles=("${(@f)$(tollgate __complete 2>/dev/null)}")
+        profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
         _describe 'profile' profiles
     elif (( CURRENT >= 5 )) && [[ "${words[2]}" == switch ]]; then
         _values 'flag' '--wait[wait until the key helper serves an api-key hot swap]' \
@@ -311,12 +358,30 @@ _tollgate() {
             '--conversation[with --relaunch: the conversation to resume]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
-    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (resume|info) ]]; then
+        local -a sids
+        sids=(${(f)"$(tollgate __complete --resumable 2>/dev/null)"})
+        _describe 'session' sids
+        [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]'
+    elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
+        local -a sids
+        sids=(${(f)"$(tollgate __complete --resumable 2>/dev/null)"})
+        _describe 'session' sids
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]] && (( ! profile_on_line )); then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
-        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
+        local -a profiles codex
+        local ret=1
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]' && ret=0
+        if (( ! ${#${(@)words[3,CURRENT-1]:#(--yes|-y|--force)}} )); then
+            profiles=(${(f)"$(tollgate __complete 2>/dev/null)"})
+            codex=(${(f)"$(tollgate __complete --codex 2>/dev/null)"})
+            _describe 'profile' profiles && ret=0
+            _describe 'codex' codex && ret=0
+        fi
+        return ret
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == static-token ]]; then
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
@@ -401,11 +466,35 @@ _tollgate "$@"
 const FISH_TEMPLATE: &str = r#"function __tollgate_profiles
     tollgate __complete 2>/dev/null
 end
+function __tollgate_codex
+    tollgate __complete --codex 2>/dev/null
+end
 function __tollgate_sessions
     tollgate __complete --live-sessions 2>/dev/null
 end
+function __tollgate_resumable
+    tollgate __complete --resumable 2>/dev/null
+end
+function __tollgate_start_takes_name
+    set -l rest (commandline -opc)[3..]
+    while set -q rest[1]
+        switch $rest[1]
+            case --isolated --explain
+                set -e rest[1]
+            case --theme
+                set -e rest[1]
+                set -q rest[1]; or return 1
+                contains -- $rest[1] full compatible; or return 1
+                set -e rest[1]
+            case '*'
+                return 1
+        end
+    end
+    return 0
+end
 complete -c tollgate -f
 complete -c tollgate -f -n __fish_is_first_token -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n '__fish_is_first_token; and set -l t (commandline -opc); and test "$t[-1]" != "--theme"' -a "(__tollgate_codex)" -d Profile
 complete -c tollgate -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c tollgate -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c tollgate -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
@@ -535,10 +624,17 @@ complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--
 complete -c tollgate -f -n __fish_is_first_token -a plugin -d "Install or remove tollgate's Claude Code plugin"
 complete -c tollgate -f -n "__fish_seen_subcommand_from plugin" -a install -d "Install the plugin into ~/.claude"
 complete -c tollgate -f -n "__fish_seen_subcommand_from plugin" -a uninstall -d "Remove tollgate's plugin and its MCP wiring"
+complete -c tollgate -f -n __fish_is_first_token -a presets -d "Built-in preset maintenance"
+complete -c tollgate -f -n "__fish_seen_subcommand_from presets" -a rebind -d "Move accounts onto the model ids the built-in presets bind now"
+complete -c tollgate -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a "(__tollgate_profiles)" -d "Only these accounts"
+complete -c tollgate -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a --yes -d "Apply the listed changes"
+complete -c tollgate -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a -y -d "Apply the listed changes"
 complete -c tollgate -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c tollgate -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__tollgate_profiles)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from start delete; and not __fish_seen_subcommand_from hermes" -a "(tollgate __complete --hermes 2>/dev/null)" -d "Hermes profile"
+complete -c tollgate -f -n "__fish_seen_subcommand_from start; and __tollgate_start_takes_name" -a "(__tollgate_codex)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from delete; and not string match -qvr -- '^(--yes|-y|--force)\$' (commandline -opc)[3..]" -a "(__tollgate_codex)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from limit-reset" -a "(tollgate __complete --codex 2>/dev/null)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c tollgate -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
@@ -548,10 +644,16 @@ complete -c tollgate -f -n "__fish_seen_subcommand_from which" -a --json -d "Emi
 complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_profiles)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_sessions)" -d Session
+complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_codex)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__tollgate_profiles)" -d Profile
 complete -c tollgate -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
-complete -c tollgate -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c tollgate -f -n "__fish_seen_subcommand_from sessions" -a --live -d "Only the sessions running now; opens no transcript"
+complete -c tollgate -f -n "__fish_seen_subcommand_from resume; and not contains -- --profile (commandline -opc)" -a --profile -d "Resume under this profile instead of prompting"
+complete -c tollgate -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_resumable)" -d Session
+complete -c tollgate -f -n '__fish_seen_subcommand_from resume; and set -l t (commandline -opc); and test "$t[-1]" = --profile' -a "(__tollgate_profiles)" -d Profile
+complete -c tollgate -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__tollgate_resumable)" -d Session
+complete -c tollgate -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__tollgate_resumable)" -d Session
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --wait -d "Wait until the key helper serves an api-key hot swap"
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --relaunch -d "Stop the session and resume its conversation under the profile"
 complete -c tollgate -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 4" -a --yes -d "With --relaunch: do not ask for confirmation"
@@ -681,14 +783,19 @@ static ZSH: LazyLock<String> =
 static FISH: LazyLock<String> =
     LazyLock::new(|| FISH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &fish_login_flags()));
 
-pub(crate) fn print_script(shell: &str) -> Result<()> {
-    let script = match shell {
-        "bash" => BASH.as_str(),
-        "zsh" => ZSH.as_str(),
-        "fish" => FISH.as_str(),
+/// The script this binary emits for `shell`, the bytes `tollgate completions
+/// <shell>` prints and `install` writes.
+pub(crate) fn emission(shell: &str) -> Result<&'static str> {
+    match shell {
+        "bash" => Ok(BASH.as_str()),
+        "zsh" => Ok(ZSH.as_str()),
+        "fish" => Ok(FISH.as_str()),
         _ => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
-    };
-    out!("{script}");
+    }
+}
+
+pub(crate) fn print_script(shell: &str) -> Result<()> {
+    out!("{}", emission(shell)?);
     Ok(())
 }
 
@@ -750,8 +857,23 @@ pub(crate) fn hermes_profile_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `__complete --codex`: the codex roster, for the codex-only verbs
-/// (`limit-reset`), whose names the claude roster above never holds.
+/// `tollgate resume` / `tollgate info` completion words: the word `latest`, then
+/// every top-level session id of the global store, sorted. `latest` resolves
+/// to the newest of these same top-level sessions.
+fn resume_targets() -> Vec<String> {
+    let mut targets = vec!["latest".to_string()];
+    targets.extend(crate::sessions::resumable_session_ids());
+    targets
+}
+
+pub(crate) fn print_resume_targets() {
+    for target in resume_targets() {
+        outln!("{target}");
+    }
+}
+
+/// `__complete --codex`: the codex roster, whose names the claude roster above
+/// never holds.
 pub(crate) fn print_codex_profile_names() {
     for name in codex_profile_names() {
         outln!("{name}");
@@ -772,12 +894,78 @@ pub(crate) fn install(shell: Option<&str>) -> Result<()> {
         None => detect_shell()?,
     };
 
-    match shell.as_str() {
-        "bash" => install_rc("bash", &BASH, ".bashrc"),
-        "zsh" => install_rc("zsh", &ZSH, ".zshrc"),
-        "fish" => install_fish(),
-        s => bail!("unsupported shell '{s}', expected: bash, zsh, fish"),
+    match rc_name(&shell) {
+        Some(rc) => install_rc(&shell, emission(&shell)?, rc),
+        None if shell == "fish" => install_fish(),
+        None => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
     }
+}
+
+/// The shell rc file `install` keeps tollgate's `source` line in; only the
+/// shells that read one have an entry.
+fn rc_name(shell: &str) -> Option<&'static str> {
+    match shell {
+        "bash" => Some(".bashrc"),
+        "zsh" => Some(".zshrc"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptState {
+    Current,
+    Stale,
+    Missing,
+}
+
+/// Where `install` puts `shell`'s script: the one path builder the writer and
+/// the state reader share, so neither can drift onto another location.
+fn script_path(home: &std::path::Path, shell: &str) -> Result<std::path::PathBuf> {
+    match shell {
+        "bash" | "zsh" => Ok(home
+            .join(crate::identity::DATA_DIR_NAME)
+            .join("completions")
+            .join(format!("tollgate.{shell}"))),
+        "fish" => Ok(home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("tollgate.fish")),
+        other => bail!("unsupported shell '{other}', expected: bash, zsh, fish"),
+    }
+}
+
+/// Whether the script installed for `shell` is this binary's own emission.
+/// `Missing` when nothing sits at the writer's path; any other read failure is
+/// an error, never a stale claim (bytes we could not read prove nothing).
+pub(crate) fn script_state(shell: &str) -> Result<ScriptState> {
+    let path = script_path(&home_dir()?, shell)?;
+    let installed = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScriptState::Missing),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    if installed == emission(shell)? {
+        Ok(ScriptState::Current)
+    } else {
+        Ok(ScriptState::Stale)
+    }
+}
+
+/// An installed completion script and the shell it belongs to, as the Services
+/// plugin card reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledScript {
+    pub(crate) shell: String,
+    pub(crate) state: ScriptState,
+}
+
+/// The shell `$SHELL` names and its script's state; `None` when no supported
+/// shell is named or the script cannot be read (the card then shows nothing).
+pub(crate) fn detected_installed_script() -> Option<InstalledScript> {
+    let shell = detect_shell().ok()?;
+    let state = script_state(&shell).ok()?;
+    Some(InstalledScript { shell, state })
 }
 
 fn detect_shell() -> Result<String> {
@@ -793,20 +981,18 @@ fn detect_shell() -> Result<String> {
     }
 }
 
-/// Write the `shell` completion script under `~/.tollgate/completions/` and
-/// return the `source` line an rc file carries for it (what `completions
-/// install` appends; the import's retire step R4 puts it where upstream's
-/// line was).
+/// Write the `shell` completion script at [`script_path`] and return the
+/// `source` line an rc file carries for it (what `completions install`
+/// appends; the import's retire step R4 puts it where upstream's line was).
 fn write_script(shell: &str, script: &str) -> Result<String> {
     let home = home_dir()?;
-    let completions_dir = home
-        .join(crate::identity::DATA_DIR_NAME)
-        .join("completions");
-    crate::profile::mkdir_700(&completions_dir)?;
-    let script_path = completions_dir.join(format!("tollgate.{shell}"));
-    crate::profile::atomic_write_600(&script_path, script)
-        .with_context(|| format!("failed to write {}", script_path.display()))?;
-    Ok(format!("source \"{}\"", script_path.display()))
+    let path = script_path(&home, shell)?;
+    if let Some(dir) = path.parent() {
+        crate::profile::mkdir_700(dir)?;
+    }
+    crate::profile::atomic_write_600(&path, script)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(format!("source \"{}\"", path.display()))
 }
 
 /// [`write_script`] for bash: the script written, its `source` line back.
@@ -814,20 +1000,30 @@ pub(crate) fn write_bash_script() -> Result<String> {
     write_script("bash", &BASH)
 }
 
-fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
+fn install_rc(shell: &str, script: &str, rc_file: &str) -> Result<()> {
     let home = home_dir()?;
-    let source_line = write_script(shell, script)?;
-    let rc_path = home.join(rc_name);
+    let rc_path = home.join(rc_file);
 
-    let existing = fs::read_to_string(&rc_path).unwrap_or_default();
-    let already = existing.lines().any(|l| l.trim() == source_line);
+    // Raw bytes: a file that does not decode must keep every byte it holds.
+    // Only a missing file counts as empty. Read before writing the script, so
+    // a refused install leaves the disk untouched.
+    let existing = match fs::read(&rc_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", rc_path.display())),
+    };
+    let source_line = write_script(shell, script)?;
+
+    let already = existing
+        .split(|&b| b == b'\n')
+        .any(|line| line.trim_ascii() == source_line.as_bytes());
 
     if !already {
         let mut new = existing;
-        if !new.is_empty() && !new.ends_with('\n') {
-            new.push('\n');
+        if !new.is_empty() && !new.ends_with(b"\n") {
+            new.push(b'\n');
         }
-        new.push_str(&format!("\n# tollgate completions\n{source_line}\n"));
+        new.extend_from_slice(format!("\n# tollgate completions\n{source_line}\n").as_bytes());
         fs::write(&rc_path, new)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
     }
@@ -921,10 +1117,10 @@ pub(crate) fn auto_install_once() {
 }
 
 fn install_fish() -> Result<()> {
-    let home = home_dir()?;
-    let dir = home.join(".config").join("fish").join("completions");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("tollgate.fish");
+    let path = script_path(&home_dir()?, "fish")?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     fs::write(&path, &*FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

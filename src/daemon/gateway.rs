@@ -46,7 +46,7 @@ use crate::gateway::{
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{atomic_write_600, open_append_600, tollgate_dir};
-use crate::usage::{epoch_secs_to_iso, now_ms};
+use crate::usage::{ms_to_iso, now_ms};
 
 /// The run loop's round length: after a round it waits out the rest of this
 /// since the round's tick, so a `starting` gateway is probed at most once a
@@ -90,27 +90,50 @@ const SHUNT_BLOCKING_GRACE: Duration = Duration::from_secs(5);
 /// telemetry flush shunt runs after the drain.
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
-/// How long a daemon exiting on a signal waits for its gateway before it exits
-/// anyway. `--replace` escalates to SIGKILL once [`REPLACE_WAIT`] passes with
-/// the singleton flock still held, so the stop gets that window less 1 s for
-/// the release to be seen at `--replace`'s 50 ms poll, including the
-/// 500 ms supervisor answer grace. A `/health` probe does
-/// not eat into it: a shutdown preempts a probe, so the budget bounds only the
-/// child's exit. A gateway still draining past it is left running with its
-/// stop deadline in the child marker; shunt bounds its own drain, and the next
-/// daemon start waits out the rest of the deadline and kills it there.
-pub(crate) const DAEMON_STOP_BUDGET: Duration = REPLACE_WAIT.saturating_sub(Duration::from_secs(1));
+/// The window a daemon exiting on a signal gives its gateway to stop. The
+/// budget plus [`STOP_ANSWER_GRACE`] bounds the supervisor's answer; the daemon
+/// then joins the stop thread through its deferred log and marker writes with
+/// no bound. A `/health` probe does not eat into it: a shutdown preempts a
+/// probe, so the budget bounds only the child's exit. A gateway still draining
+/// past it is left running with its stop deadline in the child marker; shunt
+/// bounds its own drain, and the next daemon start waits out the rest of the
+/// deadline and kills it there.
+///
+/// The token-spend drain needs no longer budget here: it runs CONCURRENTLY
+/// with this stop ([`stop_for_exit`]), so the exit takes the longer of the
+/// two rather than their sum, and [`REPLACE_WAIT`] covers that longer term.
+pub(crate) const DAEMON_STOP_BUDGET: Duration = Duration::from_secs(4);
 
-/// How often a stop waiting inside [`DAEMON_STOP_BUDGET`] polls the child.
-const STOP_POLL: Duration = Duration::from_millis(50);
+/// How often a supervisor wait re-checks its subject: the child inside
+/// [`DAEMON_STOP_BUDGET`], the drain's token spend, a health probe's answer.
+pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// The clamp a stop applies to its last sleep: [`STOP_POLL`] at most, the
+/// exact remaining time when less is left, so the wait ends at the deadline,
+/// never up to one poll past it.
+pub(crate) fn stop_sleep(remaining: Duration) -> Duration {
+    STOP_POLL.min(remaining)
+}
+
+/// The stop loop's next sleep: [`stop_sleep`]'s clamp of `remaining`, passed
+/// through the seam's record so the loop's one sleep line consumes the
+/// recorded value in every build. A call site that sleeps [`STOP_POLL`]
+/// regardless never records, so the clamp pin reds on the empty record; the
+/// one thing the pin cannot see is this fn returning other than `request`.
+fn stop_poll(remaining: Duration) -> Duration {
+    let request = stop_sleep(remaining);
+    #[cfg(all(test, unix))]
+    probe_seam::record_stop_sleep(remaining, request);
+    request
+}
 
 /// How long past its budget a stop waits for the supervisor's answer before
 /// it calls the supervisor stuck. Only the supervisor's own timer decides that
 /// the deadline passed, and that timer can oversleep: a 50 ms sleep on
 /// GitHub's macOS runner returned up to 150 ms late (CI run 38386356570), so a
 /// one-poll grace raced every stop whose child outlived its budget. The grace
-/// stays inside the second of [`REPLACE_WAIT`] the budget leaves for
-/// `--replace` to see the flock go.
+/// stays inside the escalation margin [`REPLACE_WAIT`] leaves over the budget,
+/// so `--replace` still sees the flock go.
 const STOP_ANSWER_GRACE: Duration = Duration::from_millis(500);
 const _: () = assert!(
     DAEMON_STOP_BUDGET.as_millis() + STOP_ANSWER_GRACE.as_millis() + REPLACE_POLL.as_millis()
@@ -860,34 +883,29 @@ impl Supervisor {
     /// is already underway, since a second SIGTERM makes shunt skip its
     /// drain), then wait until `deadline`. A gateway still running then is
     /// left draining, its deadline in the child marker for the next start.
-    pub(crate) fn shutdown(&mut self, deadline: Instant) {
+    /// The writes that follow the wait (the exit and "still stopping" lines,
+    /// the marker removal) come back as [`StopWrites`] instead of running
+    /// here, so the caller answers before a stalled stderr or disk there.
+    #[must_use = "dropping it skips the stop's log and marker writes"]
+    pub(crate) fn shutdown(&mut self, deadline: Instant) -> Option<StopWrites> {
         // The probe seam holds or panics the supervisor thread here, so
         // `stop`'s missed-budget and panic paths are reachable in a test.
         #[cfg(all(test, unix))]
         let _seam = probe_seam::hold();
         self.begin_stop(AfterStop::Shutdown, Tick::now());
-        let Some(running) = self.child.as_mut() else {
-            return;
-        };
+        let running = self.child.as_mut()?;
         loop {
             match running.child.try_wait() {
                 Ok(Some(status)) => {
                     let report = ExitReport::from(status);
-                    logline!(
-                        "tollgate daemon: the shunt gateway (pid {}) stopped ({report})",
-                        running.pid
-                    );
-                    remove_marker();
+                    let pid = running.pid;
                     self.child = None;
-                    return;
+                    return Some(StopWrites::Exited { pid, report });
                 }
                 Ok(None) => {}
-                Err(e) => {
-                    logline!(
-                        "tollgate daemon: cannot wait on the shunt gateway (pid {}): {e}",
-                        running.pid
-                    );
-                    return;
+                Err(error) => {
+                    let pid = running.pid;
+                    return Some(StopWrites::CannotWait { pid, error });
                 }
             }
             let now = Instant::now();
@@ -899,13 +917,11 @@ impl Supervisor {
                 stop.killed = true;
             }
             if now >= deadline {
-                logline!(
-                    "tollgate daemon: the shunt gateway (pid {}) is still stopping; the next daemon start finishes the stop",
-                    running.pid
-                );
-                return;
+                let pid = running.pid;
+                return Some(StopWrites::StillStopping { pid });
             }
-            std::thread::sleep(STOP_POLL.min(deadline - now));
+            let remaining = deadline - now;
+            std::thread::sleep(stop_poll(remaining));
         }
     }
 
@@ -1051,15 +1067,21 @@ impl Supervisor {
             AfterStop::Respawn { why } => why.clone(),
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
-        logline!(
-            "tollgate daemon: stopping the shunt gateway (pid {}): {why}",
-            running.pid
-        );
+        // The SIGTERM and the deadline marker go before the "stopping" line, so
+        // a stalled stderr can delay neither, and a daemon killed mid-write
+        // still leaves the deadline the next start waits out (no second
+        // SIGTERM that would make shunt skip its drain).
         terminate_pid(running.pid, false);
         let deadline_ms = tick.wall_ms + running.stop_bound.as_millis() as u64;
         if let Err(e) = write_marker(&running.marker(Some(deadline_ms))) {
             logline!("tollgate daemon: failed to record the gateway's stop deadline: {e:#}");
         }
+        #[cfg(all(test, unix))]
+        probe_seam::begin_stop_stall();
+        logline!(
+            "tollgate daemon: stopping the shunt gateway (pid {}): {why}",
+            running.pid
+        );
         running.stop = Some(Stop {
             deadline: tick.at + running.stop_bound,
             killed: false,
@@ -1434,7 +1456,7 @@ impl Supervisor {
         let since = if slot.state == self.slot.state && self.slot.since.is_some() {
             self.slot.since.clone()
         } else {
-            Some(epoch_secs_to_iso((tick.wall_ms / 1000) as i64))
+            Some(ms_to_iso(tick.wall_ms))
         };
         self.slot = GatewaySlot {
             restarts: self.restarts,
@@ -1566,9 +1588,9 @@ pub(crate) fn write_marker(marker: &ChildMarker) -> Result<()> {
 pub(crate) fn read_marker() -> Result<Option<ChildMarker>> {
     let path = marker_path()?;
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
@@ -1810,6 +1832,63 @@ pub(crate) fn start(handle: GatewayHandle, _singleton: &DaemonLock) -> Result<Su
     })
 }
 
+/// What a [`Supervisor::shutdown`] still owes once its wait ends: the writes a
+/// stop makes after the gateway exits or the deadline passes, deferred so the
+/// caller answers before a stalled stderr or disk there reads as a missed
+/// budget.
+pub(crate) enum StopWrites {
+    /// The gateway exited inside the budget: log the exit and drop its marker.
+    Exited { pid: u32, report: ExitReport },
+    /// The gateway could not be waited on: log it.
+    CannotWait { pid: u32, error: std::io::Error },
+    /// The gateway outlived the budget: log it is still draining.
+    StillStopping { pid: u32 },
+}
+
+impl StopWrites {
+    /// The writes themselves, on the stop's thread, after the answer.
+    fn perform(self) {
+        match self {
+            StopWrites::Exited { pid, report } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!("tollgate daemon: the shunt gateway (pid {pid}) stopped ({report})");
+                remove_marker();
+            }
+            StopWrites::CannotWait { pid, error } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!("tollgate daemon: cannot wait on the shunt gateway (pid {pid}): {error}");
+            }
+            StopWrites::StillStopping { pid } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!(
+                    "tollgate daemon: the shunt gateway (pid {pid}) is still stopping; the next daemon start finishes the stop"
+                );
+            }
+        }
+    }
+}
+
+/// End the supervisor on a shutdown request: stop the gateway within
+/// `deadline`, then answer `done` when the caller waits on one, before the
+/// stop's deferred writes, so a stalled stderr or disk after the wait never
+/// reads as a missed budget.
+fn end(supervisor: &mut Supervisor, deadline: Instant, done: Option<Sender<()>>) {
+    let writes = supervisor.shutdown(deadline);
+    // The seam poses this thread's deadline wake running late, so a test can
+    // tell a late answer from a stuck thread.
+    #[cfg(all(test, unix))]
+    probe_seam::answer_delay();
+    if let Some(done) = done {
+        let _ = done.send(());
+    }
+    if let Some(writes) = writes {
+        writes.perform();
+    }
+}
+
 /// The supervisor's rounds. The thread ends on a `Shutdown` alone: `probe`,
 /// its own sender, keeps the inbox open for the thread's whole life, so the
 /// `Disconnected` arms never run and only keep each match exhaustive.
@@ -1820,16 +1899,13 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
             supervisor.publish();
             match inbox.recv_timeout(SUPERVISE_POLL) {
                 Ok(RunMessage::Shutdown(req)) => {
-                    supervisor.shutdown(req.deadline);
-                    #[cfg(all(test, unix))]
-                    probe_seam::answer_delay();
-                    let _ = req.done.send(());
+                    end(&mut supervisor, req.deadline, Some(req.done));
                     return;
                 }
                 Ok(RunMessage::Probe(_)) => {}
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    supervisor.shutdown(Instant::now() + DAEMON_STOP_BUDGET);
+                    end(&mut supervisor, Instant::now() + DAEMON_STOP_BUDGET, None);
                     return;
                 }
             }
@@ -1867,10 +1943,7 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
                     // may start once a stop was asked for.
                     match inbox.try_recv() {
                         Ok(RunMessage::Shutdown(req)) => {
-                            supervisor.shutdown(req.deadline);
-                            #[cfg(all(test, unix))]
-                            probe_seam::answer_delay();
-                            let _ = req.done.send(());
+                            end(&mut supervisor, req.deadline, Some(req.done));
                             return;
                         }
                         Ok(RunMessage::Probe(_)) => {}
@@ -1881,10 +1954,7 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
                     break;
                 }
                 Ok(RunMessage::Shutdown(req)) => {
-                    supervisor.shutdown(req.deadline);
-                    #[cfg(all(test, unix))]
-                    probe_seam::answer_delay();
-                    let _ = req.done.send(());
+                    end(&mut supervisor, req.deadline, Some(req.done));
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1899,7 +1969,7 @@ fn run(mut supervisor: Supervisor, inbox: &Receiver<RunMessage>, probe: Sender<R
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    supervisor.shutdown(Instant::now() + DAEMON_STOP_BUDGET);
+                    end(&mut supervisor, Instant::now() + DAEMON_STOP_BUDGET, None);
                     return;
                 }
             }
@@ -1930,16 +2000,13 @@ fn drain_until(
         }
         match inbox.recv_timeout(deadline - now) {
             Ok(RunMessage::Shutdown(req)) => {
-                supervisor.shutdown(req.deadline);
-                #[cfg(all(test, unix))]
-                probe_seam::answer_delay();
-                let _ = req.done.send(());
+                end(supervisor, req.deadline, Some(req.done));
                 return true;
             }
             Ok(RunMessage::Probe(_)) => {}
             Err(RecvTimeoutError::Timeout) => return false,
             Err(RecvTimeoutError::Disconnected) => {
-                supervisor.shutdown(Instant::now() + DAEMON_STOP_BUDGET);
+                end(supervisor, Instant::now() + DAEMON_STOP_BUDGET, None);
                 return true;
             }
         }
@@ -2041,19 +2108,19 @@ pub(crate) fn inherited_ignored(signal: libc::c_int) -> bool {
     old.sa_sigaction == libc::SIG_IGN
 }
 
-/// Stop the gateway before the daemon dies of SIGTERM, SIGINT or SIGHUP, then
-/// die of that same signal, so a supervisor reads the exit it always read.
+/// Stop the gateway before the daemon dies of SIGTERM, SIGINT or SIGHUP,
+/// waiting out a token spend in flight first, then die of that same signal, so
+/// a supervisor reads the exit it always read. The watcher installs even with
+/// no gateway and no local API: the spend in flight still needs its drain.
 /// Returns the supervisor back when no watcher could take it; the caller
 /// keeps it alive for the process's life either way.
 #[cfg(unix)]
 pub(crate) fn stop_on_signal(
+    spends: super::SpendDrain,
     supervisor: Option<SupervisorThread>,
     local_api: Option<Arc<crate::local_api::Server>>,
 ) -> Option<SupervisorThread> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-    if supervisor.is_none() && local_api.is_none() {
-        return None;
-    }
     // Watch only the signals this daemon did not inherit as ignored (nohup, a
     // non-interactive shell's `&`): signal-hook installs its handler over an
     // inherited SIG_IGN without chaining it, so watching an ignored signal
@@ -2080,12 +2147,9 @@ pub(crate) fn stop_on_signal(
             let Some(signal) = signals.forever().next() else {
                 return;
             };
-            if let Some(supervisor) = supervisor {
-                supervisor.shutdown(DAEMON_STOP_BUDGET);
-            }
-            if let Some(local_api) = local_api {
-                local_api.cleanup_socket();
-            }
+            // Stop the gateway and wait out the token spend in flight
+            // together, then die of the signal that arrived.
+            stop_for_exit(&spends, supervisor, local_api);
             if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
                 logline!("tollgate daemon: cannot re-raise signal {signal}: {e}");
             }
@@ -2099,12 +2163,40 @@ pub(crate) fn stop_on_signal(
     None
 }
 
+/// Send the gateway its stop on its own thread, wait out the token spend in
+/// flight on the calling thread, then join the stop and remove the local API's
+/// socket. Concurrent on purpose: the exit then takes max(spend, gateway),
+/// never their sum. Split from [`stop_on_signal`]'s watcher so a test can pin
+/// the wait without dying.
+#[cfg(unix)]
+pub(crate) fn stop_for_exit(
+    spends: &super::SpendDrain,
+    supervisor: Option<SupervisorThread>,
+    local_api: Option<Arc<crate::local_api::Server>>,
+) {
+    // The gateway's stop runs beside the drain: the wait for its answer ends
+    // within one `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, and the join
+    // after the answer then waits out that stop's deferred log and marker
+    // writes with no bound.
+    let supervisor = supervisor
+        .map(|supervisor| std::thread::spawn(move || supervisor.shutdown(DAEMON_STOP_BUDGET)));
+    spends.drain(super::SPEND_DRAIN_BOUND);
+    if let Some(supervisor) = supervisor {
+        let _ = supervisor.join();
+    }
+    if let Some(local_api) = local_api {
+        local_api.cleanup_socket();
+    }
+}
+
 /// Windows delivers no SIGTERM to a console process: the daemon ends by
 /// `taskkill /F`, the gateway outlives it, and the next start meets it as an
 /// orphan and stops it there ([`Supervisor::reclaim`]), or the TUI's
-/// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]).
+/// `stop daemon` does once no daemon is left ([`stop_left_behind_gateway`]). A
+/// forced kill leaves no window for a token save, so the drain is dropped.
 #[cfg(not(unix))]
 pub(crate) fn stop_on_signal(
+    _spends: super::SpendDrain,
     supervisor: Option<SupervisorThread>,
     _local_api: Option<Arc<crate::local_api::Server>>,
 ) -> Option<SupervisorThread> {
@@ -2194,6 +2286,38 @@ mod probe_seam {
         }
     }
 
+    /// Set by [`stall_stop_writes`]: the supervisor thread carrying this name
+    /// sleeps this long before the writes of each arm a stop makes once its
+    /// child has exited or its deadline has passed, posing a stalled stderr or
+    /// disk. One slot, serialized like [`ANSWER_DELAY`].
+    static WRITE_STALL: Mutex<Option<(&'static str, Duration)>> = Mutex::new(None);
+
+    /// Stall the post-wait stop writes of the supervisor thread named
+    /// `thread` by `by`. The returned guard disarms it on drop.
+    pub fn stall_stop_writes(thread: &'static str, by: Duration) -> StallArm {
+        *WRITE_STALL.lock().expect("the write stall is not poisoned") = Some((thread, by));
+        StallArm
+    }
+
+    pub struct StallArm;
+
+    impl Drop for StallArm {
+        fn drop(&mut self) {
+            *WRITE_STALL.lock().expect("the write stall is not poisoned") = None;
+        }
+    }
+
+    /// Sleep the armed stall when the calling thread carries its name; called
+    /// right before each write a stop makes after its wait ends.
+    pub fn write_stall() {
+        let armed = *WRITE_STALL.lock().expect("the write stall is not poisoned");
+        if let Some((name, by)) = armed
+            && std::thread::current().name() == Some(name)
+        {
+            std::thread::sleep(by);
+        }
+    }
+
     /// Sleep the armed delay when the calling thread carries its name.
     pub fn answer_delay() {
         let armed = *ANSWER_DELAY
@@ -2204,6 +2328,103 @@ mod probe_seam {
         {
             std::thread::sleep(by);
         }
+    }
+
+    /// Set by [`stall_begin_stop`]: the supervisor thread carrying this name
+    /// sleeps this long at the "stopping" line, posing a stalled stderr there
+    /// after the SIGTERM and the deadline marker, so a stall cannot delay
+    /// either. One slot, serialized like [`ANSWER_DELAY`].
+    static BEGIN_STOP_STALL: Mutex<Option<(&'static str, Duration)>> = Mutex::new(None);
+
+    /// Stall the "stopping" line of the supervisor thread named `thread` by
+    /// `by`. The returned guard disarms it on drop.
+    pub fn stall_begin_stop(thread: &'static str, by: Duration) -> BeginStopArm {
+        *BEGIN_STOP_STALL
+            .lock()
+            .expect("the begin-stop stall is not poisoned") = Some((thread, by));
+        BeginStopArm
+    }
+
+    pub struct BeginStopArm;
+
+    impl Drop for BeginStopArm {
+        fn drop(&mut self) {
+            *BEGIN_STOP_STALL
+                .lock()
+                .expect("the begin-stop stall is not poisoned") = None;
+        }
+    }
+
+    /// Sleep the armed stall when the calling thread carries its name; called
+    /// right before the "stopping" line, after the SIGTERM and the deadline
+    /// marker write.
+    pub fn begin_stop_stall() {
+        let armed = *BEGIN_STOP_STALL
+            .lock()
+            .expect("the begin-stop stall is not poisoned");
+        if let Some((name, by)) = armed
+            && std::thread::current().name() == Some(name)
+        {
+            std::thread::sleep(by);
+        }
+    }
+
+    /// One armed stop-sleep record: the supervisor thread's name and its
+    /// `(remaining, request)` sleep pairs.
+    type StopSleepRecord = (&'static str, Vec<(Duration, Duration)>);
+
+    /// The `(remaining, request)` pairs of the stop loop's sleeps, recorded by
+    /// the loop for the clamped-last-sleep pin, keyed to the supervisor thread
+    /// named by [`arm_stop_sleeps`] so a thread leaked from another test
+    /// cannot pollute a later one's record. One slot, serialized like
+    /// [`ANSWER_DELAY`].
+    static STOP_SLEEPS: Mutex<Option<StopSleepRecord>> = Mutex::new(None);
+
+    /// Record the stop loop's sleeps for the supervisor thread named `thread`.
+    /// The returned guard disarms it on drop.
+    pub fn arm_stop_sleeps(thread: &'static str) -> SleepArm {
+        *STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned") = Some((thread, Vec::new()));
+        SleepArm
+    }
+
+    pub struct SleepArm;
+
+    impl Drop for SleepArm {
+        fn drop(&mut self) {
+            *STOP_SLEEPS
+                .lock()
+                .expect("the stop-sleep record is not poisoned") = None;
+        }
+    }
+
+    /// Record the `(remaining, request)` pair the stop loop's next poll will
+    /// sleep, for the armed supervisor thread. Only the record: the caller
+    /// sleeps `request` after this returns, outside the record's lock, so this
+    /// never sleeps and never holds the lock across a sleep. A call site that
+    /// sleeps the poll regardless never reaches this, so the clamp pin reds on
+    /// the empty record.
+    pub fn record_stop_sleep(remaining: Duration, request: Duration) {
+        let mut record = STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned");
+        if let Some((name, entries)) = record.as_mut()
+            && std::thread::current().name() == Some(name)
+        {
+            entries.push((remaining, request));
+        }
+    }
+
+    /// The `(remaining, request)` pairs the armed stop loop recorded, in
+    /// order; empty when none was armed.
+    pub fn stop_sleeps() -> Vec<(Duration, Duration)> {
+        STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned")
+            .as_ref()
+            .map(|(_, entries)| entries.clone())
+            .unwrap_or_default()
     }
 
     /// Arm the seam to panic the next probe or `Supervisor::shutdown` to

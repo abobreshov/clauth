@@ -98,6 +98,127 @@ fn names_filter_selects_one_profile_case_insensitively() {
     );
 }
 
+/// A third-party key the provider refused (the durable per-credential verdict)
+/// marks its row `key rejected` in the account-state run, so a picker skips it
+/// before a spawn. The verdict is keyed on the key's fingerprint: an account
+/// whose verdict names another fingerprint (a re-captured key) carries no mark.
+#[test]
+fn a_rejected_api_key_marks_its_row_key_rejected() {
+    let _home = HomeSandbox::new();
+    let url = Some("https://api.deepseek.com/anthropic".to_string());
+    let dead = Profile::new("dead".to_string(), url.clone(), Some("sk-dead".to_string()));
+    let fresh = Profile::new("fresh".to_string(), url, Some("sk-fresh".to_string()));
+    save_profile(&dead).expect("save dead");
+    save_profile(&fresh).expect("save fresh");
+    save_app_state(&AppState {
+        active_profile: Some("dead".into()),
+        profiles: vec!["dead".into(), "fresh".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let dead_fp = crate::usage::profile_credential_fingerprint(&dead).expect("dead fp");
+    let fresh_fp = crate::usage::profile_credential_fingerprint(&fresh).expect("fresh fp");
+    crate::profile_cache::write_auth_expired(&dead.name, dead_fp);
+    // A stale verdict on the key `fresh` held before its re-capture.
+    crate::profile_cache::write_auth_expired(&fresh.name, fresh_fp ^ 1);
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- dead (global active) [DeepSeek, api.deepseek.com]: usage unknown; key rejected",
+            "- fresh [DeepSeek, api.deepseek.com]: usage unknown",
+        ],
+    );
+}
+
+/// A setup token the usage probe found refused marks its row `token rejected`,
+/// never `key rejected`: the account holds no api key, so the key word names a
+/// fix that cannot apply.
+#[test]
+fn a_refused_setup_token_marks_its_row_token_rejected() {
+    let _home = HomeSandbox::new();
+    let mut tok = Profile::new("tok".to_string(), None, None);
+    crate::testutil::refuse_setup_token(&mut tok);
+    save_app_state(&AppState {
+        active_profile: Some("tok".into()),
+        profiles: vec!["tok".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec!["- tok (global active) [anthropic]: usage unknown; tier unknown; token rejected"],
+    );
+}
+
+/// `token_rejected` renders in the same contiguous marker run as `key_rejected`.
+#[test]
+fn a_token_rejected_marker_renders_in_the_state_group() {
+    let line = render::profiles_prose(&serde_json::json!({
+        "profiles": [{
+            "name": "tok",
+            "active": false,
+            "provider": "DeepSeek",
+            "tier": null,
+            "host": "api.deepseek.com",
+            "windows": {"kind": "third_party"},
+            "has_live_session": true,
+            "disabled": true,
+            "auth_broken": true,
+            "token_rejected": true,
+            "canceled": true,
+        }]
+    }));
+    assert_eq!(
+        line,
+        "- tok [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; token rejected; subscription canceled",
+    );
+}
+
+/// The `profiles` pass reads the job store once for the whole roster, never
+/// once per row (the `gc_runtime_trees` snapshot precedent).
+#[test]
+fn the_profiles_pass_reads_the_job_store_once() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+
+    crate::claude_jobs::reset_job_trees_reads();
+    call_profiles(None, None);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the whole pass reads the store once, never once per row"
+    );
+}
+
+/// A job naming a tree under `solo/` makes `solo`'s roster row carry the live
+/// flag while `vendor` stays without it: the row derives liveness from the same
+/// per-pass job snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_marks_only_that_profiles_row_live() {
+    let home = HomeSandbox::new();
+    seed_two_profiles();
+    let solo_dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("solo")).expect("solo dir");
+    let runtime = solo_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
+
+    let text = first_text(&call_profiles(None, None));
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("- solo") && l.contains("live session")),
+        "a job under solo/ is a live solo session: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.starts_with("- vendor") && l.contains("live session")),
+        "a job under solo/ is nobody's vendor session: {text}"
+    );
+}
+
 /// A name matching nothing fails loudly. Dropping it silently would answer with
 /// a roster that reads exactly like "that profile no longer exists", and the
 /// model would act on the wrong one of those two readings.
@@ -129,6 +250,19 @@ fn an_unrecognised_scope_is_refused_by_name() {
     assert_eq!(
         first_text(&result),
         "error: unrecognized scope \"sessions\": accepted \"all\" and \"session\""
+    );
+}
+
+/// A caller-spelled scope is echoed flat in that refusal: an embedded newline
+/// cannot forge a second line.
+#[test]
+fn an_unrecognised_scope_value_is_echoed_flat() {
+    let _home = HomeSandbox::new();
+    let result = call_profiles(None, Some("sessions\nforged"));
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: unrecognized scope \"sessions forged\": accepted \"all\" and \"session\""
     );
 }
 
@@ -307,11 +441,47 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     );
 }
 
-/// The marker group is contiguous: a profile in all three states spells them
+/// An organization's refusal rides the roster row as `org refused`, off the
+/// account's cached plan, named apart from a canceled plan. The control: the
+/// canceled account beside it keeps `subscription canceled`.
+#[test]
+fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
+    let _home = HomeSandbox::new();
+    seed_flag_states();
+    save_profile(&Profile::new("held".to_string(), None, None)).expect("save held");
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.profiles.push("held".into());
+    save_app_state(&state).expect("save state");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                codex_plan: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let prose = lines(&call_profiles(None, None));
+    assert!(
+        prose.contains(&"- held [anthropic, Free]: usage unknown; org refused".to_string()),
+        "{prose:?}"
+    );
+    assert!(
+        prose.contains(
+            &"- gone [anthropic, Free]: usage unknown; subscription canceled".to_string()
+        ),
+        "control: {prose:?}"
+    );
+}
+
+/// The marker group is contiguous: a profile in all four states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.
 #[test]
-fn the_three_state_markers_render_as_one_group() {
+fn the_four_state_markers_render_as_one_group() {
     let line = render::profiles_prose(&serde_json::json!({
         "profiles": [{
             "name": "wreck",
@@ -324,12 +494,89 @@ fn the_three_state_markers_render_as_one_group() {
             "disabled": true,
             "auth_broken": true,
             "keyless": true,
+            "key_rejected": true,
             "canceled": true,
         }]
     }));
     assert_eq!(
         line,
-        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; subscription canceled",
+        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; key rejected; subscription canceled",
+    );
+}
+
+/// `credit cap spent` follows `subscription canceled`: it refuses a delegate
+/// only by model, so it sits outside the four-marker refusal group.
+#[test]
+fn the_credit_cap_marker_follows_the_canceled_marker() {
+    let line = render::profiles_prose(&serde_json::json!({
+        "profiles": [{
+            "name": "wreck",
+            "active": false,
+            "provider": "anthropic",
+            "tier": null,
+            "windows": {"kind": "oauth"},
+            "has_live_session": false,
+            "disabled": true,
+            "canceled": true,
+            "credit_capped": true,
+        }]
+    }));
+    assert_eq!(
+        line,
+        "- wreck [anthropic]: usage unknown; tier unknown; disabled; subscription canceled; credit cap spent",
+    );
+}
+
+/// The roster names a spent usage-credit cap off the account's cached
+/// reading, and only where the cap reads spent: a billing-off account
+/// carrying a stale limit at 100% is no cap. The flag shows whenever the cap
+/// reads spent, gate on or off — the gate governs only the roster RANK.
+#[test]
+fn the_roster_names_a_spent_credit_cap() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new("capped".to_string(), None, None)).expect("save capped");
+    save_profile(&Profile::new("stale".to_string(), None, None)).expect("save stale");
+    let mut gated_off = Profile::new("gated_off".to_string(), None, None);
+    gated_off.check_credit_cap = false;
+    save_profile(&gated_off).expect("save gated off");
+    save_app_state(&AppState {
+        profiles: vec!["capped".into(), "gated_off".into(), "stale".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let spend = |enabled: bool| UsageInfo {
+        spend: Some(crate::usage::SpendInfo {
+            enabled,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("capped"),
+        USAGE_CACHE_FILE,
+        &spend(true),
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gated_off"),
+        USAGE_CACHE_FILE,
+        &spend(true),
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("stale"),
+        USAGE_CACHE_FILE,
+        &spend(false),
+    );
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- capped [anthropic]: usage unknown; tier unknown; credit cap spent".to_string(),
+            "- gated_off [anthropic]: usage unknown; tier unknown; credit cap spent".to_string(),
+            "- stale [anthropic]: usage unknown; tier unknown".to_string(),
+        ],
     );
 }
 
@@ -602,6 +849,7 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
                     label: "api balance".to_string(),
                     value: format!("{amount:.2} CNY"),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 }],
                 bars: vec![],
                 plan: None,
@@ -625,6 +873,142 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
     assert!(
         !row.contains("USD/day"),
         "the unfunded USD wallet's series stays off the row: {row}",
+    );
+}
+
+/// The runway reaches the roster row through the payload: `windows_payload`
+/// carries the funded wallet's numeric balance beside its burn, so the prose
+/// divides two numbers and never parses its own rendered figure. The burn is
+/// recency-weighted, so the row's exact runway is the prose test's job; this
+/// one pins that the clause reaches the row at all.
+#[test]
+fn a_wallet_series_renders_its_runway_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+                observed: None,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    let runway = row
+        .split_once("CNY/day (~")
+        .and_then(|(_, rest)| rest.split_once(" left)"))
+        .map(|(n, _)| n.to_string());
+    assert!(
+        runway
+            .as_deref()
+            .is_some_and(|n| n.ends_with(" day") || n.ends_with(" days") || n.ends_with(" h")),
+        "the funded wallet's runway rides its burn: {row}",
+    );
+    // The series burns ~393 CNY/day, so 498.18 CNY lasts 1.27 days; the
+    // count stays 1 for any burn between ~333 and ~498 CNY/day, so the
+    // recency weighting's drift between the fixture's stamps and the call
+    // cannot move it, while a wrong unit does.
+    assert!(
+        row.ends_with(" CNY/day (~1 day left)"),
+        "the funded wallet's runway in whole days: {row}",
+    );
+}
+
+/// The numeric balance the prose divides rides the payload, and it is the
+/// FUNDED wallet's amount in the burn's currency — the two-wallet cache lists
+/// an empty USD row first, so a balance taken off the first row would name a
+/// different wallet than the burn.
+#[test]
+fn the_runway_payload_carries_the_funded_wallets_balance() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let now = crate::usage::now_ms();
+    let history = [
+        (now - 2 * 3_600_000, 600.18),
+        (now - 3_600_000, 550.18),
+        (now - 30 * 60_000, 520.18),
+    ]
+    .into_iter()
+    .map(|(ts, amount)| crate::usage::WalletSample {
+        ts,
+        label: "api balance".to_string(),
+        amount,
+        currency: "CNY".to_string(),
+    })
+    .collect::<Vec<_>>();
+    let rate = crate::usage::funded_wallet_rate(&history, &stats.rows)
+        .expect("the funded CNY wallet carries a rate");
+    assert_eq!(rate.currency, "CNY");
+    let payload = windows_payload(&ProfileWindows::ThirdParty {
+        stats: Some(stats),
+        age_secs: None,
+        provider: None,
+        wallet_rate: Some(rate),
+    });
+    assert_eq!(payload["wallet_balance"].as_f64(), Some(498.18));
+    assert_eq!(payload["wallet_burn_currency"], "CNY");
+}
+
+/// The receipt's `target` clause reads the payload `windows_payload` builds:
+/// `live_usage_json` folds `wallet_balance` and the burn in through
+/// `dated_windows_payload`, so a delegate reply names the target wallet's
+/// runway without a second render path. 498.18 CNY at 160.7/day lasts 3.10
+/// days -> three whole days.
+#[test]
+fn the_runway_reaches_the_delegate_receipt_through_live_usage_json() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let rate = crate::usage::WalletRate {
+        label: "api balance".to_string(),
+        currency: "CNY".to_string(),
+        amount: 498.18,
+        per_day: 160.7,
+    };
+    let lu = live_usage_json(
+        Some("vendor"),
+        Some(&ProfileWindows::ThirdParty {
+            stats: Some(stats),
+            age_secs: None,
+            provider: None,
+            wallet_rate: Some(rate),
+        }),
+    );
+    let prose = render::live_usage_prose(&lu, "target");
+    assert!(
+        prose.ends_with("(~3 days left)"),
+        "the receipt's target clause names the target wallet's runway: {prose}",
     );
 }
 
@@ -889,6 +1273,134 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: CX; cx names a CODEX account, which these tools do not \
          manage — they are Claude Code only. Switch it with `tollgate <name>`"
+    );
+}
+
+// ── model binds (shown only when the call names the account) ─────────────────
+
+/// One plain OAuth account and one third-party account carrying `opus` and
+/// `sonnet` binds — the DeepSeek aliasing the roster's generic model note
+/// itself uses as its example.
+fn seed_bound_profile() {
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    vendor.models.sonnet = Some("deepseek-v4-flash".to_string());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+}
+
+/// An account's model binds print only when the call names it in `names`: the
+/// unfiltered roster — the reply its own description tells a model to call
+/// before every delegate — stays byte-identical, so 27 rows never carry binds
+/// none of them asked about. The unfiltered expectation is the pre-change
+/// code's own output: the same two lines
+/// `names_filter_selects_one_profile_case_insensitively` already pins for the
+/// same fixture without binds.
+#[test]
+fn model_binds_print_only_when_the_filter_names_the_account() {
+    let _home = HomeSandbox::new();
+    seed_bound_profile();
+
+    // The byte-identity pin: the same roster that renders with binds when the
+    // filter names the account must not gain a clause when it does not.
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown",
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key",
+        ],
+        "the unfiltered roster carries no bind clause, byte-identical to today",
+    );
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: opus -> \
+             deepseek-v4-pro, sonnet -> deepseek-v4-flash; no api key"
+        ],
+        "the named account's own binds print on its row",
+    );
+}
+
+/// The session scope names its account by construction, so its one row prints
+/// the binds the way a `names` call does — it is the same `profile_line`.
+#[test]
+fn session_scope_prints_the_resolved_accounts_binds() {
+    let home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("vendor".into()),
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let runtime = home.home().join(".tollgate/profiles/vendor/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = ConfigDirSandbox::new(&home, &runtime);
+
+    let row = first_text(&call_profiles(None, Some("session")))
+        .lines()
+        .next()
+        .expect("the session row")
+        .to_string();
+    assert!(
+        row.contains("models: opus -> deepseek-v4-pro"),
+        "the session row names its account's binds: {row}"
+    );
+}
+
+/// A bind the stored config leaves absent prints nothing, and a bind holding
+/// an empty string is not a mapping: only tiers the operator actually bound
+/// appear, never an empty `tier -> ` placeholder between the real ones.
+#[test]
+fn only_set_binds_print_and_a_named_unbound_account_stays_identical() {
+    let _home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.default = Some("deepseek-v4-chat".to_string());
+    vendor.models.haiku = Some(String::new());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: default -> \
+             deepseek-v4-chat; no api key"
+        ],
+        "only the set binds print, with no empty placeholder among them",
+    );
+
+    // An account with no binds at all prints no clause even when named.
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["solo"]), None)),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a named account with no binds stays byte-identical",
     );
 }
 

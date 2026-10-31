@@ -114,7 +114,7 @@ pub(crate) enum Command {
     /// endpoint and api key are left untouched.
     ///
     /// Starting an Alibaba account from nothing therefore takes two steps: give
-    /// it a Model Studio endpoint first (a Qwen preset on the Setup tab, or
+    /// it an Alibaba endpoint first (the Qwen preset on the Setup tab, or
     /// --base-url here), then run a bare login on that name. Which console a
     /// session is captured from is read off the endpoint, so a name with no
     /// endpoint yet has no console to open.
@@ -122,13 +122,13 @@ pub(crate) enum Command {
 
     /// Save the login Claude Code is using now as a new profile
     ///
-    /// Reads the live ~/.claude/.credentials.json — plus whatever endpoint and
-    /// api key Claude Code is running on — and stores it under <name>, with no
+    /// Reads the live ~/.claude/.credentials.json, plus whatever endpoint and
+    /// api key Claude Code is running on, and stores it under <name>, with no
     /// browser flow. This is the way to adopt a login `claude` already minted,
     /// including the one a first account is refused over when the live file
     /// holds a login no profile owns. The first profile becomes the active
     /// account; a later one needs `tollgate <name>` to switch to. An existing
-    /// name is refused — re-authenticating one is `tollgate login <name>`.
+    /// name is refused. Re-authenticating one is `tollgate login <name>`.
     Capture {
         /// Profile to save the current login under.
         profile: String,
@@ -142,7 +142,8 @@ pub(crate) enum Command {
         /// implicit yes for an irreversible delete.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Delete even while a live `tollgate start` session holds the profile.
+        /// Delete even while a live `tollgate start` session holds the profile, or
+        /// while its runtime trees hold session files tollgate could not rescue.
         /// Independent of --yes, which does not override this guard.
         #[arg(long)]
         force: bool,
@@ -257,7 +258,7 @@ pub(crate) enum Command {
     ///
     /// One row per record in ~/.tollgate/jobs/: background runs still going,
     /// blocking runs whose caller is still waiting, finished results nothing
-    /// has collected yet, and runs whose server died. Read-only — stopping one
+    /// has collected yet, and runs whose server died. Read-only: stopping one
     /// is the `monitor` tool's job. An empty store exits 0.
     Jobs {
         /// Emit a stable newest-first JSON array instead of the table. The
@@ -266,18 +267,23 @@ pub(crate) enum Command {
         json: bool,
     },
 
-    /// List Claude Code sessions as a table
+    /// List Claude Code sessions, or with --live every running tollgate session
     ///
     /// Exits 0 on success, 2 on a usage error, 1 on any other failure.
     Sessions {
-        /// Emit a stable newest-first JSON array instead of the table. The field
-        /// set is fixed; `tokens` and `cost` are null without `--tokens`.
+        /// Emit a stable newest-first JSON array instead of the table. Each
+        /// listing's field set is fixed; without `--tokens`, the full listing's
+        /// `tokens` and `cost` are null.
         #[arg(long)]
         json: bool,
         /// Add each session's token total and cost. Reads every transcript in
         /// full, so a large store takes a while; omitted, both stay blank.
         #[arg(long)]
         tokens: bool,
+        /// Only the sessions running now, with the id `tollgate switch` takes.
+        /// Opens no transcript.
+        #[arg(long, conflicts_with = "tokens")]
+        live: bool,
     },
 
     /// Switch the global account, or move a live session to another profile
@@ -293,18 +299,18 @@ pub(crate) enum Command {
     /// refused with a logged reason. An API-key session hot-swaps its key
     /// when the target has the same endpoint, model routing and custom env
     /// (a different key is exactly what it swaps): it prints `committed`,
-    /// then shows swapping… until its key helper has served the new key
-    /// (`--wait` waits for that). Any other target — another endpoint,
-    /// models or env, or a session that cannot hot-swap — is refused with
+    /// then shows swapping... until its key helper has served the new key
+    /// (`--wait` waits for that). Any other target (another endpoint,
+    /// models or env, or a session that cannot hot-swap) is refused with
     /// the command to use instead: `--relaunch`, which stops the session and
     /// resumes its conversation under the profile. For a session started with
     /// --with-fallback, the chain's decider can supersede a manual intent on
     /// its next tick. The sid is the `<pid>-<seq>` of a live `tollgate start`
-    /// session, one row per session under ~/.tollgate/live_sessions/.
+    /// session or delegate, as `tollgate sessions --live` lists it.
     Switch {
         /// Profile to switch the global account to, or a live session id.
         name: String,
-        /// Profile to point the live session at — its presence is what makes
+        /// Profile to point the live session at. Its presence is what makes
         /// the two-name form the session form.
         profile: Option<String>,
         /// Session form: wait (up to 65 s) until the session's key helper
@@ -369,14 +375,14 @@ pub(crate) enum Command {
         /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8453
         ///
         /// For running the daemon on one machine and a client (tollgate-tray) on
-        /// another. TLS comes from this host's lego certificate — from
+        /// another. TLS comes from this host's lego certificate: from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
         /// ~/.tollgate/tls.json. Every request but a pairing needs a paired
         /// device's token; see `tollgate devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
-        /// flag is for — a client on another machine. It is the same exposure
+        /// flag is for: a client on another machine. It is the same exposure
         /// the spelled-out form always had, just less to type; the flag itself
         /// still has to be passed, so nothing listens by accident.
         #[arg(
@@ -393,7 +399,7 @@ pub(crate) enum Command {
         /// no certificate covers, and `tailscale cert` writes a `<name>.crt` and
         /// `<name>.key` with no issuer file and none of lego's naming.
         ///
-        /// Both files are read as PEM. Given these, nothing else is consulted —
+        /// Both files are read as PEM. Given these, nothing else is consulted:
         /// not `hostname -f`, not the directory in ~/.tollgate/tls.json, and no
         /// issuer file beside the certificate. Requires --key and --listen.
         #[arg(long, value_name = "PATH", requires = "key", requires = "listen")]
@@ -438,8 +444,8 @@ pub(crate) enum Command {
 
     /// Print every account's quota windows and money meters
     ///
-    /// One observation per account across every provider — claude profiles,
-    /// codex profiles and monitoring sources — read from the on-disk usage
+    /// One observation per account across every provider (claude profiles,
+    /// codex profiles and monitoring sources), read from the on-disk usage
     /// caches, never fetched. `--json` prints the stable envelope agents read:
     /// `{schema_version: 1, generated_at, guest_mode, accounts: [...]}`, money
     /// as exact decimal strings and times as RFC 3339. Without it, a report of
@@ -466,7 +472,7 @@ pub(crate) enum Command {
         #[arg(long, value_name = "ACCOUNT")]
         account: Option<String>,
         /// Only accounts from this source (`anthropic_oauth`, `codex`,
-        /// `openrouter`, …) or provider name.
+        /// `openrouter`, ...) or provider name.
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
     },
@@ -503,7 +509,7 @@ pub(crate) enum Command {
     ///
     /// The same shape the daemon writes to ~/.tollgate/status.json.
     Status {
-        /// Required — status has no other output mode.
+        /// Required: status has no other output mode.
         #[arg(long, required = true)]
         json: bool,
         /// Also list disabled profiles, hidden by default.
@@ -512,6 +518,15 @@ pub(crate) enum Command {
         /// Alias for --all.
         #[arg(long)]
         disabled: bool,
+    },
+
+    /// Built-in preset maintenance
+    ///
+    /// `tollgate presets rebind` moves accounts onto the model ids the built-in
+    /// presets bind now.
+    Presets {
+        #[command(subcommand)]
+        cmd: PresetsCommand,
     },
 
     /// Run the stdio MCP server (claude code launches this)
@@ -581,26 +596,31 @@ pub(crate) enum Command {
 
     /// Print one profile name per line, for the shell completion scripts;
     /// `--live-sessions` prints the live-session registry's id stems instead,
-    /// for `tollgate switch`'s first position.
+    /// for `tollgate switch`'s first position; `--resumable` prints `latest`
+    /// plus the global store's top-level session ids, for `resume` and `info`.
     #[command(name = "__complete", hide = true)]
     Complete {
-        /// The codex roster instead of the claude one (for `limit-reset`).
-        #[arg(long)]
+        /// The codex roster instead of the claude one.
+        #[arg(long, conflicts_with_all = ["live_sessions", "resumable"])]
         codex: bool,
         /// The Hermes roster (for `start`, `delete` and the `hermes` verbs).
         #[arg(long)]
         hermes: bool,
         /// Print `~/.tollgate/live_sessions/`'s file stems instead of profile
         /// names.
-        #[arg(long = "live-sessions", hide = true)]
+        #[arg(long = "live-sessions", hide = true, conflicts_with = "resumable")]
         live_sessions: bool,
+        /// Print `latest` plus the global store's top-level session ids
+        /// instead of profile names.
+        #[arg(long, hide = true)]
+        resumable: bool,
     },
 
     /// CC's `apiKeyHelper` body for an api-key profile: print the profile's
     /// stored key to stdout so the runtime settings.json never holds it. The
     /// command reads, never mints: every call prints the same static key from
     /// `config.toml` until a re-login or the divergence adopt re-captures it,
-    /// so a copied value keeps working across any number of child sessions —
+    /// so a copied value keeps working across any number of child sessions:
     /// it is not single-use.
     #[command(name = crate::identity::API_KEY_HELPER_SUBCMD, hide = true)]
     ApiKey {
@@ -642,6 +662,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     SelfHeal,
 
+    /// The `PreToolUse` `Read` hook `tollgate start` and `delegate` inject: read
+    /// the hook payload on stdin and allow a read of the session's own tool
+    /// result that resolves through the runtime's `projects` link.
+    #[command(hide = true)]
+    HookReadExempt,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {
@@ -671,18 +697,20 @@ pub(crate) struct StartArgs {
     ///
     /// The session starts on this profile and swaps onto the next chain member
     /// when its window is spent, instead of stopping where the account does. If
-    /// a chain member is today's home account — the `preferred` flag, or a
-    /// `preferred_days` list naming today — the session also returns to it once
+    /// a chain member is today's home account (the `preferred` flag, or a
+    /// `preferred_days` list naming today), the session also returns to it once
     /// it reads clear and fresh again. Needs a running
     /// `tollgate daemon` to decide the switches, and a profile that is already a
     /// chain member. Not available with --isolated, on a non-OAuth account,
-    /// or on a Windows host without symlink privilege — each of those is refused
+    /// or on a Windows host without symlink privilege. Each of those is refused
     /// by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
-    /// Pick the account instead of naming one: the first fallback-chain member
-    /// with headroom for the models this session will run (`--model`, the model
-    /// in your settings, the subagent model).
+    /// Pick the account instead of naming one: the fallback-chain member
+    /// with headroom for the models this session will run (`--model`, the
+    /// model in your settings, the subagent model), taken in your
+    /// `walk_order`: chain position by default, else the soonest weekly
+    /// reset or the most weekly headroom.
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:
@@ -697,7 +725,8 @@ pub(crate) struct StartArgs {
     /// Profile to launch under.
     #[arg(required_unless_present = "auto")]
     pub(crate) profile: Option<String>,
-    /// Args handed to `claude` verbatim.
+    /// Args handed to `claude` as given, except a `--settings` before `--`,
+    /// which tollgate merges into its own settings file when it passes one.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -740,7 +769,7 @@ impl StartArgs {
     ///
     /// `--auto` leaves no profile to fill, but clap fills positionals in
     /// declaration order and binds the first trailing value to that slot
-    /// anyway — so `tollgate start --auto -- -p "hi"` parks `-p` in `profile` and
+    /// anyway, so `tollgate start --auto -- -p "hi"` parks `-p` in `profile` and
     /// leaves `claude` a bare `hi`. Folding it back is what makes the `--`
     /// spelling come out whole on the other side.
     pub(crate) fn passthrough(&self) -> Vec<String> {
@@ -776,12 +805,12 @@ pub(crate) struct LoginArgs {
     pub(crate) setup_token: bool,
     /// Create (or re-authenticate) a CODEX profile instead, by adopting the
     /// operator's own `codex login` out of ~/.codex/auth.json. The flag picks
-    /// which state file the profile lives in and appears only on this verb —
-    /// switch, delete, and start resolve bare names against both rosters.
+    /// which state file the profile lives in and appears only on this verb.
+    /// Switch, delete, and start resolve bare names against both rosters.
     #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
     pub(crate) codex: bool,
     /// With --codex: mint a FRESH codex chain via the browser instead of
-    /// adopting ~/.codex — a login tollgate alone holds, leaving your own codex
+    /// adopting ~/.codex: a login tollgate alone holds, leaving your own codex
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
@@ -1086,6 +1115,29 @@ pub(crate) enum HermesAuthAction {
     },
 }
 
+/// `tollgate presets <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum PresetsCommand {
+    /// Move accounts onto the model ids the built-in presets bind now
+    ///
+    /// Bare, it lists the rows that would move; `--yes` writes them. Only rows
+    /// that are empty or still hold an id an earlier release shipped move; a
+    /// row holding any other id stays.
+    Rebind(RebindArgs),
+}
+
+/// `tollgate presets rebind`'s account selection and apply switch.
+#[derive(Args, Debug)]
+pub(crate) struct RebindArgs {
+    /// Only these accounts
+    #[arg(value_name = "ACCOUNT")]
+    pub(crate) accounts: Vec<String>,
+
+    /// Apply the listed changes
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
 /// `tollgate herdr <cmd>`: install and uninstall the plugin and its config wiring.
 #[derive(Subcommand, Debug)]
 pub(crate) enum HerdrCommand {
@@ -1154,7 +1206,7 @@ pub(crate) enum HerdrCommand {
         agent: Option<String>,
         /// The pane's `tollgate start` session: the tag then grades the
         /// account the session's requests authenticate as, and names a hot
-        /// swap in flight (`<served> → <committed> swapping…`).
+        /// swap in flight (`<served> → <committed> swapping...`).
         #[arg(long, value_name = "SID")]
         session: Option<String>,
         /// A bare Hermes pane's HERMES_HOME: a tollgate Hermes home names its

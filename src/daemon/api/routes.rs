@@ -39,6 +39,7 @@ pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
+use super::push;
 use super::sessions;
 use super::terminal;
 
@@ -78,6 +79,9 @@ pub(crate) struct Route {
 /// The one path-parameter spelling a row may carry, utoipa's own, so the
 /// route table and the document compare by the same string.
 const ID_SEGMENT: &str = "{id}";
+/// The second parameter, on the ask route: bound like [`ID_SEGMENT`], through
+/// the same decoder, as the second element of the bound list.
+const ASK_SEGMENT: &str = "{ask}";
 
 /// A bound path segment as the client meant it: `%XX` pairs decoded to their
 /// bytes, once, at the binding. The PWA's generator runtime (`openapi-fetch`)
@@ -91,20 +95,19 @@ pub(crate) fn decode_segment(segment: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Whether `path` is an instance of `template`: the same segments, with an
-/// [`ID_SEGMENT`] matching any non-empty request segment that
-/// [`decode_segment`] accepts. `Some(bound)` on a match, the bound id `None`
-/// for a row that names no parameter; the terminal bridge binds its pane id
-/// through the same decoder.
-fn match_template(template: &str, path: &str) -> Option<Option<String>> {
+/// Whether `path` is an instance of `template`: the same segments, with a
+/// `{id}` or `{ask}` segment matching any non-empty request segment that
+/// [`decode_segment`] accepts. The bound segments return in template order,
+/// decoded; the terminal bridge binds its pane id through the same decoder.
+fn match_template(template: &str, path: &str) -> Option<Vec<String>> {
     let mut want = template.split('/');
     let mut have = path.split('/');
-    let mut bound = None;
+    let mut bound = Vec::new();
     loop {
         match (want.next(), have.next()) {
             (None, None) => return Some(bound),
-            (Some(ID_SEGMENT), Some(segment)) if !segment.is_empty() => {
-                bound = Some(decode_segment(segment)?);
+            (Some(ID_SEGMENT | ASK_SEGMENT), Some(segment)) if !segment.is_empty() => {
+                bound.push(decode_segment(segment)?);
             }
             (Some(expected), Some(segment)) if expected == segment => {}
             _ => return None,
@@ -252,6 +255,24 @@ pub(crate) static ROUTES: &[Route] = &[
         handler: agent::keys,
     },
     Route {
+        method: "POST",
+        path: "/sessions/{id}/prompt",
+        access: Access::Control,
+        handler: agent::session_prompt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/interrupt",
+        access: Access::Control,
+        handler: agent::session_interrupt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/asks/{ask}",
+        access: Access::Control,
+        handler: agent::session_answer,
+    },
+    Route {
         method: "GET",
         path: "/gateway",
         access: Access::View,
@@ -262,6 +283,37 @@ pub(crate) static ROUTES: &[Route] = &[
         path: "/gateway",
         access: Access::View,
         handler: gateway::gateway,
+    },
+    Route {
+        method: "GET",
+        path: "/push/key",
+        access: Access::View,
+        handler: push::key,
+    },
+    Route {
+        method: "HEAD",
+        path: "/push/key",
+        access: Access::View,
+        handler: push::key,
+    },
+    // The two rows below are the one write the view tier can make, a
+    // deliberate exception to "every mutating route needs control": a device
+    // writes only its own subscription row, and the row reaches nothing the
+    // tier does not already read. Two bounds hold it there: the endpoint must
+    // be https on Google's, Apple's or Mozilla's push service, so a device
+    // cannot point the daemon at any other host; and a push carries the event
+    // kind and the account name alone, both already in the view feed.
+    Route {
+        method: "PUT",
+        path: "/push/subscription",
+        access: Access::View,
+        handler: push::subscribe,
+    },
+    Route {
+        method: "DELETE",
+        path: "/push/subscription",
+        access: Access::View,
+        handler: push::unsubscribe,
     },
 ];
 
@@ -274,6 +326,9 @@ pub(crate) struct Caller<'a> {
     /// The request segment the row's [`ID_SEGMENT`] bound — the pane or
     /// session the request names; `None` on a row without one.
     pub(crate) target: Option<&'a str>,
+    /// The request segment the row's [`ASK_SEGMENT`] bound — the ask the
+    /// request answers; `None` on a row without one.
+    pub(crate) ask: Option<&'a str>,
 }
 
 impl Caller<'_> {
@@ -312,6 +367,9 @@ pub(crate) struct ApiContext {
     /// where there is no scheduler to ask — the tests that exercise a route
     /// without a daemon behind it.
     pub(crate) live: Option<crate::daemon::LiveStores>,
+    /// The reading stores, when a daemon built this context: the REST switch
+    /// drains the forgets its change site noted right after the locks drop.
+    pub(crate) memory_stores: Option<crate::usage::MemoryStores>,
     /// The seam every bounded herdr call goes through (the pane route, the
     /// terminal bridge's snapshot, the agent routes); see [`super::panes`].
     pub(crate) herdr_probe: PaneProbe,
@@ -323,27 +381,44 @@ pub(crate) struct ApiContext {
     /// test spawns a fixture script, and the default refuses so no test ever
     /// runs a real herdr.
     pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
+    /// The mod bridge hub, when a `--listen` daemon bound the socket and built
+    /// this context with it. `None` in tests without a bridge and on platforms
+    /// with no bridge (Windows).
+    #[cfg(unix)]
+    pub(crate) bridge: Option<Arc<crate::daemon::bridge::Hub>>,
+    /// Which device holds control of each pane: the terminal bridge records
+    /// it, `GET /events` relays the contention it detects.
+    pub(crate) terminal_holders: Arc<super::terminal::TerminalHolders>,
 }
 
 impl ApiContext {
     /// The daemon's constructor: both herdr seams are passed explicitly, the
-    /// pane probe for `GET /panes` and the socket resolver for `GET /events`.
+    /// pane probe for `GET /panes` and the socket resolver for `GET /events`,
+    /// and the mod bridge hub (unix) — `None` when the bind failed or a test
+    /// runs without one (SB-1).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: ConfigHandle,
         status_path: PathBuf,
         live: Option<crate::daemon::LiveStores>,
+        memory_stores: Option<crate::usage::MemoryStores>,
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
+        #[cfg(unix)] bridge: Option<Arc<crate::daemon::bridge::Hub>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
             status_path,
             switch_gate: RankedMutex::new(()),
             live,
+            memory_stores,
             herdr_probe,
             herdr,
             terminal_spawn,
+            #[cfg(unix)]
+            bridge,
+            terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
         })
     }
 
@@ -361,9 +436,33 @@ impl ApiContext {
             config,
             status_path,
             live,
+            None,
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// The test constructor over a bridge hub: the bridge the tests drive and a
+    /// pane probe that answers nothing by default.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_tests_with_bridge(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        herdr_probe: PaneProbe,
+        bridge: Arc<crate::daemon::bridge::Hub>,
+    ) -> Arc<Self> {
+        Self::new(
+            config,
+            status_path,
+            None,
+            None,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+            Some(bridge),
         )
     }
 }
@@ -417,10 +516,10 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             (route.method == req.method)
                 .then(|| match_template(route.path, path))
                 .flatten()
-                .map(|target| (route, target))
+                .map(|bound| (route, bound))
         })
     });
-    if let Some((route, target)) = &route
+    if let Some((route, bound)) = &route
         && route.access == Access::None
     {
         return Handled {
@@ -430,7 +529,8 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
                 &Caller {
                     peer,
                     device: None,
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             device: None,
@@ -470,14 +570,15 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     }
 
     let response = match route {
-        Some((route, target)) => match authorize(&device.tier, route.access) {
+        Some((route, bound)) => match authorize(&device.tier, route.access) {
             Grant::Allowed => (route.handler)(
                 ctx,
                 req,
                 &Caller {
                     peer,
                     device: Some(&device),
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
@@ -787,7 +888,7 @@ pub(crate) struct SwitchOk {
         (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
-        (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
+        (status = 503, description = "the state flock is held (`state_locked`; retry shortly), or the daemon is stopping (`daemon_stopping`; retry once it is back)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`), or the switch failed (`switch_failed`)", body = ErrorBody)
     ),
     security(("bearer" = ["control"]))
@@ -823,17 +924,56 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
         return Response::error(409, "switch_in_progress");
     };
 
+    // The switch's AUTH-1 gate can refresh the target on THIS request thread,
+    // and a stop signal does not see that thread: the spend marker travels into
+    // the gate, which claims it under the rotation lock right before the POST.
+    // A stop that lands while the gate is parked then refuses the spend (the
+    // gate answers `Stopping`), and a stop during the save is waited out by the
+    // drain.
+    let target = crate::profile::ProfileName::from(canonical.as_str());
+    let spend_marker = match &ctx.live {
+        Some(live) => {
+            // A stopping daemon takes no new switch, a no-spend one included:
+            // the exit waits out a token spend, never a switch's install. A
+            // stop landing after this check is refused inside the gate, which
+            // reads the flag under the rotation lock before any token request.
+            if live.shutting_down.load(Ordering::SeqCst) {
+                return Response::error(503, "daemon_stopping");
+            }
+            Some((&live.activity, live.shutting_down.as_ref()))
+        }
+        // No daemon built this context, so no stop path can cut it.
+        None => None,
+    };
+
     match switch_profile_noninteractive(
         &ctx.config,
-        &crate::profile::ProfileName::from(canonical.as_str()),
+        &target,
         on_divergence,
         oauth::refresh_result,
+        spend_marker,
     ) {
-        Ok((previous, active)) => {
+        // A bare-item notice is on daemon.log already: the body's schema has
+        // no text field to carry it.
+        Ok((previous, active, _notice)) => {
             logline!(
                 "tollgate api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
+            // Apply now that the state flock and config guard dropped, before
+            // the republish so the feed reflects the forget. This drain runs on
+            // the request thread, so a main-loop compare can overlap it and
+            // forget this switch's change a second time, counting it external
+            // (one extra reload). The second forget also clears memory-only
+            // state that landed between the two (a fetch's streak and cadence,
+            // a kick block, the `/profile` memo); readings, status and leg come
+            // back from the disk re-seed, the epoch is monotonic and the
+            // re-seed idempotent, and the compare's per-half CAS keeps the
+            // COMPARE from clobbering a concurrent refresh, so the cost is at
+            // most one extra request, never a wrong figure.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             republish(ctx);
             Response::serialize(
                 200,
@@ -845,6 +985,11 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             )
         }
         Err(e) => {
+            // Apply so a half-switched capture does not leave the old reading
+            // in the daemon's stores.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             // The chain (`{:#}`, every context anyhow carries) goes to
             // daemon.log, the surface the operator owns — bounded like every
             // logline is; the body keeps only what the closed set reflects. A
@@ -875,6 +1020,9 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                     SwitchError::Refused(sentence) | SwitchError::Deferred(sentence) => {
                         Response::refused(409, "switch_refused", sentence)
                     }
+                    // The daemon's stop flag refused the gate's refresh under
+                    // the rotation lock: nothing was sent, retry once it is back.
+                    SwitchError::Stopping => Response::error(503, "daemon_stopping"),
                     // The reflected copy is a fixed literal, so it needs no
                     // sanitize; the variable chain stays in daemon.log.
                     SwitchError::Failed(_) => {
@@ -974,7 +1122,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, push::key, push::subscribe, push::unsubscribe),
     // Shared cache observation schema, also used by the local agent API.
     components(schemas(crate::usage::observation::AccountObservation)),
     modifiers(&BearerScheme)
@@ -1036,3 +1184,7 @@ fn openapi_document(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
 #[cfg(test)]
 #[path = "../../../tests/inline/daemon_api_routes.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/inline/daemon_api_push.rs"]
+mod push_tests;

@@ -683,7 +683,7 @@ fn second_start_on_same_profile_refuses_live() {
         err.to_string(),
         format!(
             "tollgate: hermes 'or-main': a Hermes session is already running on this home \
-             (session {}); Hermes homes take one process at a time — start another account home \
+             (session {}); Hermes homes take one process at a time; start another account home \
              instead",
             marker.session_id()
         )

@@ -27,6 +27,7 @@ fn only_enabled_due_monitors_are_polled() {
                 label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
                 value: "3.00 USD".into(),
                 kind: StatRowKind::Body,
+                raw: None,
             }],
             bars: Vec::new(),
             plan: None,

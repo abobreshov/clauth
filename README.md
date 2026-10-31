@@ -24,8 +24,8 @@ tollgate monitors and manages your AI subscriptions and spending from one termin
 - **Monitor** live 5h / 7d rate-limit bars, provider balances and quotas, a token dashboard with API-equivalent cost, and the Claude status-incident feed
 - **Auto-switch** down a fallback chain when an account hits its limit, with weekly-window and spend-ceiling gates; opted-in accounts queue their auto-start so their 5h windows open apart
 - **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins or hooks
-- **From inside Claude**: the MCP plugin lets a live session list accounts, switch, or delegate a prompt to another account, and tells it when the account behind it changed
-- **Headless**: `tollgate daemon` runs the refresh and auto-switch loop with no TUI, publishes `status.json`, and can serve that feed, the account switch and herdr panes to another machine over HTTPS with `--listen`
+- **From inside Claude**: the MCP plugin lets a live session list accounts, switch, or delegate a prompt to another account, tells it when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a paired phone
+- **Headless**: `tollgate daemon` runs the refresh and auto-switch loop with no TUI, publishes `status.json`, and can serve that feed, the account switch, herdr panes, Claude Code session history, and prompts and interrupts into a session to another machine over HTTPS with `--listen`
 - **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and rotate accounts between sessions on a separate codex chain
 - **Hermes profiles**: run Hermes Agent under a named account in a home of its own, with a child `HOME` that keeps it away from `~/.claude`, a launch audit that refuses every route to Anthropic, and each home's month-to-date spend from its own `state.db`
 - **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, multi-instance safe
@@ -208,7 +208,7 @@ Swap in your theme's colours. The figures come from the caches, so keep `tollgat
 | [Configuration](wiki/Configuration.md) | `profiles.toml`, `config.toml`, `monitors.toml`, palette, local API, presets, storage |
 | [Auto-switch](wiki/Auto-Switch.md) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
 | [Daemon](wiki/Daemon.md) | `tollgate daemon`, the local agent API, the REST API, `status.json` |
-| [Claude Code plugin](wiki/Claude-Code-Plugin.md) | the MCP server and `delegate` |
+| [Claude Code plugin](wiki/Claude-Code-Plugin.md) | the MCP server, `delegate`, answering a session from your phone |
 | [herdr plugin](wiki/Herdr-Plugin.md) | the popup, the keys, the usage-aware pane tag |
 | [Tokens and cost](wiki/Tokens-And-Cost.md) | the token dashboard and its cost figure |
 | [Codex](wiki/Codex.md) | ChatGPT logins as codex profiles |

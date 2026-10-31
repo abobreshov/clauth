@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName, WalkOrder};
-use crate::runtime::LaunchTransport;
+use crate::runtime::{Isolation, LaunchTransport};
 use crate::usage::{
     PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
     now_epoch_secs,
@@ -60,39 +60,67 @@ fn canceled_usage() -> UsageInfo {
     }
 }
 
-fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInfo>) -> Profile {
+/// The auto-decision gap handle disarms its slot on drop: arm, drop without
+/// the actor firing, re-arm — the second arm works. A panicking test that
+/// armed the gap must not strand the seam for the next one.
+#[test]
+fn a_dropped_unfired_gap_leaves_the_next_arm_working() {
+    let _home = crate::testutil::HomeSandbox::new();
+    {
+        let _gap = crate::fallback::install_auto_decision_gap();
+        // dropped here, before any decision actor reaches the gap
+    }
+    let _gap = crate::fallback::install_auto_decision_gap();
+}
+
+/// A scenario profile plus its readings, carried beside it.
+struct Fixture {
+    profile: Profile,
+    usage: Option<UsageInfo>,
+    fresh: bool,
+    status: Option<FetchStatus>,
+}
+
+fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInfo>) -> Fixture {
     use std::collections::BTreeMap;
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: threshold,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
+    Fixture {
+        profile: Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: threshold,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            check_credit_cap: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: Some(crate::testutil::oauth_pair(name)),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
+            provider: None,
+        },
         usage,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
+        fresh: false,
+        status: None,
     }
 }
 
 /// Profile whose 5h window is live (future reset) at the given utilization —
 /// the exhaustion predicates only trust a live window.
-fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64>) -> Profile {
+fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64>) -> Fixture {
     profile_with_usage(
         name,
         threshold,
@@ -104,33 +132,50 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
 /// A separate wrapper — rather than threading a bool through every helper —
 /// so call sites read as "this member is the sink" instead of inferring it
 /// from an incidental threshold value.
-fn mark_last_resort(mut p: Profile) -> Profile {
-    p.last_resort = true;
-    p
+fn mark_last_resort(mut f: Fixture) -> Fixture {
+    f.profile.last_resort = true;
+    f
 }
 
 /// Marks a profile user-disabled (`Profile::disabled = true`) — invisible to
 /// the fallback-chain walk though it still sits in `fallback_chain` on disk.
-fn mark_disabled(mut p: Profile) -> Profile {
-    p.disabled = true;
-    p
+fn mark_disabled(mut f: Fixture) -> Fixture {
+    f.profile.disabled = true;
+    f
 }
 
 /// Marks a profile's last usage read as live — the freshness input
 /// [`walk_config`] folds into `ChainSnapshot::fresh` (the same fill the
 /// scheduler's scan runs from the `StatusStore`).
-fn mark_fresh(mut p: Profile) -> Profile {
-    p.fetch_status = Some(FetchStatus::Fresh);
-    p
+fn mark_fresh(mut f: Fixture) -> Fixture {
+    f.fresh = true;
+    f
 }
 
 /// Marks a profile the chain's preferred (home) account (`Profile::preferred`).
 /// The snapshot twin carries it on `ChainMember::preferred`, derived under the
 /// config lock in `build_chain_snapshot`, so `snapshot_chain` alone suffices to
 /// exercise the return-to-preferred pass.
-fn mark_preferred(mut p: Profile) -> Profile {
-    p.preferred = true;
-    p
+fn mark_preferred(mut f: Fixture) -> Fixture {
+    f.profile.preferred = true;
+    f
+}
+
+/// Strips the fixture's default login so a walk test can build a member that
+/// holds no login at all (no stored pair, sidecar, api key or env token).
+fn no_login(mut f: Fixture) -> Fixture {
+    f.profile.credentials = None;
+    f
+}
+
+/// Marks a profile as holding a long-lived `session-token.json` sidecar with no
+/// OAuth pair behind it — the shape whose sessions run on a setup token and
+/// whose usage nothing polls, so `no_usage_source` holds and the `NoUsage` rung
+/// fires instead of `LoggedOut`.
+fn with_long_lived_sidecar(mut f: Fixture) -> Fixture {
+    f.profile.credentials = None;
+    f.profile.has_long_lived_sidecar = true;
+    f
 }
 
 fn spend_block(enabled: bool, used: f64, limit: Option<f64>) -> SpendInfo {
@@ -155,41 +200,63 @@ fn usage_spent_with_spend(spend: SpendInfo) -> UsageInfo {
 
 /// Member whose windows are spent but whose account is billing, with `ceiling`
 /// dollars allowed unattended.
-fn spend_member(name: &str, ceiling: f64, used: f64, limit: Option<f64>) -> Profile {
-    let mut p = profile_with_usage(
+fn spend_member(name: &str, ceiling: f64, used: f64, limit: Option<f64>) -> Fixture {
+    let mut f = profile_with_usage(
         name,
         Some(95.0),
         Some(usage_spent_with_spend(spend_block(true, used, limit))),
     );
-    p.max_auto_spend = Some(ceiling);
-    p
+    f.profile.max_auto_spend = Some(ceiling);
+    f
 }
 
-fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
-    AppConfig {
+/// The per-scenario readings the config builder carries beside the profiles:
+/// the per-name picked usage and the `mark_fresh` set.
+#[derive(Default)]
+struct TestReadings {
+    usage: HashMap<String, UsageInfo>,
+    fresh: Vec<ProfileName>,
+    status: HashMap<String, FetchStatus>,
+}
+
+fn config_with_chain(fixtures: Vec<Fixture>, active: &str) -> (AppConfig, TestReadings) {
+    let names: Vec<ProfileName> = fixtures.iter().map(|f| f.profile.name.clone()).collect();
+    let mut readings = TestReadings::default();
+    for f in &fixtures {
+        if let Some(u) = &f.usage {
+            readings.usage.insert(f.profile.name.to_string(), u.clone());
+        }
+        if f.fresh {
+            readings.fresh.push(f.profile.name.clone());
+        }
+        if let Some(s) = &f.status {
+            readings.status.insert(f.profile.name.to_string(), *s);
+        }
+    }
+    let config = AppConfig {
         state: AppState {
             active_profile: Some(active.into()),
             profiles: names.clone(),
             fallback_chain: names,
             ..AppState::default()
         },
-        profiles,
-    }
+        profiles: fixtures.into_iter().map(|f| f.profile).collect(),
+    };
+    (config, readings)
 }
 
 // Both maxed and BOTH marked last_resort at a non-100 threshold: active is
 // itself the sink, so it stays parked without the walk ever reaching B.
 #[test]
 fn all_maxed_sinks_no_switch() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             mark_last_resort(profile_with_util("a", Some(90.0), Some(95.0))),
             mark_last_resort(profile_with_util("b", Some(90.0), Some(95.0))),
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // Active (unmarked, threshold 95) at 100%; B is marked last_resort at an 80%
@@ -197,7 +264,7 @@ fn all_maxed_sinks_no_switch() {
 // threshold value. One migration allowed.
 #[test]
 fn non_sink_active_migrates_to_sink_once() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
@@ -205,7 +272,7 @@ fn non_sink_active_migrates_to_sink_once() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -214,14 +281,14 @@ fn non_sink_active_migrates_to_sink_once() {
 // migration, exactly like the old threshold==100 sentinel parked.
 #[test]
 fn sink_active_maxed_stays_put() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
         ],
         "b",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // Active marked last_resort (80% threshold, maxed), B has headroom (95% @
@@ -229,7 +296,7 @@ fn sink_active_maxed_stays_put() {
 // last-resort loop guard is even consulted.
 #[test]
 fn sink_active_switches_to_member_with_headroom() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             mark_last_resort(profile_with_util("a", Some(80.0), Some(100.0))),
             profile_with_util("b", Some(95.0), Some(50.0)),
@@ -237,7 +304,7 @@ fn sink_active_switches_to_member_with_headroom() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -245,14 +312,14 @@ fn sink_active_switches_to_member_with_headroom() {
 // No member marked last_resort (both threshold 95 at 100%) — returns None.
 #[test]
 fn no_sink_available_returns_none() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
@@ -264,7 +331,7 @@ fn no_sink_available_returns_none() {
 // returned `None` (the walk stopped dead) — this assertion fails against it.
 #[test]
 fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(100.0), Some(100.0)),
             profile_with_util("b", Some(100.0), Some(100.0)),
@@ -273,7 +340,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -284,7 +351,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
 // firing Off; unmarked, B is just another exhausted, non-viable member.
 #[test]
 fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(100.0), Some(100.0)),
@@ -293,7 +360,7 @@ fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -322,39 +389,25 @@ fn store_with_infos(entries: Vec<(&str, UsageInfo)>) -> UsageStore {
     Arc::new(RankedMutex::new(map))
 }
 
-/// A `UsageStore` seeded from the profiles' `Profile.usage` fields — the port
-/// bridge for the UI-walk scenarios while `Profile.usage` still exists (commit
-/// 2b deletes the field and these tests die with it).
-fn store_from_config(config: &AppConfig) -> UsageStore {
-    let map: HashMap<String, UsageInfo> = config
-        .profiles
-        .iter()
-        .filter_map(|p| p.usage.as_ref().map(|u| (p.name.to_string(), u.clone())))
-        .collect();
-    Arc::new(RankedMutex::new(map))
-}
-
-/// Run the scheduler walk over an `AppConfig` built the way the config-side
-/// scenarios build it: snapshot the chain, seed the store from `Profile.usage`,
-/// fold `fetch_status == Fresh` into `snapshot.fresh` (the store twin of
-/// `mark_fresh`), and union the key-rejected set into `broken` (the scan's
-/// fold, which `snapshot_chain` alone leaves out).
-fn walk_config(config: &AppConfig, key_rejected: &HashSet<ProfileName>) -> Option<SwitchAction> {
+/// Run the scheduler walk over the scenario's `TestReadings` (the usage map and
+/// the `mark_fresh` set), the direct inputs `walk_config` takes. Unions the
+/// key-rejected set into `broken` (the scan's fold, which `snapshot_chain`
+/// alone leaves out).
+fn walk_config(
+    config: &AppConfig,
+    key_rejected: &HashSet<ProfileName>,
+    readings: &TestReadings,
+) -> Option<SwitchAction> {
     let mut snap = snapshot_chain(config, key_rejected).expect("snapshot");
     snap.broken.extend(key_rejected.iter().cloned());
-    snap.fresh = config
-        .profiles
-        .iter()
-        .filter(|p| p.fetch_status == Some(FetchStatus::Fresh))
-        .map(|p| p.name.clone())
-        .collect();
-    let store = store_from_config(config);
+    snap.fresh = readings.fresh.clone();
+    let store = Arc::new(RankedMutex::new(readings.usage.clone()));
     next_auto_switch_target(&snap, &store)
 }
 
 #[test]
 fn snapshot_chain_captures_thresholds_and_active() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(50.0)),
             mark_last_resort(profile_with_util("b", Some(80.0), Some(20.0))),
@@ -377,7 +430,8 @@ fn snapshot_chain_captures_thresholds_and_active() {
 
 #[test]
 fn snapshot_chain_none_when_active_not_in_chain() {
-    let mut config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(50.0))], "a");
+    let (mut config, _readings) =
+        config_with_chain(vec![profile_with_util("a", Some(95.0), Some(50.0))], "a");
     // active is set but absent from the chain
     config.state.fallback_chain = vec!["other".into()];
     assert!(snapshot_chain(&config, &HashSet::new()).is_none());
@@ -389,7 +443,7 @@ fn snapshot_chain_none_when_active_not_in_chain() {
 /// builder has to be the one that does not.
 #[test]
 fn a_session_snapshot_needs_no_global_active_profile() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(10.0)),
@@ -397,7 +451,7 @@ fn a_session_snapshot_needs_no_global_active_profile() {
         "a",
     );
     config.state.active_profile = None;
-    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
 
     assert!(
         snapshot_chain(&config, &HashSet::new()).is_none(),
@@ -426,7 +480,7 @@ fn a_session_snapshot_needs_no_global_active_profile() {
 /// member it must leave.
 #[test]
 fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(50.0)),
             mark_disabled(profile_with_util("b", Some(95.0), Some(10.0))),
@@ -434,7 +488,7 @@ fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
         ],
         "a",
     );
-    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
 
     let snap = snapshot_session_chain(
         &config,
@@ -477,8 +531,8 @@ fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
 #[test]
 fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
     let mut endpoint = profile_with_util("b", Some(95.0), Some(10.0));
-    endpoint.base_url = Some("https://api.example/anthropic".into());
-    let mut config = config_with_chain(
+    endpoint.profile.base_url = Some("https://api.example/anthropic".into());
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             endpoint,
@@ -491,7 +545,7 @@ fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
     // `load_profile` refuses it `ProfileUnreadable` every tick, so naming it stops
     // the session ever reaching the member past it.
     config.state.fallback_chain.push("ghost".into());
-    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
 
     let snap = snapshot_session_chain(
         &config,
@@ -526,7 +580,7 @@ fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
 /// there is nothing to decide.
 #[test]
 fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(10.0)),
@@ -534,7 +588,7 @@ fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
         "a",
     );
     config.state.fallback_chain = vec!["b".into()];
-    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
 
     assert!(
         snapshot_session_chain(
@@ -547,9 +601,43 @@ fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
     );
 }
 
+/// F4: a credit-leave `models_differ` list admits only members that hold a
+/// login. A login-less member whose `[models]` differ would otherwise merge
+/// into the leave walk, and the per-session leg would then ask
+/// `swap_target_precondition` about it only for the login re-read to refuse —
+/// a wasted disk re-check per tick, and a decision that lands right only when
+/// the disk agrees with memory. Reading the list directly is the observable.
+#[test]
+fn a_credit_leave_models_differ_list_skips_a_member_holding_no_login() {
+    let mut x = no_login(profile_with_util("x", Some(95.0), Some(10.0)));
+    x.profile.models.default = Some("opus".to_string());
+    let mut c = profile_with_util("c", Some(95.0), Some(10.0));
+    c.profile.models.default = Some("opus".to_string());
+    let (config, _readings) = config_with_chain(
+        vec![profile_with_util("a", Some(95.0), Some(100.0)), x, c],
+        "a",
+    );
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
+    let snap = snapshot_session_chain(
+        &config,
+        &crate::profile::ProfileName::from("a"),
+        &launch,
+        &HashSet::new(),
+    )
+    .expect("a session snapshot");
+    assert_eq!(
+        snap.models_differ
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c"],
+        "a login-less member whose models differ is not a credit-leave target"
+    );
+}
+
 #[test]
 fn auto_switch_returns_none_when_active_below_threshold() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -563,7 +651,7 @@ fn auto_switch_returns_none_when_active_below_threshold() {
 
 #[test]
 fn auto_switch_picks_member_with_headroom() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -582,7 +670,7 @@ fn auto_switch_picks_member_with_headroom() {
 // sink; the loop guard holds and no migration to B forms.
 #[test]
 fn auto_switch_sink_loop_guard_holds() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_last_resort(profile_with_util("a", Some(80.0), None)),
             mark_last_resort(profile_with_util("b", Some(80.0), None)),
@@ -599,7 +687,7 @@ fn auto_switch_sink_loop_guard_holds() {
 // exhausted and nothing marked, wrap-off switches off instead of parking.
 #[test]
 fn auto_switch_unmarked_hundred_threshold_member_is_not_a_sink() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(100.0), None),
@@ -620,7 +708,7 @@ fn auto_switch_unmarked_hundred_threshold_member_is_not_a_sink() {
 // 80% threshold — one migration to B.
 #[test]
 fn auto_switch_non_sink_active_migrates_to_sink_once() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             mark_last_resort(profile_with_util("b", Some(80.0), None)),
@@ -637,7 +725,7 @@ fn auto_switch_non_sink_active_migrates_to_sink_once() {
 
 #[test]
 fn auto_switch_missing_util_is_not_exhausted() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -658,7 +746,7 @@ fn auto_switch_missing_util_is_not_exhausted() {
 /// headroom.
 #[test]
 fn auto_switch_skips_unresolvable_chain_entry() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("c", Some(95.0), Some(10.0)),
@@ -696,7 +784,7 @@ fn auto_switch_skips_unresolvable_chain_entry() {
 // walk: switch_off_when_spent on, no last_resort member, all exhausted → Off.
 #[test]
 fn wrap_off_switches_off_when_chain_spent() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
@@ -705,7 +793,7 @@ fn wrap_off_switches_off_when_chain_spent() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -714,7 +802,7 @@ fn wrap_off_switches_off_when_chain_spent() {
 // threshold, not 100) → migrate there, not Off.
 #[test]
 fn wrap_off_prefers_sink_over_off() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
@@ -723,7 +811,7 @@ fn wrap_off_prefers_sink_over_off() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -731,7 +819,7 @@ fn wrap_off_prefers_sink_over_off() {
 // walk: switch_off_when_spent on but active still has headroom → no Off.
 #[test]
 fn wrap_off_skips_off_when_active_has_headroom() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(50.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
@@ -740,20 +828,20 @@ fn wrap_off_skips_off_when_active_has_headroom() {
     );
     config.state.switch_off_when_spent = true;
     // a at 50% < 95% → not exhausted → stay
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // walk: same spent chain, switch_off_when_spent off → legacy None.
 #[test]
 fn wrap_off_disabled_stays_put() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // ── soonest_resume ───────────────────────────────────────────────────────────
@@ -762,20 +850,20 @@ fn wrap_off_disabled_stays_put() {
 // member that resumes soonest, valid only when EVERY member is currently
 // exhausted.
 
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
-}
+use crate::testutil::reset_in;
 
 #[test]
 fn soonest_resume_empty_chain_is_none() {
-    let config = config_with_chain(vec![], "a");
-    assert_eq!(soonest_resume(&config, &HashSet::new()), None);
+    let (config, readings) = config_with_chain(vec![], "a");
+    assert_eq!(
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
+        None
+    );
 }
 
 #[test]
 fn soonest_resume_picks_the_soonest_reset() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "a",
@@ -790,7 +878,8 @@ fn soonest_resume_picks_the_soonest_reset() {
         ],
         "a",
     );
-    let (name, eta) = soonest_resume(&config, &HashSet::new()).expect("all exhausted");
+    let (name, eta) =
+        soonest_resume(&config, &HashSet::new(), &readings.usage).expect("all exhausted");
     assert_eq!(name, "b", "b resets sooner than a");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
 }
@@ -799,7 +888,7 @@ fn soonest_resume_picks_the_soonest_reset() {
 #[test]
 fn soonest_resume_ties_keep_earlier_chain_order() {
     let reset = reset_in(3600);
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "a",
@@ -814,7 +903,8 @@ fn soonest_resume_ties_keep_earlier_chain_order() {
         ],
         "a",
     );
-    let (name, _) = soonest_resume(&config, &HashSet::new()).expect("all exhausted");
+    let (name, _) =
+        soonest_resume(&config, &HashSet::new(), &readings.usage).expect("all exhausted");
     assert_eq!(name, "a", "a tie keeps the earlier chain-order member");
 }
 
@@ -822,7 +912,7 @@ fn soonest_resume_ties_keep_earlier_chain_order() {
 // all-exhausted premise doesn't hold; recovery would relink it next tick.
 #[test]
 fn soonest_resume_none_when_one_member_recovered() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "a",
@@ -833,14 +923,17 @@ fn soonest_resume_none_when_one_member_recovered() {
         ],
         "a",
     );
-    assert_eq!(soonest_resume(&config, &HashSet::new()), None);
+    assert_eq!(
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
+        None
+    );
 }
 
 // b's 5h window already reset — headroom again whatever its stale util says
 // (the same wall-clock rule `find_recovered_member` uses).
 #[test]
 fn soonest_resume_none_when_a_member_window_expired() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "a",
@@ -855,14 +948,17 @@ fn soonest_resume_none_when_a_member_window_expired() {
         ],
         "a",
     );
-    assert_eq!(soonest_resume(&config, &HashSet::new()), None);
+    assert_eq!(
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
+        None
+    );
 }
 
 // A chain member with no resolvable profile (deleted, still listed) can't be
 // proven exhausted — bail rather than pick around it.
 #[test]
 fn soonest_resume_none_when_chain_member_missing_profile() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![profile_with_usage(
             "a",
             Some(95.0),
@@ -871,7 +967,10 @@ fn soonest_resume_none_when_chain_member_missing_profile() {
         "a",
     );
     config.state.fallback_chain.push("ghost".into());
-    assert_eq!(soonest_resume(&config, &HashSet::new()), None);
+    assert_eq!(
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
+        None
+    );
 }
 
 // A disabled member is never a switch candidate, so its idle cached 5h
@@ -879,7 +978,7 @@ fn soonest_resume_none_when_chain_member_missing_profile() {
 // hard-exhausted member still reports its reset.
 #[test]
 fn soonest_resume_skips_a_disabled_member_holding_an_idle_window() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "reachable",
@@ -890,8 +989,8 @@ fn soonest_resume_skips_a_disabled_member_holding_an_idle_window() {
         ],
         "reachable",
     );
-    let (name, eta) =
-        soonest_resume(&config, &HashSet::new()).expect("reachable member is hard-exhausted");
+    let (name, eta) = soonest_resume(&config, &HashSet::new(), &readings.usage)
+        .expect("reachable member is hard-exhausted");
     assert_eq!(name, "reachable", "the disabled member must be skipped");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
 }
@@ -900,7 +999,7 @@ fn soonest_resume_skips_a_disabled_member_holding_an_idle_window() {
 // axis that isn't usage-derived.
 #[test]
 fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "reachable",
@@ -912,8 +1011,8 @@ fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
         "reachable",
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true);
-    let (name, eta) =
-        soonest_resume(&config, &HashSet::new()).expect("reachable member is hard-exhausted");
+    let (name, eta) = soonest_resume(&config, &HashSet::new(), &readings.usage)
+        .expect("reachable member is hard-exhausted");
     assert_eq!(name, "reachable", "the auth-broken member must be skipped");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
 }
@@ -922,7 +1021,7 @@ fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
 // a canceled account whose cached 5h window still reads idle headroom.
 #[test]
 fn soonest_resume_skips_a_canceled_member_holding_an_idle_window() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "reachable",
@@ -933,8 +1032,8 @@ fn soonest_resume_skips_a_canceled_member_holding_an_idle_window() {
         ],
         "reachable",
     );
-    let (name, eta) =
-        soonest_resume(&config, &HashSet::new()).expect("reachable member is hard-exhausted");
+    let (name, eta) = soonest_resume(&config, &HashSet::new(), &readings.usage)
+        .expect("reachable member is hard-exhausted");
     assert_eq!(name, "reachable", "the canceled member must be skipped");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
 }
@@ -951,7 +1050,7 @@ fn soonest_resume_skips_a_canceled_member_holding_an_idle_window() {
 // dead-member skip exists at all.
 #[test]
 fn soonest_resume_none_when_the_only_chain_member_is_a_dead_one_over_threshold() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![mark_disabled(profile_with_util(
             "dead",
             Some(95.0),
@@ -959,13 +1058,16 @@ fn soonest_resume_none_when_the_only_chain_member_is_a_dead_one_over_threshold()
         ))],
         "dead",
     );
-    assert_eq!(soonest_resume(&config, &HashSet::new()), None);
+    assert_eq!(
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
+        None
+    );
 }
 
 // next_auto_switch_target: scheduler-side wrap-off → Off when chain spent.
 #[test]
 fn auto_switch_wrap_off_switches_off_when_chain_spent() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -994,7 +1096,7 @@ fn auto_switch_wrap_off_switches_off_when_chain_spent() {
 /// Fixture shared by the walk-order pins: chain [alpha (7d +3d, clear), beta
 /// (7d +2h, clear)], active gamma 5h-exhausted. Chain order lands the walk on
 /// alpha (the first slot after gamma); soonest-weekly-reset lands it on beta.
-fn walk_order_config() -> AppConfig {
+fn walk_order_config() -> (AppConfig, TestReadings) {
     let clear = |seven_reset: String| {
         usage_both(
             Some(window(10.0, Some(live_reset()))),
@@ -1014,14 +1116,17 @@ fn walk_order_config() -> AppConfig {
 #[test]
 fn walk_order_chain_default_picks_chain_position_and_soonest_picks_the_soonest_reset() {
     assert_eq!(
-        walk_config(&walk_order_config(), &HashSet::new()),
+        {
+            let (wc, r) = walk_order_config();
+            walk_config(&wc, &HashSet::new(), &r)
+        },
         Some(SwitchAction::To("alpha".to_string())),
         "default (unset) keeps today's chain-position walk byte-identical"
     );
-    let mut soonest = walk_order_config();
+    let (mut soonest, readings) = walk_order_config();
     soonest.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        walk_config(&soonest, &HashSet::new()),
+        walk_config(&soonest, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "soonest-weekly-reset lands on the member whose 7d window resets first"
     );
@@ -1031,7 +1136,7 @@ fn walk_order_chain_default_picks_chain_position_and_soonest_picks_the_soonest_r
 // reset ranks AFTER every member that has one, whatever its chain position.
 #[test]
 fn walk_order_soonest_ranks_a_member_with_no_weekly_reset_last() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "alpha",
@@ -1052,7 +1157,7 @@ fn walk_order_soonest_ranks_a_member_with_no_weekly_reset_last() {
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a cold member's unknown reset ranks last, not soonest"
     );
@@ -1069,7 +1174,7 @@ fn walk_order_soonest_ties_keep_chain_position() {
             Some(window(10.0, Some(seven_reset.to_string()))),
         )
     };
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_usage("alpha", Some(95.0), Some(clear(&same))),
             profile_with_usage("beta", Some(95.0), Some(clear(&same))),
@@ -1079,7 +1184,7 @@ fn walk_order_soonest_ties_keep_chain_position() {
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("alpha".to_string())),
         "a tie on the parsed instant keeps the earlier chain-order member"
     );
@@ -1101,8 +1206,8 @@ fn walk_order_soonest_never_reorders_across_the_accept_pass_ladder() {
             ..UsageInfo::default()
         }),
     );
-    alpha.max_auto_spend = Some(100.0);
-    let mut config = config_with_chain(
+    alpha.profile.max_auto_spend = Some(100.0);
+    let (mut config, readings) = config_with_chain(
         vec![
             alpha,
             profile_with_usage(
@@ -1120,7 +1225,7 @@ fn walk_order_soonest_never_reorders_across_the_accept_pass_ladder() {
     config.state.spend_budget_switching = true;
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a clear member wins over a sooner-resetting spend-armed-only one"
     );
@@ -1138,6 +1243,8 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let recovered_usage = |seven_reset: String| {
         usage_both(
@@ -1188,6 +1295,8 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1205,8 +1314,12 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1251,6 +1364,8 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1273,8 +1388,12 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1448,6 +1567,8 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1465,8 +1586,12 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1506,6 +1631,8 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1530,8 +1657,12 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1570,6 +1701,8 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1587,8 +1720,12 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh,
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1638,7 +1775,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
 
 // The home is a PARK, not a per-tick re-fire: once the walk lands on the
 // soonest clear+fresh member, that member IS the home and the next healthy
-// tick must stay put — the `pref != active.name` analog. Without the guard
+// tick must stay put — the `pref != active.profile.name` analog. Without the guard
 // the active (skipped as a candidate) walks to the second-soonest member
 // every tick, one credential relink per scheduler tick, forever.
 #[test]
@@ -1653,6 +1790,8 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         walk_min_gain_secs: 3600,
@@ -1670,8 +1809,12 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["beta".into(), "alpha".into()],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1726,18 +1869,18 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
     };
     start_walk_write_usage("beta", &dated(reset_in(3 * 86_400)));
     start_walk_write_usage("alpha", &dated(reset_in(2 * 3600)));
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, None, false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
-    let (rows, pick) = start_walk(&config, None, false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(1), "soonest-reset: alpha (+2h) beats beta (+3d)");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
@@ -1752,7 +1895,7 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, None, false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
@@ -1779,7 +1922,7 @@ fn weekly_read(five: f64, seven: f64) -> UsageInfo {
 
 /// Chain [alpha, beta, gamma], active gamma 5h-spent; alpha and beta carry the
 /// given readings.
-fn headroom_config(alpha: UsageInfo, beta: UsageInfo) -> AppConfig {
+fn headroom_config(alpha: UsageInfo, beta: UsageInfo) -> (AppConfig, TestReadings) {
     config_with_chain(
         vec![
             profile_with_usage("alpha", Some(95.0), Some(alpha)),
@@ -1801,6 +1944,8 @@ fn headroom_member(name: &str, preferred: bool) -> ChainMember {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }
 }
 
@@ -1821,22 +1966,26 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
 #[test]
 fn walk_order_most_headroom_picks_the_least_used_week_not_the_next_slot() {
-    let mut config = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 5.0));
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 5.0));
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("alpha".to_string())),
         "chain mode takes the next slot"
     );
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "the least-used week wins over the next slot"
     );
@@ -1844,10 +1993,10 @@ fn walk_order_most_headroom_picks_the_least_used_week_not_the_next_slot() {
 
 #[test]
 fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
-    let mut config = headroom_config(weekly_read(60.0, 20.0), weekly_read(5.0, 20.0));
+    let (mut config, readings) = headroom_config(weekly_read(60.0, 20.0), weekly_read(5.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "the same week, so the emptier 5h window decides"
     );
@@ -1856,10 +2005,10 @@ fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
         Some(window(90.0, Some(reset_in(-60)))),
         Some(window(20.0, Some(reset_in(3 * 86_400)))),
     );
-    let mut config = headroom_config(weekly_read(5.0, 20.0), lapsed_five);
+    let (mut config, readings) = headroom_config(weekly_read(5.0, 20.0), lapsed_five);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a 5h window that already reset reads as unused"
     );
@@ -1867,10 +2016,10 @@ fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
 
 #[test]
 fn walk_order_most_headroom_ties_keep_chain_position() {
-    let mut config = headroom_config(weekly_read(10.0, 20.0), weekly_read(10.0, 20.0));
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 20.0), weekly_read(10.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("alpha".to_string())),
         "an all-equal pass keeps chain position"
     );
@@ -1878,11 +2027,11 @@ fn walk_order_most_headroom_ties_keep_chain_position() {
 
 #[test]
 fn walk_order_most_headroom_never_ranks_an_excluded_member_in() {
-    let mut config = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 1.0));
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 1.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     config.state.auth_broken = vec![ProfileName::from("beta")];
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("alpha".to_string())),
         "an auth-broken member stays out however empty its week reads"
     );
@@ -1895,10 +2044,10 @@ fn walk_order_most_headroom_reads_a_lapsed_weekly_window_as_unused() {
         Some(window(10.0, Some(live_reset()))),
         Some(window(90.0, Some(reset_in(-3600)))),
     );
-    let mut config = headroom_config(weekly_read(10.0, 30.0), lapsed);
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 30.0), lapsed);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a week that already rolled over is an unused week"
     );
@@ -1908,20 +2057,20 @@ fn walk_order_most_headroom_reads_a_lapsed_weekly_window_as_unused() {
 #[test]
 fn walk_order_most_headroom_reads_an_absent_five_hour_window_as_unused() {
     let seven_only = usage_both(None, Some(window(20.0, Some(reset_in(3 * 86_400)))));
-    let mut config = headroom_config(weekly_read(60.0, 20.0), seven_only);
+    let (mut config, readings) = headroom_config(weekly_read(60.0, 20.0), seven_only);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "the same week, and a missing 5h window reads as unused, so beta wins the tie"
     );
     // Exactly unused: against a live 0% 5h at the same week it ties, and chain
     // position keeps the 7d-only alpha first.
     let seven_only = usage_both(None, Some(window(20.0, Some(reset_in(3 * 86_400)))));
-    let mut config = headroom_config(seven_only, weekly_read(0.0, 20.0));
+    let (mut config, readings) = headroom_config(seven_only, weekly_read(0.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("alpha".to_string())),
         "a missing 5h window reads as exactly 0%, so the tie keeps chain position"
     );
@@ -1935,10 +2084,10 @@ fn walk_order_most_headroom_ranks_a_week_with_no_reset_yet_among_read_weeks() {
         Some(window(10.0, Some(live_reset()))),
         Some(window(0.0, None)),
     );
-    let mut config = headroom_config(weekly_read(10.0, 30.0), fresh_week);
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 30.0), fresh_week);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a 0% week with no reset yet outranks a 30% week"
     );
@@ -1950,10 +2099,10 @@ fn walk_order_most_headroom_ranks_a_member_with_no_weekly_window_last() {
     // beta's week sits at 97%, just under the 98% weekly line, so no finite
     // stand-in for the unknown week below 97% can pass.
     let five_only = usage_info(Some(window(10.0, Some(live_reset()))));
-    let mut config = headroom_config(five_only, weekly_read(10.0, 97.0));
+    let (mut config, readings) = headroom_config(five_only, weekly_read(10.0, 97.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a member with a read week outranks one with no weekly window"
     );
@@ -1974,8 +2123,8 @@ fn walk_order_most_headroom_never_reorders_across_the_accept_pass_ladder() {
             ..UsageInfo::default()
         }),
     );
-    alpha.max_auto_spend = Some(100.0);
-    let mut config = config_with_chain(
+    alpha.profile.max_auto_spend = Some(100.0);
+    let (mut config, readings) = config_with_chain(
         vec![
             alpha,
             profile_with_usage("beta", Some(95.0), Some(weekly_read(10.0, 70.0))),
@@ -1986,7 +2135,7 @@ fn walk_order_most_headroom_never_reorders_across_the_accept_pass_ladder() {
     config.state.spend_budget_switching = true;
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".to_string())),
         "a clear member wins over an emptier-week spend-armed-only one"
     );
@@ -2127,18 +2276,18 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
     };
     start_walk_write_usage("beta", &dated(70.0));
     start_walk_write_usage("alpha", &dated(10.0));
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, None, false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
-    let (rows, pick) = start_walk(&config, None, false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(1),
@@ -2156,7 +2305,7 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, None, false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
@@ -2182,6 +2331,8 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             oauth: true,
@@ -2193,6 +2344,8 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -2226,6 +2379,8 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             oauth: true,
@@ -2237,6 +2392,8 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -2259,6 +2416,8 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             oauth: true,
@@ -2270,6 +2429,8 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -2292,6 +2453,8 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             oauth: true,
@@ -2303,6 +2466,8 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -2327,6 +2492,8 @@ fn find_recovered_recovers_when_window_expired() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -2352,6 +2519,8 @@ fn find_recovered_recovers_when_windowless() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -2374,6 +2543,8 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -2386,7 +2557,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
 // window already reset — stale-high utilization, wall clock passed.
 #[test]
 fn auto_switch_ignores_expired_window_active() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2404,7 +2575,7 @@ fn auto_switch_ignores_expired_window_active() {
 // A chain member whose 100% window lapsed is a viable switch target again.
 #[test]
 fn walk_accepts_member_with_expired_window() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_usage(
@@ -2416,7 +2587,7 @@ fn walk_accepts_member_with_expired_window() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".into()))
     );
 }
@@ -2424,7 +2595,7 @@ fn walk_accepts_member_with_expired_window() {
 // next_auto_switch_target: switch_off_when_spent off, spent chain → legacy None.
 #[test]
 fn auto_switch_wrap_off_disabled_stays_put() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2446,7 +2617,7 @@ fn auto_switch_wrap_off_disabled_stays_put() {
 // walk: broken member with headroom is skipped; the next viable one wins.
 #[test]
 fn walk_skips_broken_member_picks_next() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
             profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
@@ -2456,7 +2627,7 @@ fn walk_skips_broken_member_picks_next() {
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into()))
     );
 }
@@ -2464,7 +2635,7 @@ fn walk_skips_broken_member_picks_next() {
 // walk: the only non-active member is broken → nothing viable → None.
 #[test]
 fn walk_returns_none_when_only_alternative_is_broken() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
             profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
@@ -2472,14 +2643,14 @@ fn walk_returns_none_when_only_alternative_is_broken() {
         "a",
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips broken members too
 // (snapshot_chain carries `auth_broken` into ChainSnapshot.broken).
 #[test]
 fn auto_switch_skips_broken_member_picks_next() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2502,7 +2673,7 @@ fn auto_switch_skips_broken_member_picks_next() {
 // sink's token.
 #[test]
 fn walk_broken_sink_wrap_off_switches_off() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
             profile_with_util("b", Some(100.0), Some(100.0)), // sink — but broken
@@ -2512,7 +2683,7 @@ fn walk_broken_sink_wrap_off_switches_off() {
     config.state.switch_off_when_spent = true;
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -2528,7 +2699,7 @@ fn walk_broken_sink_wrap_off_switches_off() {
 // next viable member wins.
 #[test]
 fn walk_skips_canceled_member_picks_next() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
             profile_with_usage("b", Some(95.0), Some(canceled_usage())), // headroom but canceled
@@ -2537,7 +2708,7 @@ fn walk_skips_canceled_member_picks_next() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into())),
     );
 }
@@ -2545,21 +2716,21 @@ fn walk_skips_canceled_member_picks_next() {
 // walk: the only alternative is canceled → nothing viable → None.
 #[test]
 fn walk_returns_none_when_only_alternative_is_canceled() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_usage("b", Some(95.0), Some(canceled_usage())),
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips a canceled member too,
 // reading the canceled state straight off the usage snapshot.
 #[test]
 fn auto_switch_skips_canceled_member_picks_next() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2590,7 +2761,7 @@ fn auto_switch_skips_canceled_member_picks_next() {
 // c (also headroom) is picked instead. Pins the exact spec scenario.
 #[test]
 fn walk_skips_disabled_member_picks_next() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
             mark_disabled(profile_with_util("b", Some(95.0), Some(20.0))), // headroom but disabled
@@ -2599,7 +2770,7 @@ fn walk_skips_disabled_member_picks_next() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into())),
     );
 }
@@ -2607,14 +2778,14 @@ fn walk_skips_disabled_member_picks_next() {
 // walk: the only alternative is disabled → nothing viable → None.
 #[test]
 fn walk_returns_none_when_only_alternative_is_disabled() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_disabled(profile_with_util("b", Some(95.0), Some(20.0))),
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // A disabled member marked `last_resort` must never serve as the chain's
@@ -2622,7 +2793,7 @@ fn walk_returns_none_when_only_alternative_is_disabled() {
 // walk returns None instead of parking on the disabled sink.
 #[test]
 fn walk_disabled_last_resort_is_never_a_sink() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
             mark_disabled(mark_last_resort(profile_with_util(
@@ -2633,14 +2804,14 @@ fn walk_disabled_last_resort_is_never_a_sink() {
         ],
         "a",
     );
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips a disabled member too
 // (snapshot_chain drops it out of ChainSnapshot.chain entirely).
 #[test]
 fn auto_switch_skips_disabled_member_picks_next() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             mark_disabled(profile_with_util("b", Some(95.0), None)),
@@ -2670,7 +2841,7 @@ fn auto_switch_skips_disabled_member_picks_next() {
 // `chain[i] == active`), never a reason to drop the active itself.
 #[test]
 fn auto_switch_disabled_active_still_evaluates_instead_of_wedging() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_disabled(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -2696,7 +2867,7 @@ fn auto_switch_disabled_active_still_evaluates_instead_of_wedging() {
 // the walk — every request 403s, so staying is fatal (mirrors AUTH-4).
 #[test]
 fn auto_switch_canceled_active_walks_away_despite_headroom() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2718,7 +2889,7 @@ fn auto_switch_canceled_active_walks_away_despite_headroom() {
 // dead-first `Canceled` reason, above every quota/limiter block.
 #[test]
 fn blocked_reason_reports_canceled_first() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![profile_with_usage("a", Some(95.0), Some(canceled_usage()))],
         "a",
     );
@@ -2726,17 +2897,34 @@ fn blocked_reason_reports_canceled_first() {
         .find(&crate::profile::ProfileName::from("a"))
         .expect("profile");
     assert_eq!(
-        blocked_reason(&config, profile, None, &HashSet::new()),
+        blocked_reason(
+            &config,
+            profile,
+            None,
+            &HashSet::new(),
+            readings.usage.get(profile.name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::Canceled),
     );
 
     // A genuine free account (no canceled status) with headroom is NOT blocked.
-    let config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
+    let (config, readings) =
+        config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
     let profile = config
         .find(&crate::profile::ProfileName::from("a"))
         .expect("profile");
     assert_eq!(
-        blocked_reason(&config, profile, None, &HashSet::new()),
+        blocked_reason(
+            &config,
+            profile,
+            None,
+            &HashSet::new(),
+            readings.usage.get(profile.name.as_str()),
+            None,
+            false
+        ),
         None
     );
 }
@@ -2756,7 +2944,7 @@ fn blocked_reason_reports_canceled_first() {
 // headroom, NOT exhausted) → the walk runs anyway and leaves for the sibling.
 #[test]
 fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2783,7 +2971,7 @@ fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
 // the healthy sibling.
 #[test]
 fn auto_switch_kick_rejected_active_walks_away_despite_idle_usage() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2815,8 +3003,8 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
         profile_with_util("b", Some(95.0), None),
         profile_with_util("c", Some(95.0), None),
     ];
-    profiles[2].last_resort = true;
-    let config = config_with_chain(profiles, "a");
+    profiles[2].profile.last_resort = true;
+    let (config, _readings) = config_with_chain(profiles, "a");
     let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
     snap.kick_rejected = vec![ProfileName::from("b")];
     let store = store_with_infos(vec![
@@ -2844,7 +3032,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
 // forever while the sibling idled.
 #[test]
 fn auto_switch_reading_dead_active_walks_away_despite_no_windows() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2870,7 +3058,7 @@ fn auto_switch_reading_dead_active_walks_away_despite_no_windows() {
 // no viable sibling, the walk stays put rather than going `Off`.
 #[test]
 fn a_reading_dead_active_is_never_switched_off() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2898,7 +3086,7 @@ fn a_reading_dead_active_is_never_switched_off() {
 // ONTO one.
 #[test]
 fn a_reading_dead_member_remains_a_walk_target() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2917,8 +3105,8 @@ fn a_reading_dead_member_remains_a_walk_target() {
     );
 }
 
-// Fresh-PREFERENCE walk: `walk_config` folds `Profile.fetch_status == Fresh`
-// into `ChainSnapshot::fresh` (the same fill the scheduler's scan runs from the
+// Fresh-PREFERENCE walk: `walk_config` folds the `mark_fresh` set into
+// `ChainSnapshot::fresh` (the same fill the scheduler's scan runs from the
 // `StatusStore` the ACTIVE gate consults), so the config-side scenarios drive
 // the one shared walk with no drift.
 
@@ -2926,7 +3114,7 @@ fn a_reading_dead_member_remains_a_walk_target() {
 // fresh member wins anyway, since pass 1a outranks walk order.
 #[test]
 fn walk_prefers_fresh_member_over_earlier_stale_one() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(10.0)),
@@ -2935,7 +3123,7 @@ fn walk_prefers_fresh_member_over_earlier_stale_one() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string())),
         "b is reached first but its read is stale — the trusted c must win"
     );
@@ -2943,7 +3131,7 @@ fn walk_prefers_fresh_member_over_earlier_stale_one() {
 
 #[test]
 fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -2966,7 +3154,7 @@ fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
 // active must keep its escape (2026-06-28 target asymmetry).
 #[test]
 fn walk_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(10.0)),
@@ -2974,7 +3162,7 @@ fn walk_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string())),
         "freshness is a preference, not a gate: the stale escape must stay open"
     );
@@ -2982,7 +3170,7 @@ fn walk_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
 
 #[test]
 fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -3015,7 +3203,7 @@ fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
 // reached first in chain order from the active yet must be passed over.
 #[test]
 fn return_to_preferred_walks_a_drifted_active_home() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3044,7 +3232,7 @@ fn return_to_preferred_walks_a_drifted_active_home() {
 // ping-pong.
 #[test]
 fn return_to_preferred_is_a_no_op_once_already_home() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3074,7 +3262,7 @@ fn return_to_preferred_is_a_no_op_once_already_home() {
 // never keeps it pinned to a spent one.
 #[test]
 fn a_spent_preferred_active_is_left_not_kept() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3104,7 +3292,7 @@ fn a_spent_preferred_active_is_left_not_kept() {
 // live work onto an untrusted account is worse than staying on a working one.
 #[test]
 fn return_to_preferred_gated_on_target_freshness() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3130,7 +3318,7 @@ fn return_to_preferred_gated_on_target_freshness() {
 // "a" is genuinely selected past the other guards, not the only candidate.
 #[test]
 fn return_to_preferred_gated_on_target_clearance() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3160,7 +3348,7 @@ fn return_to_preferred_gated_on_target_clearance() {
 // invariant: real headroom stays put).
 #[test]
 fn return_to_preferred_gated_on_active_freshness() {
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             mark_preferred(profile_with_util("a", Some(95.0), None)),
             profile_with_util("b", Some(95.0), None),
@@ -3204,7 +3392,7 @@ fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
     };
 
     // Broken preferred.
-    let config = base();
+    let (config, _readings) = base();
     let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
     snap.broken = vec![ProfileName::from("a")];
     snap.fresh = fresh_all();
@@ -3216,7 +3404,7 @@ fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
     );
 
     // Kick-rejected preferred.
-    let config = base();
+    let (config, _readings) = base();
     let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
     snap.kick_rejected = vec![ProfileName::from("a")];
     snap.fresh = fresh_all();
@@ -3227,7 +3415,7 @@ fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
     );
 
     // Canceled preferred: sourced from usage, not a snapshot flag.
-    let config = base();
+    let (config, _readings) = base();
     let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
     snap.fresh = fresh_all();
     let store_canceled = store_with_infos(vec![
@@ -3349,7 +3537,7 @@ fn spend_room_refuses_when_used_is_unknown() {
 // guard `last_resort` carries, for the same reason.
 #[test]
 fn walk_does_not_hop_between_two_spend_armed_members() {
-    let mut config = config_with_chain(
+    let (mut config, mut readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3359,16 +3547,20 @@ fn walk_does_not_hop_between_two_spend_armed_members() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "b is paying and still within budget: hopping to c gains nothing"
     );
 
     // A member with FREE quota still wins, though — the guard must not strand
     // the chain on a paying account when someone can serve for nothing.
-    config.profiles[2] = profile_with_util("c", Some(95.0), Some(10.0));
+    config.profiles[2] = profile_with_util("c", Some(95.0), Some(10.0)).profile;
+    readings.usage.insert(
+        "c".to_string(),
+        usage_info(Some(window(10.0, Some(live_reset())))),
+    );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string())),
         "free quota always beats staying on a paying active"
     );
@@ -3376,7 +3568,7 @@ fn walk_does_not_hop_between_two_spend_armed_members() {
 
 #[test]
 fn auto_switch_does_not_hop_between_two_spend_armed_members() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3414,7 +3606,7 @@ fn auto_switch_does_not_hop_between_two_spend_armed_members() {
 // is the tick the entry-side tests never reach.
 #[test]
 fn walk_over_budget_active_switches_off_by_default() {
-    let mut config = config_with_chain(
+    let (mut config, mut readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             // $4.60 spent against a $5 ceiling: past 90% of it, so the budget is
@@ -3429,15 +3621,18 @@ fn walk_over_budget_active_switches_off_by_default() {
         "a spent budget halts by default"
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off),
         "the ceiling must stop the spending, not merely gate entry to it"
     );
 
     // Still inside the budget → keeps working, which is the point of the knob.
-    config.profiles[1].usage = Some(usage_spent_with_spend(spend_block(true, 1.0, Some(50.0))));
+    readings.usage.insert(
+        "b".to_string(),
+        usage_spent_with_spend(spend_block(true, 1.0, Some(50.0))),
+    );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "under budget, stay and bill"
     );
@@ -3448,7 +3643,7 @@ fn walk_over_budget_active_switches_off_by_default() {
 // operator may want stay-on-active for one and switch-off-all for the other.
 #[test]
 fn walk_over_budget_active_can_be_told_to_keep_billing() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 5.0, 4.6, Some(50.0)),
@@ -3458,7 +3653,7 @@ fn walk_over_budget_active_can_be_told_to_keep_billing() {
     config.state.spend_budget_switching = true;
     config.state.switch_off_when_budget_spent = false;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "explicitly told to stay on a spent budget: keeps billing"
     );
@@ -3467,7 +3662,7 @@ fn walk_over_budget_active_can_be_told_to_keep_billing() {
     // halts a chain out of QUOTA, and this chain is out of MONEY.
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "switch_off_when_spent must not halt an over-budget active that was told to stay"
     );
@@ -3477,7 +3672,7 @@ fn walk_over_budget_active_can_be_told_to_keep_billing() {
 // without signing anyone out, so the halt is the last resort, not the first.
 #[test]
 fn walk_over_budget_active_parks_on_a_sink_before_halting() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 5.0, 4.6, Some(50.0)),
@@ -3487,7 +3682,7 @@ fn walk_over_budget_active_parks_on_a_sink_before_halting() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string())),
         "park on the sink to stop billing rather than halting outright"
     );
@@ -3497,7 +3692,7 @@ fn walk_over_budget_active_parks_on_a_sink_before_halting() {
 // billing account over any ceiling must read `switch_off_when_spent` exactly like before.
 #[test]
 fn walk_over_budget_halt_is_inert_with_the_toggle_off() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 5.0, 4.6, Some(50.0)),
@@ -3506,14 +3701,14 @@ fn walk_over_budget_halt_is_inert_with_the_toggle_off() {
     );
     assert!(!config.state.spend_budget_switching, "default is off");
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "switch_off_when_spent off + toggle off → stay, exactly like before the budget existed"
     );
 
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off),
         "switch_off_when_spent on → Off, decided by switch_off_when_spent alone"
     );
@@ -3553,7 +3748,7 @@ fn budget_spent_never_fires_on_a_subscription_account() {
 // remove any one of those and something stops the billing.
 #[test]
 fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 5.0, 0.0, Some(50.0)),
@@ -3563,34 +3758,44 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
     config.state.spend_budget_switching = true;
     config.state.switch_off_when_budget_spent = false;
     assert!(
-        spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "armed + stay-on-active + no sink = the ceiling never stops anything"
     );
 
     // Each of the three, alone, caps it again.
     config.state.switch_off_when_budget_spent = true;
     assert!(
-        !spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        !spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "halting stops the billing"
     );
 
     config.state.switch_off_when_budget_spent = false;
     config.profiles[0].last_resort = true;
     assert!(
-        !spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        !spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "a sink to park on stops the billing without halting"
     );
 
     config.profiles[0].last_resort = false;
     config.state.spend_budget_switching = false;
     assert!(
-        !spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        !spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "never armed at all"
     );
 
     config.state.spend_budget_switching = true;
     assert!(
-        !spend_is_uncapped(&config, 0.0, &HashSet::new()),
+        !spend_is_uncapped(&config, 0.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "a $0 ceiling never spends"
     );
 }
@@ -3602,7 +3807,7 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
 // bills.
 #[test]
 fn spend_is_uncapped_ignores_a_sink_the_walk_cannot_reach() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 5.0, 0.0, Some(50.0)),
@@ -3613,14 +3818,18 @@ fn spend_is_uncapped_ignores_a_sink_the_walk_cannot_reach() {
     config.state.switch_off_when_budget_spent = false;
     config.profiles[0].last_resort = true;
     assert!(
-        !spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        !spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "a reachable sink stops the billing"
     );
 
     // Same sink, now auth-broken: the walk skips it, so it parks nothing.
     config.state.auth_broken = vec!["a".into()];
     assert!(
-        spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "an auth-broken sink is not a parking spot"
     );
 
@@ -3628,7 +3837,9 @@ fn spend_is_uncapped_ignores_a_sink_the_walk_cannot_reach() {
     config.state.auth_broken.clear();
     config.state.fallback_chain.retain(|n| n.as_str() != "a");
     assert!(
-        spend_is_uncapped(&config, 5.0, &HashSet::new()),
+        spend_is_uncapped(&config, 5.0, &HashSet::new(), |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.usage)
+        }),
         "a sink outside the chain is not a parking spot"
     );
 }
@@ -3641,7 +3852,7 @@ fn spend_is_uncapped_ignores_a_sink_the_walk_cannot_reach() {
 // render-only invariant against a regression to a raw `budget_spent` read.
 #[test]
 fn budget_spent_blocking_needs_5h_exhaustion_too() {
-    let member = |five_h: f64| {
+    let cfg = |five_h: f64| {
         let mut p = profile_with_usage(
             "a",
             Some(95.0),
@@ -3651,26 +3862,23 @@ fn budget_spent_blocking_needs_5h_exhaustion_too() {
                 ..UsageInfo::default()
             }),
         );
-        p.max_auto_spend = Some(5.0);
-        p
-    };
-    let cfg = |p: Profile| {
-        let mut c = config_with_chain(vec![p], "a");
+        p.profile.max_auto_spend = Some(5.0);
+        let (mut c, readings) = config_with_chain(vec![p], "a");
         c.state.spend_budget_switching = true;
-        c
+        (c, readings)
     };
 
     // 5h has headroom (50% < 95%): serves free, so a maxed money budget is moot.
-    let free = cfg(member(50.0));
+    let (free, free_readings) = cfg(50.0);
     assert!(
-        !budget_spent_blocking(&free, &free.profiles[0]),
+        !budget_spent_blocking(&free, &free.profiles[0], free_readings.usage.get("a")),
         "free 5h quota → budget is not a block"
     );
 
     // 5h over threshold (100% >= 95%): nothing free left, so the budget blocks.
-    let spent = cfg(member(100.0));
+    let (spent, spent_readings) = cfg(100.0);
     assert!(
-        budget_spent_blocking(&spent, &spent.profiles[0]),
+        budget_spent_blocking(&spent, &spent.profiles[0], spent_readings.usage.get("a")),
         "no free quota + budget maxed → really blocked"
     );
 }
@@ -3681,7 +3889,7 @@ fn budget_spent_blocking_needs_5h_exhaustion_too() {
 // rather than parking.
 #[test]
 fn walk_picks_a_spend_armed_member_when_the_chain_is_spent() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3690,7 +3898,7 @@ fn walk_picks_a_spend_armed_member_when_the_chain_is_spent() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -3699,7 +3907,7 @@ fn walk_picks_a_spend_armed_member_when_the_chain_is_spent() {
 // behave exactly like today — nothing viable, so the walk stays put.
 #[test]
 fn walk_spend_budget_off_never_spends() {
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3707,14 +3915,14 @@ fn walk_spend_budget_off_never_spends() {
         "a",
     );
     assert!(!config.state.spend_budget_switching, "default must be off");
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // Toggle on, ceiling $0 → identical to the toggle being off. Both halves of the
 // opt-in are required before a cent is spent.
 #[test]
 fn walk_zero_ceiling_never_spends_even_with_the_toggle_on() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 0.0, 0.0, Some(50.0)),
@@ -3722,14 +3930,14 @@ fn walk_zero_ceiling_never_spends_even_with_the_toggle_on() {
         "a",
     );
     config.state.spend_budget_switching = true;
-    assert_eq!(walk_config(&config, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new(), &readings), None);
 }
 
 // Free quota always beats paying, whatever the walk order says: c has headroom
 // and is reached LAST, b is spend-armed and reached first.
 #[test]
 fn walk_subscription_headroom_beats_a_spend_armed_member() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3739,7 +3947,7 @@ fn walk_subscription_headroom_beats_a_spend_armed_member() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string())),
         "a member with free quota must always win over one that costs money"
     );
@@ -3748,7 +3956,7 @@ fn walk_subscription_headroom_beats_a_spend_armed_member() {
 // Pre-last-resort: paying to keep working outranks parking on a spent sink.
 #[test]
 fn walk_spend_armed_member_outranks_last_resort_parking() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(profile_with_util("b", Some(95.0), Some(100.0))),
@@ -3758,14 +3966,14 @@ fn walk_spend_armed_member_outranks_last_resort_parking() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string()))
     );
 
     // Same chain, toggle off → the sink parks it, exactly like today.
     config.state.spend_budget_switching = false;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -3774,7 +3982,7 @@ fn walk_spend_armed_member_outranks_last_resort_parking() {
 // working, and Off stops every running claude.
 #[test]
 fn walk_spend_armed_member_outranks_wrap_off() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3784,14 +3992,14 @@ fn walk_spend_armed_member_outranks_wrap_off() {
     config.state.switch_off_when_spent = true;
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string()))
     );
 
     // Toggle off → wrap-off halts, exactly like today.
     config.state.spend_budget_switching = false;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -3807,7 +4015,7 @@ fn walk_spend_armed_member_outranks_wrap_off() {
 
 #[test]
 fn walk_serving_last_resort_sink_outranks_a_spend_armed_member() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(weekly_soft_profile("b")),
@@ -3817,7 +4025,7 @@ fn walk_serving_last_resort_sink_outranks_a_spend_armed_member() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string())),
         "a sink still serving for free must beat spending money"
     );
@@ -3827,7 +4035,7 @@ fn walk_serving_last_resort_sink_outranks_a_spend_armed_member() {
 // stays put rather than hopping to a billing sibling.
 #[test]
 fn walk_serving_last_resort_active_stays_put_instead_of_paying() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             mark_last_resort(weekly_soft_profile("a")),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3836,7 +4044,7 @@ fn walk_serving_last_resort_active_stays_put_instead_of_paying() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "a serving-sink active never pays a sibling — it already serves free"
     );
@@ -3846,7 +4054,7 @@ fn walk_serving_last_resort_active_stays_put_instead_of_paying() {
 // `UsageStore`, `ChainMember::last_resort` comes from the marked profile.
 #[test]
 fn auto_switch_serving_last_resort_sink_outranks_a_spend_armed_member() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             mark_last_resort(profile_with_util("b", Some(95.0), None)),
@@ -3879,7 +4087,7 @@ fn auto_switch_serving_last_resort_sink_outranks_a_spend_armed_member() {
 
 #[test]
 fn auto_switch_serving_last_resort_active_stays_put_instead_of_paying() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             mark_last_resort(profile_with_util("a", Some(95.0), None)),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3912,7 +4120,7 @@ fn auto_switch_serving_last_resort_active_stays_put_instead_of_paying() {
 // `ChainMember::max_spend` and the spend block rides the `UsageStore`.
 #[test]
 fn auto_switch_picks_a_spend_armed_member_when_the_chain_is_spent() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3942,7 +4150,7 @@ fn auto_switch_picks_a_spend_armed_member_when_the_chain_is_spent() {
 
 #[test]
 fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -3971,7 +4179,7 @@ fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
 // active halts on `switch_off_when_budget_spent`, and `switch_off_when_spent` does not answer for it.
 #[test]
 fn auto_switch_over_budget_active_switches_off_by_default() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             spend_member("b", 5.0, 4.6, Some(50.0)),
@@ -4010,7 +4218,7 @@ fn auto_switch_over_budget_active_switches_off_by_default() {
 
 #[test]
 fn auto_switch_zero_ceiling_never_spends_even_with_the_toggle_on() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             spend_member("b", 0.0, 0.0, Some(50.0)),
@@ -4034,7 +4242,7 @@ fn auto_switch_zero_ceiling_never_spends_even_with_the_toggle_on() {
 // may still be healthy, and only real usage exhaustion may halt it.
 #[test]
 fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -4056,7 +4264,7 @@ fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
 // keys on the real exhaustion, which broken must not suppress either.
 #[test]
 fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -4083,7 +4291,7 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
 // nothing.
 #[test]
 fn walk_skips_broken_last_resort_member() {
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not last_resort
             mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))), // last_resort sink
@@ -4091,13 +4299,13 @@ fn walk_skips_broken_last_resort_member() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".into())),
         "base case: the last-resort pass migrates to the sink"
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "a broken last_resort sink is excluded from the last-resort pass"
     );
@@ -4238,7 +4446,7 @@ fn burn_aware_none_rate_falls_back_to_static_threshold_via_the_walk() {
     // The walk reads the burn rate from disk (no history here → no rate), so
     // it needs a sandboxed HOME for that read.
     let _home = crate::testutil::HomeSandbox::new();
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
@@ -4248,7 +4456,7 @@ fn burn_aware_none_rate_falls_back_to_static_threshold_via_the_walk() {
     config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off),
         "no rate available → static 100% >= 95% threshold fires, same as mode off"
     );
@@ -4304,7 +4512,7 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
 
     // Static (mode off): 96% is over the 95% threshold → active exhausted, and
     // with `b` spent too, wrap-off signs everything out.
-    let mut static_config = config_with_chain(
+    let (mut static_config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
@@ -4313,15 +4521,13 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     );
     static_config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&static_config, None, &HashSet::new()),
+        walk_config(&static_config, &HashSet::new(), &readings),
         Some(SwitchAction::Off),
         "static mode: 96% is over the 95% threshold → Off"
     );
 
-    // `next_target` takes the burn rate as a parameter — it never reads disk
-    // itself. Source it the same way `burn_rate_for_profile` does here,
-    // standing in for the caller's in-memory `history_cache` lookup
-    // (`App::active_burn_rate`) that feeds the real UI-thread call site.
+    // The history above reads as the ~600 %/h climb the burn-aware walk below
+    // projects with, sourced the way `burn_rate_for_profile` sources it.
     let active_window = window(96.0, Some(live_reset()));
     let rate = burn_rate_for_profile(
         &crate::profile::ProfileName::from("a"),
@@ -4335,7 +4541,7 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     // projection fires and the active switches Off — same as mode-off. Before the
     // fix the default 98% floor held it here (96 < 98), running the window longer
     // than static.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
@@ -4346,7 +4552,7 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     config.state.burn_aware_switching = true;
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off),
         "burn-aware agrees with static: 96% ≥ 95% threshold → Off"
     );
@@ -4380,8 +4586,9 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
-
         oauth: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4396,12 +4603,15 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
-
         walk_min_gain_secs: 3600,
         walk_cooldown_secs: 1800,
         last_switch_at: None,
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4420,6 +4630,8 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
             &usage,
             &HashSet::new(),
             ActiveBurnRate::Supplied(Some(1200.0)),
+            false,
+            false,
         ),
         Some(SwitchAction::Off),
         "the in-memory rate must decide, not the disk history"
@@ -4451,9 +4663,50 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
             &usage,
             &HashSet::new(),
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "the disk history's light climb must not project past the cap"
+    );
+}
+
+/// A probed active's next reading is its next probe, so the burn projection
+/// looks that far ahead, capped as for any active: at 92 % and 100 %/h, the
+/// 90 s poll projects 94.5 %, under the cap, where the 450 s probe projects
+/// 104.5 % and switches.
+#[test]
+fn a_probed_active_projects_its_burn_up_to_its_next_probe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut probed = profile_with_util("a", Some(95.0), Some(92.0));
+    probed.profile.usage_probe = true;
+    probed.profile.usage_probe_interval_ms = 450_000;
+    probed.profile.credentials = None;
+    probed.profile.has_long_lived_sidecar = true;
+    let (mut config, readings) = config_with_chain(
+        vec![
+            mark_fresh(probed),
+            mark_fresh(profile_with_util("b", Some(95.0), Some(10.0))),
+        ],
+        "a",
+    );
+    config.state.burn_aware_switching = true;
+    config.state.refresh_interval_ms = 90_000;
+    config.state.burn_switch_floor_pct = Some(90.0);
+    config.state.burn_horizon_cap_ms = Some(600_000);
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = readings.fresh.clone();
+    assert_eq!(snap.interval_ms, 450_000);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &readings.usage,
+            &HashSet::new(),
+            ActiveBurnRate::Supplied(Some(100.0)),
+            false,
+            false,
+        ),
+        Some(SwitchAction::To("b".to_string())),
     );
 }
 
@@ -4471,8 +4724,9 @@ fn a_third_party_active_never_projects_its_burn() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
-
         oauth: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4487,12 +4741,15 @@ fn a_third_party_active_never_projects_its_burn() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
-
         walk_min_gain_secs: 3600,
         walk_cooldown_secs: 1800,
         last_switch_at: None,
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4511,6 +4768,8 @@ fn a_third_party_active_never_projects_its_burn() {
             &usage,
             &third_party_names,
             ActiveBurnRate::Supplied(Some(1200.0)),
+            false,
+            false,
         ),
         None,
         "a third-party active's provider window must not pair with OAuth burn history"
@@ -4537,7 +4796,7 @@ fn usage_both(five_hour: Option<UsageWindow>, seven_day: Option<UsageWindow>) ->
 
 /// A profile whose weekly window is spent to the cap and whose 5h window has
 /// lapsed entirely — the live specimen's exact shape (5h resets_at: null).
-fn weekly_dead_profile(name: &str) -> Profile {
+fn weekly_dead_profile(name: &str) -> Fixture {
     profile_with_usage(
         name,
         Some(95.0),
@@ -4549,7 +4808,7 @@ fn weekly_dead_profile(name: &str) -> Profile {
 fn weekly_dead_member_is_never_a_fallback_target() {
     // a (active, 5h exhausted) → b (7d=100, 5h lapsed) → c (fresh): the walk
     // must land on c. Before the weekly gate, b's lapsed 5h read as headroom.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(97.0)),
             weekly_dead_profile("b"),
@@ -4558,7 +4817,7 @@ fn weekly_dead_member_is_never_a_fallback_target() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into()))
     );
 }
@@ -4583,12 +4842,12 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
             Some(window(98.5, Some(live_reset()))),
         )),
     );
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".into()))
     );
 }
@@ -4596,7 +4855,7 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
 #[test]
 fn weekly_soft_member_is_not_a_target() {
     // Symmetric: hopping INTO a 98%+ weekly member just re-triggers next tick.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(97.0)),
             profile_with_usage(
@@ -4612,7 +4871,7 @@ fn weekly_soft_member_is_not_a_target() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into()))
     );
 }
@@ -4620,7 +4879,7 @@ fn weekly_soft_member_is_not_a_target() {
 #[test]
 fn weekly_dead_member_is_skipped_by_the_store_walk_too() {
     // Scheduler-side twin: next_auto_switch_target reads the UsageStore.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -4658,6 +4917,8 @@ fn weekly_dead_member_never_recovers() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -4685,7 +4946,7 @@ fn soonest_resume_uses_the_weekly_reset_for_a_weekly_dead_member() {
     // because the 5h window is absent).
     let weekly_reset = epoch_secs_to_iso(now_epoch_secs() + 48 * 3600);
     let five_hour_reset = epoch_secs_to_iso(now_epoch_secs() + 600);
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             profile_with_usage(
                 "a",
@@ -4700,7 +4961,8 @@ fn soonest_resume_uses_the_weekly_reset_for_a_weekly_dead_member() {
         ],
         "a",
     );
-    let (name, secs) = soonest_resume(&config, &HashSet::new()).expect("caption data");
+    let (name, secs) =
+        soonest_resume(&config, &HashSet::new(), &readings.usage).expect("caption data");
     // a's 10-minute 5h reset beats b's 48h weekly reset.
     assert_eq!(name, "a");
     assert!((500..700).contains(&secs), "got {secs}");
@@ -4726,31 +4988,31 @@ fn weekly_line_is_configurable_chain_wide() {
             profile_with_util("c", Some(95.0), Some(10.0)),
         ]
     };
-    let mut config = config_with_chain(mk(), "a");
+    let (mut config, readings) = config_with_chain(mk(), "a");
     config.state.weekly_switch_threshold = Some(90.0);
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".into())),
         "at a 90 line, b's 7d 92% is exhausted — walk lands on c"
     );
-    let default_line = config_with_chain(mk(), "a");
+    let (default_line, readings) = config_with_chain(mk(), "a");
     assert_eq!(
-        walk_config(&default_line, &HashSet::new()),
+        walk_config(&default_line, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".into())),
         "at the 98 default, b's 7d 92% is headroom"
     );
-    let mut garbage = config_with_chain(mk(), "a");
+    let (mut garbage, readings) = config_with_chain(mk(), "a");
     garbage.state.weekly_switch_threshold = Some(120.0);
     assert_eq!(garbage.state.weekly_switch_threshold_pct(), 98.0);
     assert_eq!(
-        walk_config(&garbage, &HashSet::new()),
+        walk_config(&garbage, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".into())),
         "an out-of-band hand-edit falls back to the default line"
     );
 }
 
 /// A soft-blocked (7d >= line, < 100) profile with fresh 5h headroom.
-fn weekly_soft_profile(name: &str) -> Profile {
+fn weekly_soft_profile(name: &str) -> Fixture {
     profile_with_usage(
         name,
         Some(95.0),
@@ -4767,13 +5029,13 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
     // refused everywhere (the soft line's job), but wrap-off must NOT sign
     // everything out — the active still has real weekly room up to the API's
     // own cap, and Off would forfeit that tail for no gain.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![weekly_soft_profile("a"), weekly_soft_profile("b")],
         "a",
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "a soft-blocked active with weekly room left must stay put"
     );
@@ -4787,10 +5049,10 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
             Some(window(100.0, Some(live_reset()))),
         )),
     );
-    let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
+    let (mut config, readings) = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::Off)
     );
 }
@@ -4813,7 +5075,7 @@ fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
             Some(window(98.5, Some(live_reset()))),
         )
     };
-    let mut config = mk();
+    let (mut config, _readings) = mk();
     config.state.switch_off_when_spent = true;
     let snapshot = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
     let store = store_with_infos(vec![("a", soft()), ("b", soft())]);
@@ -4841,9 +5103,9 @@ fn soonest_resume_keys_on_the_weekly_hard_cap_not_the_soft_line() {
     // request its fresh 5h window allows. Keying the all-exhausted premise on
     // the soft line read the chain as dead and captioned a days-out weekly
     // reset over an account that works right now (2026-07-10 triage).
-    let config = config_with_chain(vec![weekly_soft_profile("a")], "a");
+    let (config, readings) = config_with_chain(vec![weekly_soft_profile("a")], "a");
     assert_eq!(
-        soonest_resume(&config, &HashSet::new()),
+        soonest_resume(&config, &HashSet::new(), &readings.usage),
         None,
         "a soft-blocked member with fresh 5h headroom is not all-exhausted"
     );
@@ -4862,7 +5124,8 @@ fn soonest_resume_all_exhausted_at_the_hard_cap_and_on_the_5h_line() {
             Some(window(100.0, Some(reset_in(48 * 3600)))),
         )),
     );
-    let (name, secs) = soonest_resume(&config_with_chain(vec![capped], "a"), &HashSet::new())
+    let (config, readings) = config_with_chain(vec![capped], "a");
+    let (name, secs) = soonest_resume(&config, &HashSet::new(), &readings.usage)
         .expect("weekly cap is all-exhausted");
     assert_eq!(name, "a");
     assert!(
@@ -4870,9 +5133,10 @@ fn soonest_resume_all_exhausted_at_the_hard_cap_and_on_the_5h_line() {
         "the 7d reset drives the eta, got {secs}"
     );
 
-    let five_hour = config_with_chain(vec![profile_with_util("b", Some(95.0), Some(97.0))], "b");
-    let (name, secs) =
-        soonest_resume(&five_hour, &HashSet::new()).expect("5h past threshold is all-exhausted");
+    let (five_hour, readings) =
+        config_with_chain(vec![profile_with_util("b", Some(95.0), Some(97.0))], "b");
+    let (name, secs) = soonest_resume(&five_hour, &HashSet::new(), &readings.usage)
+        .expect("5h past threshold is all-exhausted");
     assert_eq!(name, "b");
     assert!(
         (3500..=3600).contains(&secs),
@@ -4922,6 +5186,15 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
     }
 }
 
+/// UsageInfo carrying only a live provider-marked monthly window at `util` (no
+/// 7d) — a monthly-only account, the shape the long-window accessor falls to.
+fn monthly_usage(util: f64) -> UsageInfo {
+    UsageInfo {
+        monthly: Some(window(util, Some(live_reset()))),
+        ..UsageInfo::default()
+    }
+}
+
 // `candidate_excluded` (the dead-member predicate the reachability checks
 // share) and `blocked_reason`'s dead-first rungs
 // (`Disabled`/`Canceled`/`AuthBroken`) are two hand-written ladders over one
@@ -4937,25 +5210,37 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
 // `keep` stays active and `cand` is judged as the candidate.
 #[test]
 fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
-    fn dead_first_chip(config: &AppConfig, name: &str) -> bool {
+    fn dead_first_chip(config: &AppConfig, name: &str, readings: &TestReadings) -> bool {
         let cand = config
             .find(&crate::profile::ProfileName::from(name))
             .expect("candidate is resolvable");
         matches!(
-            blocked_reason(config, cand, None, &HashSet::new()),
+            blocked_reason(
+                config,
+                cand,
+                None,
+                &HashSet::new(),
+                readings.usage.get(cand.name.as_str()),
+                None,
+                false
+            ),
             Some(BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken)
         )
     }
     // The invariant, checked on every case: the walk skip and the chip's
     // dead-first verdict must agree for a resolvable non-active candidate.
-    let assert_coupled = |config: &AppConfig, name: &str| {
+    let assert_coupled = |config: &AppConfig, name: &str, readings: &TestReadings| {
         assert_eq!(
             candidate_excluded(
                 config,
                 &crate::profile::ProfileName::from(name),
-                &HashSet::new()
+                &HashSet::new(),
+                crate::fallback::is_canceled_from_usage(
+                    &crate::profile::ProfileName::from(name),
+                    &readings.usage
+                ),
             ),
-            dead_first_chip(config, name),
+            dead_first_chip(config, name, readings),
             "walk skip and dead-first chip disagree for {name}: {:?}",
             blocked_reason(
                 config,
@@ -4964,24 +5249,37 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .expect("resolvable"),
                 None,
                 &HashSet::new(),
+                readings.usage.get(
+                    config
+                        .find(&crate::profile::ProfileName::from(name))
+                        .expect("resolvable")
+                        .name
+                        .as_str()
+                ),
+                None,
+                false
             )
         );
     };
     let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
 
     // disabled: the walk skips it, the chip is Disabled.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             mark_disabled(profile_with_util("cand", Some(90.0), Some(10.0))),
         ],
         "keep",
     );
-    assert_coupled(&config, "cand");
+    assert_coupled(&config, "cand", &readings);
     assert!(candidate_excluded(
         &config,
         &crate::profile::ProfileName::from("cand"),
         &HashSet::new(),
+        crate::fallback::is_canceled_from_usage(
+            &crate::profile::ProfileName::from("cand"),
+            &readings.usage
+        ),
     ));
     assert_eq!(
         blocked_reason(
@@ -4991,17 +5289,26 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                 .expect("cand"),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand")
+                    .name
+                    .as_str()
+            ),
+            None,
+            false
         ),
         Some(BlockedReason::Disabled)
     );
 
     // auth-broken: the walk skips it, the chip is AuthBroken.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![keeper(), profile_with_util("cand", Some(90.0), Some(10.0))],
         "keep",
     );
     config.state.auth_broken.push("cand".into());
-    assert_coupled(&config, "cand");
+    assert_coupled(&config, "cand", &readings);
     assert_eq!(
         blocked_reason(
             &config,
@@ -5010,19 +5317,28 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                 .expect("cand"),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand")
+                    .name
+                    .as_str()
+            ),
+            None,
+            false
         ),
         Some(BlockedReason::AuthBroken)
     );
 
     // canceled: the walk skips it, the chip is Canceled.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             profile_with_usage("cand", Some(90.0), Some(canceled_usage())),
         ],
         "keep",
     );
-    assert_coupled(&config, "cand");
+    assert_coupled(&config, "cand", &readings);
     assert_eq!(
         blocked_reason(
             &config,
@@ -5031,23 +5347,36 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                 .expect("cand"),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand")
+                    .name
+                    .as_str()
+            ),
+            None,
+            false
         ),
         Some(BlockedReason::Canceled)
     );
 
     // live headroom: the walk keeps it, no chip at all.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             mark_fresh(profile_with_util("cand", Some(90.0), Some(10.0))),
         ],
         "keep",
     );
-    assert_coupled(&config, "cand");
+    assert_coupled(&config, "cand", &readings);
     assert!(!candidate_excluded(
         &config,
         &crate::profile::ProfileName::from("cand"),
         &HashSet::new(),
+        crate::fallback::is_canceled_from_usage(
+            &crate::profile::ProfileName::from("cand"),
+            &readings.usage
+        ),
     ));
     assert_eq!(
         blocked_reason(
@@ -5057,25 +5386,38 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                 .expect("cand"),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand")
+                    .name
+                    .as_str()
+            ),
+            None,
+            false
         ),
         None
     );
 
     // usage-only exhaustion: still a walk candidate (routed around by accept,
     // not skip), and the chip is present but NOT dead-first.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             mark_fresh(profile_with_util("cand", Some(90.0), Some(100.0))),
         ],
         "keep",
     );
-    assert_coupled(&config, "cand");
+    assert_coupled(&config, "cand", &readings);
     assert!(
         !candidate_excluded(
             &config,
             &crate::profile::ProfileName::from("cand"),
-            &HashSet::new()
+            &HashSet::new(),
+            crate::fallback::is_canceled_from_usage(
+                &crate::profile::ProfileName::from("cand"),
+                &readings.usage
+            )
         ),
         "a member blocked only by usage stays a walk candidate"
     );
@@ -5088,6 +5430,15 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .expect("cand"),
                 None,
                 &HashSet::new(),
+                readings.usage.get(
+                    config
+                        .find(&crate::profile::ProfileName::from("cand"))
+                        .expect("cand")
+                        .name
+                        .as_str()
+                ),
+                None,
+                false
             ),
             Some(BlockedReason::FiveHour { .. })
         ),
@@ -5111,38 +5462,66 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
 fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     fn dead_first(reason: &BlockedReason) -> bool {
         match reason {
-            BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
-            BlockedReason::KeyRejected => true,
+            BlockedReason::Disabled
+            | BlockedReason::Canceled
+            | BlockedReason::OrgRefused
+            | BlockedReason::AuthBroken => true,
+            BlockedReason::KeyRejected | BlockedReason::TokenRejected => true,
+            BlockedReason::LoggedOut => true,
             BlockedReason::WeeklySpent { .. }
             | BlockedReason::KickRejected { .. }
             | BlockedReason::BudgetSpent
+            | BlockedReason::CreditCap
             | BlockedReason::FiveHour { .. }
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
             | BlockedReason::SameAccount { .. }
             | BlockedReason::IdentityUnverified { .. }
-            | BlockedReason::Stale => false,
+            | BlockedReason::Stale
+            | BlockedReason::NoUsage => false,
         }
     }
+
+    // The sidecar half of the ladder's lowest rung. Each arm passes the token
+    // fact its own member has: every member here is an OAuth one except the
+    // LoggedOut arm's, which holds no login at all, so each passes `NO_TOKEN`,
+    // and only the `NoUsage` arm builds a sidecar-only member
+    // (`with_long_lived_sidecar`) and passes `TOKEN` to reach that rung.
+    const TOKEN: bool = true;
+    const NO_TOKEN: bool = false;
 
     // Confirms the fixture actually triggers `expected` AND that the walk's
     // skip agrees with `dead_first` on it, for the resolvable non-active
     // "cand" behind a healthy active "keep".
     let assert_variant = |config: &AppConfig,
                           kick_lift: Option<i64>,
+                          session_token: bool,
                           expected: &dyn Fn(&BlockedReason) -> bool,
-                          label: &str| {
+                          label: &str,
+                          readings: &TestReadings| {
         let cand = config
             .find(&crate::profile::ProfileName::from("cand"))
             .expect("candidate is resolvable");
-        let reason = blocked_reason(config, cand, kick_lift, &HashSet::new())
-            .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
+        let reason = blocked_reason(
+            config,
+            cand,
+            kick_lift,
+            &HashSet::new(),
+            readings.usage.get(cand.name.as_str()),
+            readings.status.get(cand.name.as_str()).copied(),
+            session_token,
+        )
+        .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
         assert!(expected(&reason), "{label}: got {reason:?}");
         assert_eq!(
             candidate_excluded(
                 config,
                 &crate::profile::ProfileName::from("cand"),
-                &HashSet::new()
+                &HashSet::new(),
+                crate::fallback::refuses_service_from_usage(
+                    &crate::profile::ProfileName::from("cand"),
+                    &readings.usage
+                )
             ),
             dead_first(&reason),
             "{label}: walk skip and dead-first chip disagree, got {reason:?}"
@@ -5152,7 +5531,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
 
     // Disabled — dead-first.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             mark_disabled(profile_with_util("cand", Some(90.0), Some(10.0))),
@@ -5162,12 +5541,14 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Disabled),
         "Disabled",
+        &readings,
     );
 
     // Canceled — dead-first.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             profile_with_usage("cand", Some(90.0), Some(canceled_usage())),
@@ -5177,12 +5558,35 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Canceled),
         "Canceled",
+        &readings,
+    );
+
+    // OrgRefused — dead-first, as Canceled.
+    let mut refused = canceled_usage();
+    if let Some(plan) = refused.plan.as_mut() {
+        plan.subscription_status = Some(crate::usage::ORG_REFUSED_STATUS.to_string());
+    }
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(refused)),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::OrgRefused),
+        "OrgRefused",
+        &readings,
     );
 
     // AuthBroken — dead-first.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![keeper(), profile_with_util("cand", Some(90.0), Some(10.0))],
         "keep",
     );
@@ -5190,12 +5594,31 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::AuthBroken),
         "AuthBroken",
+        &readings,
+    );
+
+    // LoggedOut — holds no login at all: dead-first, the walk skips it.
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            no_login(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::LoggedOut),
+        "LoggedOut",
+        &readings,
     );
 
     // WeeklySpent — 7d at the hard cap: usage-only, stays a walk candidate.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             profile_with_usage("cand", Some(90.0), Some(weekly_usage(100.0))),
@@ -5205,13 +5628,15 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::WeeklySpent { .. }),
         "WeeklySpent",
+        &readings,
     );
 
     // KickRejected — the messages limiter refuses the auto-start kick despite
     // live headroom: usage/limiter-only, stays a walk candidate.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             mark_fresh(profile_with_util("cand", Some(90.0), Some(10.0))),
@@ -5222,12 +5647,14 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         Some(until),
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::KickRejected { .. }),
         "KickRejected",
+        &readings,
     );
 
     // BudgetSpent — 5h spent, billing, over its auto-spend ceiling: usage-only.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![keeper(), spend_member("cand", 10.0, 20.0, None)],
         "keep",
     );
@@ -5235,25 +5662,29 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::BudgetSpent),
         "BudgetSpent",
+        &readings,
     );
 
     // FiveHour — over its own rotate threshold: usage-only.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![keeper(), profile_with_util("cand", Some(90.0), Some(97.0))],
         "keep",
     );
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::FiveHour { .. }),
         "FiveHour",
+        &readings,
     );
 
     // ScopedSpent — a gated per-model weekly window over the line, aggregate
     // windows clear: usage-only.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             profile_with_usage(
@@ -5271,12 +5702,32 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::ScopedSpent { .. }),
         "ScopedSpent",
+        &readings,
+    );
+
+    // CreditCap — the gate on over a spent cap, every window clear: a
+    // target-side skip, so the member stays a walk candidate.
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(usage_credit_capped())),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::CreditCap),
+        "CreditCap",
+        &readings,
     );
 
     // WeeklySoft — 7d over the soft line, under the hard cap: usage-only.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             keeper(),
             profile_with_usage("cand", Some(90.0), Some(both_windows(40.0, 99.0))),
@@ -5286,15 +5737,17 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::WeeklySoft { .. }),
         "WeeklySoft",
+        &readings,
     );
 
     // Stale — the last read was cached, otherwise live and clear: usage-only.
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![keeper(), {
             let mut p = profile_with_util("cand", Some(90.0), Some(40.0));
-            p.fetch_status = Some(FetchStatus::Cached);
+            p.status = Some(FetchStatus::Cached);
             p
         }],
         "keep",
@@ -5302,17 +5755,44 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Stale),
         "Stale",
+        &readings,
+    );
+
+    // NoUsage: a member tollgate cannot measure, with no reading. Display-only.
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        TOKEN,
+        &|r| matches!(r, BlockedReason::NoUsage),
+        "NoUsage",
+        &readings,
     );
 }
 
 #[test]
 fn blocked_reason_none_for_a_live_member_with_headroom() {
     let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         None
     );
 }
@@ -5321,10 +5801,18 @@ fn blocked_reason_none_for_a_live_member_with_headroom() {
 fn blocked_reason_auth_broken_outranks_every_other_block() {
     // 7d at the hard cap AND 5h over threshold — auth still wins.
     let p = profile_with_usage("a", Some(95.0), Some(both_windows(100.0, 100.0)));
-    let mut cfg = config_with_chain(vec![p], "a");
+    let (mut cfg, readings) = config_with_chain(vec![p], "a");
     cfg.state.auth_broken.push("a".into());
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::AuthBroken)
     );
 }
@@ -5332,15 +5820,23 @@ fn blocked_reason_auth_broken_outranks_every_other_block() {
 #[test]
 fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
     let p = profile_with_usage("a", Some(95.0), Some(weekly_usage(100.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
-            Some(BlockedReason::WeeklySpent { resets_in: Some(secs) })
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
+            Some(BlockedReason::WeeklySpent { resets_in: Some(secs), monthly: false })
                 if (3500..=3600).contains(&secs)
         ),
         "got {:?}",
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new())
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        )
     );
 }
 
@@ -5348,11 +5844,69 @@ fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
 fn blocked_reason_weekly_hard_outranks_a_5h_block() {
     // 7d at the hard cap AND 5h over threshold — weekly (dead for days) wins.
     let p = profile_with_usage("a", Some(95.0), Some(both_windows(99.0, 100.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::WeeklySpent { .. })
     ));
+}
+
+/// A monthly-only member past the SOFT weekly line (99%) carries `monthly: true`
+/// on its block — the producer that decides it, not the renderer, so every
+/// surface downstream reads `30d 99%`, never "weekly 99%".
+#[test]
+fn a_monthly_only_member_past_the_soft_line_carries_the_monthly_label() {
+    let p = profile_with_usage("a", Some(90.0), Some(monthly_usage(99.0)));
+    let (cfg, readings) = config_with_chain(vec![p], "a");
+    assert_eq!(
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
+        Some(BlockedReason::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        })
+    );
+}
+
+/// A monthly-only member at the HARD cap (100%) carries `monthly: true` on its
+/// spent block — the producer that decides it, so the pill and fix read
+/// `30d spent` / `monthly quota is spent`.
+#[test]
+fn a_monthly_only_member_at_the_hard_cap_carries_the_monthly_label() {
+    let p = profile_with_usage("a", Some(90.0), Some(monthly_usage(100.0)));
+    let (cfg, readings) = config_with_chain(vec![p], "a");
+    let reason = blocked_reason(
+        &cfg,
+        &cfg.profiles[0],
+        None,
+        &HashSet::new(),
+        readings.usage.get(cfg.profiles[0].name.as_str()),
+        None,
+        false,
+    );
+    assert_eq!(
+        reason.as_ref().map(|r| match r {
+            BlockedReason::WeeklySpent { monthly, resets_in } => (*monthly, resets_in.is_some()),
+            _ => (false, false),
+        }),
+        Some((true, true)),
+        "the hard-spent monthly member carries the monthly label and a live reset"
+    );
 }
 
 #[test]
@@ -5360,10 +5914,18 @@ fn blocked_reason_budget_spent_when_billing_and_over_ceiling() {
     // spend_member is 5h-spent + billing; ceiling 10, used 20 → over. Budget is
     // checked before the 5h block, so this also proves budget › 5h.
     let p = spend_member("a", 10.0, 20.0, None);
-    let mut cfg = config_with_chain(vec![p], "a");
+    let (mut cfg, readings) = config_with_chain(vec![p], "a");
     cfg.state.spend_budget_switching = true;
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::BudgetSpent)
     );
 }
@@ -5377,10 +5939,18 @@ fn blocked_reason_budget_spent_is_moot_with_free_5h_quota() {
     if let Some(u) = p.usage.as_mut() {
         u.five_hour = Some(window(30.0, Some(live_reset()))); // free 5h quota
     }
-    let mut cfg = config_with_chain(vec![p], "a");
+    let (mut cfg, readings) = config_with_chain(vec![p], "a");
     cfg.state.spend_budget_switching = true;
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         None
     );
 }
@@ -5388,15 +5958,23 @@ fn blocked_reason_budget_spent_is_moot_with_free_5h_quota() {
 #[test]
 fn blocked_reason_five_hour_reports_utilization_and_reset() {
     let p = profile_with_util("a", Some(95.0), Some(97.0));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::FiveHour { pct, resets_in: Some(secs) })
                 if (pct - 97.0).abs() < f64::EPSILON && (3500..=3600).contains(&secs)
         ),
         "got {:?}",
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new())
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        )
     );
 }
 
@@ -5404,10 +5982,10 @@ fn blocked_reason_five_hour_reports_utilization_and_reset() {
 fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
     // 7d at 99 (≥ default soft 98, < 100) with 5h headroom → soft weekly block.
     let p = profile_with_usage("a", Some(95.0), Some(both_windows(40.0, 99.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
-        Some(BlockedReason::WeeklySoft { pct }) if (pct - 99.0).abs() < f64::EPSILON
+        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
+        Some(BlockedReason::WeeklySoft { pct, monthly: false }) if (pct - 99.0).abs() < f64::EPSILON
     ));
 }
 
@@ -5415,9 +5993,17 @@ fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
 fn blocked_reason_five_hour_outranks_a_soft_weekly_block() {
     // Both hold: 5h fully stopped now beats the soft week (still serving).
     let p = profile_with_usage("a", Some(95.0), Some(both_windows(97.0, 99.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::FiveHour { .. })
     ));
 }
@@ -5439,15 +6025,23 @@ fn blocked_reason_scoped_spent_names_the_worst_gated_window() {
             ],
         )),
     );
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::ScopedSpent { label, pct })
                 if label == "7d opus" && (pct - 100.0).abs() < f64::EPSILON
         ),
         "got {:?}",
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new())
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        )
     );
 }
 
@@ -5464,10 +6058,18 @@ fn blocked_reason_scoped_gate_off_never_claims_a_scoped_block() {
             vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
         )),
     );
-    p.check_scoped = false;
-    let cfg = config_with_chain(vec![p], "a");
+    p.profile.check_scoped = false;
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::WeeklySoft { .. })
     ));
 }
@@ -5481,10 +6083,18 @@ fn blocked_reason_weekly_gate_off_drops_the_soft_chip() {
         Some(95.0),
         Some(both_windows(40.0, 99.0)),
     ));
-    p.check_weekly = false;
-    let cfg = config_with_chain(vec![p], "a");
+    p.profile.check_weekly = false;
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         None
     );
 }
@@ -5492,10 +6102,18 @@ fn blocked_reason_weekly_gate_off_drops_the_soft_chip() {
 #[test]
 fn blocked_reason_stale_when_the_last_read_was_cached() {
     let mut p = profile_with_util("a", Some(95.0), Some(40.0));
-    p.fetch_status = Some(FetchStatus::Cached);
-    let cfg = config_with_chain(vec![p], "a");
+    p.status = Some(FetchStatus::Cached);
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
+        ),
         Some(BlockedReason::Stale)
     );
 }
@@ -5504,10 +6122,18 @@ fn blocked_reason_stale_when_the_last_read_was_cached() {
 fn blocked_reason_a_real_block_outranks_stale_data() {
     // 5h over threshold AND cached — the block wins, stale is only the fallback.
     let mut p = profile_with_util("a", Some(95.0), Some(97.0));
-    p.fetch_status = Some(FetchStatus::Cached);
-    let cfg = config_with_chain(vec![p], "a");
+    p.status = Some(FetchStatus::Cached);
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
+        ),
         Some(BlockedReason::FiveHour { .. })
     ));
 }
@@ -5517,10 +6143,18 @@ fn blocked_reason_failed_fetch_is_not_flagged_stale() {
     // `Failed` = no data at all (the card already says "no data"); only cached /
     // rate-limited numbers count as stale.
     let mut p = profile_with_util("a", Some(95.0), Some(40.0));
-    p.fetch_status = Some(FetchStatus::Failed);
-    let cfg = config_with_chain(vec![p], "a");
+    p.status = Some(FetchStatus::Failed);
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
+        ),
         None
     );
 }
@@ -5531,15 +6165,23 @@ fn blocked_reason_kick_rejected_when_switch_grade_with_headroom() {
     // the walk routes around. `kick_lift` (Some(until)) carries the advertised
     // lift ceiling; the chip reports it as a countdown.
     let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     let until = now_epoch_secs() + 3600;
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new()),
+            blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::KickRejected { lifts_in }) if (3500..=3600).contains(&lifts_in)
         ),
         "got {:?}",
-        blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new())
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            Some(until),
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        )
     );
 }
 
@@ -5549,10 +6191,18 @@ fn blocked_reason_kick_rejected_outranks_a_5h_block() {
     // member at all, so the kick block outranks the usage exhaustion. Reds if the
     // arm is placed below the 5h block.
     let p = profile_with_util("a", Some(95.0), Some(97.0));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     let until = now_epoch_secs() + 3600;
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            Some(until),
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::KickRejected { .. })
     ));
 }
@@ -5561,10 +6211,18 @@ fn blocked_reason_kick_rejected_outranks_a_5h_block() {
 fn blocked_reason_weekly_hard_outranks_a_kick_block() {
     // 7d at the hard cap (dead for days) beats a kick block that lifts in hours.
     let p = profile_with_usage("a", Some(95.0), Some(weekly_usage(100.0)));
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     let until = now_epoch_secs() + 3600;
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            Some(until),
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::WeeklySpent { .. })
     ));
 }
@@ -5606,6 +6264,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
+                own_inference: false,
             },
             ChainMember {
                 oauth: true,
@@ -5617,6 +6277,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
+                own_inference: false,
             },
             ChainMember {
                 oauth: true,
@@ -5628,6 +6290,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
+                own_inference: false,
             },
         ],
         switch_off_when_spent: true,
@@ -5640,8 +6304,12 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         spend_budget,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
@@ -5699,6 +6367,8 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
@@ -5838,6 +6508,8 @@ fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
         &pre_mutation,
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     );
     assert_eq!(
         result_with_pre_snapshot,
@@ -5899,7 +6571,7 @@ fn usage_with_scoped(
 fn auto_switch_prefers_member_clear_of_every_weekly_window() {
     // Active maxed. B is the ax-cl shape (agg clear, fable 100). C is clear
     // everywhere. Chain order favors B — the tier-1 pass must still pick C.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -5939,7 +6611,7 @@ fn auto_switch_never_lands_on_a_gate_on_model_blocked_member() {
     // Only sibling is model-blocked with its `check_scoped` gate on (the
     // default): it is out of rotation, so a spent active stays put rather
     // than stranding the next session of the capped model there.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -5965,7 +6637,7 @@ fn auto_switch_never_lands_on_a_gate_on_model_blocked_member() {
 fn auto_switch_scoped_gate_off_keeps_a_model_blocked_member_in_rotation() {
     // Same shape, but the operator flipped b's `check_scoped` gate off ("I
     // run other models on it") — b rotates normally despite its fable week.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -5996,7 +6668,7 @@ fn auto_switch_weekly_gate_off_ignores_the_soft_line_but_not_the_hard_cap() {
     // b rides the soft weekly band (99% > the default 98 line) with its
     // `check_weekly` gate off: still a rotation target. At the 100% hard cap
     // the gate no longer helps — the account cannot serve at all.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6030,7 +6702,7 @@ fn auto_switch_weekly_gate_off_ignores_the_soft_line_but_not_the_hard_cap() {
 fn auto_switch_scoped_blocked_active_hops_to_fully_clear_member() {
     // Active is healthy by every aggregate gate but its fable window crossed
     // the line — with a fully-clear sibling, hop.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6066,7 +6738,7 @@ fn auto_switch_scoped_blocked_active_hops_to_fully_clear_member() {
 fn auto_switch_scoped_blocked_active_stays_put_when_no_fully_clear_member() {
     // Every sibling is equally model-blocked: hopping buys nothing and would
     // ping-pong — stay put.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6102,7 +6774,7 @@ fn scoped_active_trigger_stays_parked_on_a_pinned_sink() {
     // here for free until dead") — the scoped hop must not un-park it, or the
     // chain oscillates on the sibling's 5h period: hop off, sibling's 5h
     // spends, serving-sink pass returns, sibling resets, hop again.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6143,7 +6815,7 @@ fn scoped_line_ignores_the_override_while_the_weekly_gate_is_off() {
     // b: override 60, weekly gate OFF, fable at 70. The override is inert —
     // b's fable window sits under the chain line (98), so b is fully clear
     // and the walk leaves a spent active for it.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6177,7 +6849,7 @@ fn scoped_windows_judge_the_chain_line_while_the_weekly_gate_is_off() {
     // CHAIN line (98), so b stays out of rotation. If gate-off routed the
     // scoped line to the hard cap the way it does the aggregate one, 99
     // would pass and this would hop.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6206,7 +6878,7 @@ fn scoped_windows_judge_the_chain_line_while_the_weekly_gate_is_off() {
 
 #[test]
 fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
-    // Chip twin of the walk pair above: override 60 + gate off + fable at 70
+    // Chip mirror of the walk above: override 60 + gate off + fable at 70
     // → no chip (the walk keeps rotating here); fable at 99 → `ScopedSpent`
     // at the chain line (the walk skips it), even with the gate off.
     let mut under = profile_with_usage(
@@ -6218,11 +6890,19 @@ fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
             vec![scoped_window("7d fable", 70.0, Some(week_reset()))],
         )),
     );
-    under.weekly_threshold = Some(60.0);
-    under.check_weekly = false;
-    let cfg = config_with_chain(vec![under], "a");
+    under.profile.weekly_threshold = Some(60.0);
+    under.profile.check_weekly = false;
+    let (cfg, readings) = config_with_chain(vec![under], "a");
     assert_eq!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         None,
         "a gated-off override must not put the chip on the card"
     );
@@ -6236,11 +6916,19 @@ fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
             vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
         )),
     );
-    over.check_weekly = false;
-    let cfg = config_with_chain(vec![over], "a");
+    over.profile.check_weekly = false;
+    let (cfg, readings) = config_with_chain(vec![over], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+            blocked_reason(
+                &cfg,
+                &cfg.profiles[0],
+                None,
+                &HashSet::new(),
+                readings.usage.get(cfg.profiles[0].name.as_str()),
+                None,
+                false
+            ),
             Some(BlockedReason::ScopedSpent { .. })
         ),
         "gate-off scoped judgment holds the chain line on the chip too"
@@ -6261,9 +6949,17 @@ fn blocked_reason_five_hour_outranks_scoped_spent() {
             vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
         )),
     );
-    let cfg = config_with_chain(vec![p], "a");
+    let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::FiveHour { .. })
     ));
 }
@@ -6282,7 +6978,7 @@ fn blocked_reason_five_hour_outranks_scoped_spent() {
 fn scoped_gate_off_active_never_fires_the_scoped_hop() {
     // Active is model-blocked but its own `check_scoped` gate is off: no
     // scoped trigger, even with a clear sibling waiting.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6308,7 +7004,7 @@ fn scoped_gate_off_active_never_fires_the_scoped_hop() {
 #[test]
 fn lapsed_scoped_window_never_blocks() {
     // A fable window at 100 whose reset has PASSED is stale — no hop.
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6332,9 +7028,9 @@ fn lapsed_scoped_window_never_blocks() {
 
 #[test]
 fn walk_prefers_fully_clear_member() {
-    // UI-side twin of the tier-1 preference: B model-blocked, C clear.
+    // Walk-driven tier-1 preference: B model-blocked, C clear.
     let mk = |name: &str, info: UsageInfo| profile_with_usage(name, Some(95.0), Some(info));
-    let config = config_with_chain(
+    let (config, readings) = config_with_chain(
         vec![
             mk("a", usage_info(Some(window(100.0, Some(live_reset()))))),
             mk(
@@ -6350,7 +7046,7 @@ fn walk_prefers_fully_clear_member() {
         "a",
     );
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("c".to_string())),
     );
 }
@@ -6368,6 +7064,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             oauth: true,
@@ -6379,6 +7077,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_infos(vec![
@@ -6416,6 +7116,8 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     }];
     assert_eq!(
         find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
@@ -6442,6 +7144,8 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let chain = vec![
         mkmember("a", false),
@@ -6498,6 +7202,8 @@ fn recovery_respects_each_members_gates() {
         weekly_line: if check_weekly { 98.0 } else { 100.0 },
         scoped_line: 98.0,
         check_scoped,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
     let store = store_with_infos(vec![
@@ -6533,7 +7239,7 @@ fn recovery_respects_each_members_gates() {
 fn weekly_override_tightens_and_loosens_the_member_line() {
     // b overrides the chain-wide 98 line DOWN to 50: at weekly 60 it is out
     // of rotation even though the chain line would accept it.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6567,7 +7273,7 @@ fn weekly_override_governs_the_actives_scoped_windows_too() {
     // One per-account line for both judgments: active's fable week at 90 is
     // under the chain line (98) but over its own override (85) — the scoped
     // trigger fires and hops to the clear sibling.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6598,7 +7304,7 @@ fn weekly_override_never_softens_the_hard_sink_and_halt_judgments() {
     // A last-resort sink whose week is at 99 with an override of 50: the
     // serving-sink pass keys on the HARD cap, so the sink still parks —
     // a member's soft-line taste must not bench a literally-usable account.
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(95.0), None),
@@ -6627,7 +7333,7 @@ fn weekly_override_on_a_sink_never_makes_the_walk_pay() {
     // serving-sink pass must park there instead of paying the spend-armed
     // sibling — judging the sink at its member-resolved soft line would make
     // the walk spend real money while it should park.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
             mark_last_resort(weekly_soft_profile("b")),
@@ -6638,7 +7344,7 @@ fn weekly_override_on_a_sink_never_makes_the_walk_pay() {
     config.profiles[1].weekly_threshold = Some(50.0);
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("b".to_string())),
         "a hard-clear sink parks free regardless of its soft-line override"
     );
@@ -6649,7 +7355,7 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
     // Active-side facet: the serving-sink ACTIVE carries the override. Its
     // own soft line says "exhausted", but it still answers for free — the
     // stay-put guard keys on the hard cap, so no switch (and no spend) fires.
-    let mut config = config_with_chain(
+    let (mut config, readings) = config_with_chain(
         vec![
             mark_last_resort(weekly_soft_profile("a")),
             spend_member("b", 20.0, 0.0, Some(50.0)),
@@ -6659,7 +7365,7 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
     config.profiles[0].weekly_threshold = Some(50.0);
     config.state.spend_budget_switching = true;
     assert_eq!(
-        walk_config(&config, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         None,
         "a serving-sink active stays parked free regardless of its override"
     );
@@ -6830,7 +7536,14 @@ fn a_quarantined_codex_member_is_walked_around() {
         crate::codex_auth::CodexRefreshError,
     > { Err(crate::codex_auth::CodexRefreshError::Reused) };
     assert_eq!(
-        crate::codex_auth::standby_pass("cx2", now_ms, "2026-08-13T00:00:00Z".into(), &reused),
+        crate::codex_auth::standby_pass(
+            "cx2",
+            now_ms,
+            "2026-08-13T00:00:00Z".into(),
+            &reused,
+            &crate::testutil::fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         crate::codex_auth::StandbyOutcome::Failed
     );
 
@@ -6914,7 +7627,14 @@ fn a_rotation_the_store_could_not_keep_is_walked_around() {
         })
     };
     assert_eq!(
-        crate::codex_auth::standby_pass("cxl2", now_ms, "2026-08-13T00:00:00Z".into(), &minted),
+        crate::codex_auth::standby_pass(
+            "cxl2",
+            now_ms,
+            "2026-08-13T00:00:00Z".into(),
+            &minted,
+            &crate::testutil::fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         crate::codex_auth::StandbyOutcome::Failed
     );
     // What the store still holds: the token the wire just spent.
@@ -6957,12 +7677,18 @@ fn a_rotation_the_store_could_not_keep_is_walked_around() {
 // ── start_walk: the `--auto` selection walk over the on-disk caches ─────────
 //
 // `start_walk` reads usage off `profile_json::profile_windows` (the on-disk
-// `usage_cache.json`), never `Profile.usage` (which only the UI thread fills),
-// so these fixtures write the cache under a sandbox rather than the in-memory
-// field the walk tests use.
+// `usage_cache.json`), so these fixtures write the cache under a sandbox
+// rather than an in-memory store the walk tests use.
 
-fn start_walk_profile(name: &str) -> Profile {
-    Profile::new(name.to_string(), None, None)
+fn start_walk_profile(name: &str) -> Fixture {
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::testutil::oauth_pair(name));
+    Fixture {
+        profile,
+        usage: None,
+        fresh: false,
+        status: None,
+    }
 }
 
 fn start_walk_sandbox(names: &[&str]) -> crate::testutil::HomeSandbox {
@@ -7099,11 +7825,242 @@ fn start_walk_takes_chain_order_over_headroom() {
     let _sb = start_walk_sandbox(&["a", "b"]);
     start_walk_write_usage("a", &start_walk_usage(240, 80.0, 10.0));
     start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
-    let config = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&config, None, false);
+    let (config, _readings) =
+        config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0), "chain order, not headroom, is the pick");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
+}
+
+/// A refused setup token stays a dead login once an OAuth pair is stored beside
+/// it, a `tollgate login` on the `×`'s advice say: every switch still installs
+/// the sidecar ahead of the pair, so a session landing there would run on the
+/// refused token. `tollgate start --auto` passes it over, the durable verdict
+/// seeds it, and its row reads `token rejected`.
+#[test]
+fn a_refused_setup_token_stays_a_dead_login_beside_a_stored_pair() {
+    let _sb = start_walk_sandbox(&["refused", "next"]);
+    start_walk_write_usage("refused", &start_walk_usage(240, 10.0, 10.0));
+    start_walk_write_usage("next", &start_walk_usage(240, 10.0, 10.0));
+    let mut refused = start_walk_profile("refused");
+    crate::testutil::make_probed_account(&mut refused.profile);
+    let digest = refused
+        .profile
+        .setup_token_digest
+        .expect("the setup token's digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("refused"), digest);
+    refused.profile.credentials = Some(crate::testutil::oauth_pair("refused"));
+    crate::profile::save_profile(&refused.profile).expect("store the pair");
+    assert_eq!(
+        crate::claude::install_source_path(&ProfileName::from("refused"))
+            .expect("the install source")
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("session-token.json"),
+        "fixture control: the sidecar outranks the pair at a switch"
+    );
+    assert!(
+        crate::fallback::durable_key_rejected_seed([&refused.profile]).contains_key("refused"),
+        "the verdict still binds to the installed token"
+    );
+    let (config, _readings) =
+        config_with_chain(vec![refused, start_walk_profile("next")], "refused");
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(picked, Some(1));
+    assert_eq!(rows[0].block, Some(StartBlock::AuthBroken));
+    let key_rejected: HashSet<ProfileName> = [ProfileName::from("refused")].into();
+    assert_eq!(
+        blocked_reason(
+            &config,
+            &config.profiles[0],
+            None,
+            &key_rejected,
+            None,
+            None,
+            false
+        ),
+        Some(BlockedReason::TokenRejected)
+    );
+}
+
+/// Whether `start_walk` picks the member on record as refusing a credit-billed
+/// request, two hours ago, for a launch on `model` (none resolved for `None`),
+/// and the verdict it gives that member. Its reading reads clear, and the
+/// member after it would serve.
+fn start_walk_on_a_member_with_a_credit_refusal(
+    model: Option<&str>,
+) -> (Option<usize>, Option<String>) {
+    let _sb = start_walk_sandbox(&["refused", "next"]);
+    start_walk_write_usage("refused", &start_walk_usage(240, 10.0, 10.0));
+    start_walk_write_usage("next", &start_walk_usage(240, 10.0, 10.0));
+    let mut refused = start_walk_profile("refused");
+    refused.profile.models.default = model.map(str::to_owned);
+    let mut next = start_walk_profile("next");
+    next.profile.models.default = model.map(str::to_owned);
+    let (config, _readings) = config_with_chain(vec![refused, next], "refused");
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("refused"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 7_200_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
+        },
+    );
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    (
+        picked,
+        rows[0].block.as_ref().map(crate::format::start_block_label),
+    )
+}
+
+/// `tollgate start --auto` reads a member's credit refusal on record as a block
+/// for a launch that may need credits, and `--explain` says when it refused.
+#[test]
+fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_credit_billed_launch() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(Some("fable")),
+        (Some(1), Some("credits refused 2h ago".to_string()))
+    );
+}
+
+/// A launch with no model resolved may need credits, so `--auto` passes over
+/// such a member for it too.
+#[test]
+fn start_walk_passes_over_a_member_with_a_credit_refusal_for_a_launch_with_no_model() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(None),
+        (Some(1), Some("credits refused 2h ago".to_string()))
+    );
+}
+
+/// A plan-covered launch still starts on it: the credits it refused are not
+/// what that launch spends. The control: a launch naming no model passes over
+/// it.
+#[test]
+fn start_walk_keeps_a_member_with_a_credit_refusal_for_a_plan_covered_launch() {
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(None).0,
+        Some(1),
+        "control: a launch naming no model passes over it"
+    );
+    assert_eq!(
+        start_walk_on_a_member_with_a_credit_refusal(Some("opus")),
+        (Some(0), None)
+    );
+}
+
+/// A recent probe reading is as fresh as a measured one for any launch, a
+/// credit-billed one included: what keeps such a launch off a member is a
+/// refusal on record, never the probe. So the age cell names no probe; a stale
+/// reading still says so, and one whose windows have all lapsed reads its age
+/// alone.
+#[test]
+fn start_walk_takes_a_recent_probe_reading_as_fresh_for_any_launch() {
+    for (model, probed_age, live, expected) in [
+        (
+            "fable",
+            240,
+            true,
+            "* probed  ok   usage 4m ago\n  polled  ok   usage 4m ago",
+        ),
+        (
+            "opus",
+            240,
+            true,
+            "* probed  ok   usage 4m ago\n  polled  ok   usage 4m ago",
+        ),
+        (
+            "fable",
+            10_800,
+            true,
+            "  probed  ok   usage 3h ago (stale)\n* polled  ok   usage 4m ago",
+        ),
+        (
+            "fable",
+            10_800,
+            false,
+            "  probed  ok   usage 3h ago\n* polled  ok   usage 4m ago",
+        ),
+    ] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        let mut reading = start_walk_usage(probed_age, 10.0, 10.0);
+        if !live {
+            reading.five_hour = Some(window(10.0, Some(expired_reset())));
+            reading.seven_day = Some(window(10.0, Some(expired_reset())));
+        }
+        start_walk_write_usage("probed", &reading);
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        probed.profile.models.default = Some(model.to_owned());
+        let mut polled = start_walk_profile("polled");
+        polled.profile.models.default = Some(model.to_owned());
+        let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
+        let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+        assert_eq!(
+            crate::format::render_start_walk(&rows, picked),
+            expected,
+            "{model}, probe reading {probed_age}s old, live windows {live}"
+        );
+    }
+}
+
+/// The same for a launch the credit rung reads as billed because tollgate cannot
+/// tell its model: no model named, one it cannot place, an agent naming none,
+/// or an unplaceable `--fallback-model` beside a headline it can place. The
+/// probed member first in the chain is taken on its recent reading.
+#[test]
+fn start_walk_takes_a_probe_reading_as_fresh_when_the_model_is_unknown() {
+    for args in [
+        Vec::<String>::new(),
+        vec!["--model".to_owned(), "mystery-model".to_owned()],
+        vec!["--agent".to_owned(), "reviewer".to_owned()],
+        vec![
+            "--model".to_owned(),
+            "opus".to_owned(),
+            "--fallback-model".to_owned(),
+            "glm-4.6".to_owned(),
+        ],
+    ] {
+        let _sb = start_walk_sandbox(&["probed", "polled"]);
+        start_walk_write_usage("probed", &start_walk_usage(240, 10.0, 10.0));
+        start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+        let mut probed = start_walk_profile("probed");
+        crate::testutil::make_probed_account(&mut probed.profile);
+        let (config, _readings) =
+            config_with_chain(vec![probed, start_walk_profile("polled")], "probed");
+        let (rows, picked) =
+            start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+        assert_eq!(picked, Some(0), "{args:?}");
+        assert!(rows[0].fresh, "{args:?}");
+    }
+}
+
+/// A probe switched off leaves its last reading in `usage_cache.json`, and
+/// nothing reads the account any more: that frozen reading, with no credit
+/// figures, is no fresh one a credit-billed launch prefers, and the age cell
+/// says tollgate cannot read the account.
+#[test]
+fn start_walk_takes_no_reading_from_a_cache_a_switched_off_probe_left() {
+    let _sb = start_walk_sandbox(&["lapsed", "polled"]);
+    start_walk_write_usage("lapsed", &start_walk_usage(1800, 10.0, 10.0));
+    start_walk_write_usage("polled", &start_walk_usage(240, 10.0, 10.0));
+    let mut lapsed = start_walk_profile("lapsed");
+    crate::testutil::make_probed_account(&mut lapsed.profile);
+    lapsed.profile.usage_probe = false;
+    lapsed.profile.models.default = Some("fable".to_owned());
+    let mut polled = start_walk_profile("polled");
+    polled.profile.models.default = Some("fable".to_owned());
+    let (config, _readings) = config_with_chain(vec![lapsed, polled], "lapsed");
+    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(picked, Some(1));
+    assert_eq!(
+        crate::format::render_start_walk(&rows, picked)
+            .lines()
+            .next(),
+        Some("  lapsed  ok   can't read usage")
+    );
 }
 
 #[test]
@@ -7115,9 +8072,10 @@ fn start_walk_skips_a_member_capped_on_a_demanded_family() {
         window: window(100.0, Some(live_reset())),
     }];
     start_walk_write_usage("capped", &usage);
-    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
-    let demand = ["opus".to_owned()];
-    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    let mut capped = start_walk_profile("capped");
+    capped.profile.models.default = Some("opus".to_owned());
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(
         rows[0].block,
@@ -7137,11 +8095,327 @@ fn start_walk_keeps_a_member_capped_on_another_family() {
         window: window(100.0, Some(live_reset())),
     }];
     start_walk_write_usage("capped", &usage);
-    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
-    let demand = ["sonnet".to_owned()];
-    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    let mut capped = start_walk_profile("capped");
+    capped.profile.models.default = Some("sonnet".to_owned());
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
+}
+
+/// A project `<cwd>/.claude/settings.json` `model` is the headline the spawn
+/// runs, so it demands a family the capped member's spent cap refuses. The same
+/// file at the real `$HOME` is the user-tier base the runtime overlay drops
+/// (the member's opus default is the demand) and the project tier never reads
+/// it there (`--setting-sources user`), so the member is picked with the opus
+/// default — and a wrongly-read fable would refuse, keeping the skip bound.
+#[test]
+fn start_walk_reads_a_project_settings_model_and_skips_a_capped_member() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    capped.profile.models.default = Some("opus".to_owned());
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "the project model is fable, which the cap refuses"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+
+    // The same file at the real `$HOME` is not a project source.
+    std::fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    std::fs::write(
+        sb.home().join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(sb.home()),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the home settings are not project settings, so the opus default runs and the member is picked"
+    );
+    assert_eq!(rows[0].block, None);
+}
+
+/// An unplaceable named model is an unknown demand, judged credit-billed
+/// whatever the gate says: with the gate off, `start --auto` refuses the same
+/// member the delegate pre-flight refuses.
+#[test]
+fn start_refuses_an_unplaceable_model_with_the_gate_off() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let args = vec!["--model".to_owned(), "glm-4.6".to_owned()];
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+    assert_eq!(
+        pick, None,
+        "an unknown demand refuses a capped member whatever the gate says"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+}
+
+/// A `--setting-sources` passthrough naming neither `project` nor `local`
+/// makes Claude Code skip the project tiers, so a project `model: fable` is
+/// ignored and the member's opus default runs: the member is picked; a wrongly
+/// read fable would refuse it.
+#[test]
+fn start_ignores_a_project_model_under_a_setting_sources_user_flag() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    capped.profile.models.default = Some("opus".to_owned());
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let args = vec!["--setting-sources".to_owned(), "user".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the project tier is skipped, so the opus default runs and the member is picked"
+    );
+    assert_eq!(rows[0].block, None);
+}
+
+/// A `--setting-sources` list names each project tier alone: `project` reads
+/// `.claude/settings.json` (opus, headroom) and skips `settings.local.json`
+/// (fable), `local` reads the local file alone and skips the project one.
+#[test]
+fn start_setting_sources_reads_only_the_named_project_tier() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let project_args = vec!["--setting-sources".to_owned(), "user,project".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &project_args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "`user,project` reads only settings.json, whose opus has headroom"
+    );
+    assert_eq!(rows[0].block, None);
+
+    let local_args = vec!["--setting-sources".to_owned(), "user,local".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &local_args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "`user,local` reads only settings.local.json, whose fable is refused"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+}
+
+/// The LAST `--setting-sources` flag governs, whatever an earlier one named.
+#[test]
+fn start_the_last_setting_sources_flag_governs() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--setting-sources".to_owned(),
+        "user,local".to_owned(),
+        "--setting-sources".to_owned(),
+        "user,project".to_owned(),
+    ];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the last flag names project, so opus governs and the member is picked"
+    );
+    assert_eq!(rows[0].block, None);
+}
+
+/// A test build's only home is the sandbox: a project dir NOT under it is
+/// never read (the test process cwd is the real checkout root on a dev box,
+/// whose `.claude/settings*.json` must not steer the demand). The same file
+/// under the sandbox home IS the project tier.
+#[test]
+fn start_walk_ignores_a_project_dir_outside_the_sandbox_home() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    capped.profile.models.default = Some("opus".to_owned());
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join(".claude")).unwrap();
+    std::fs::write(
+        outside.path().join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(outside.path()),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "a project dir outside the sandbox home is never read, so the opus default runs and the member is picked"
+    );
+    assert_eq!(rows[0].block, None);
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(pick, None, "the sandbox project model is fable, refused");
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+}
+#[test]
+fn start_walk_reads_a_project_local_settings_model_over_the_project_one() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let capped = start_walk_profile("capped");
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the project model is opus, which has headroom"
+    );
+    assert_eq!(rows[0].block, None);
+
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "the local model is fable, which the cap refuses"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
 }
 
 #[test]
@@ -7155,9 +8429,16 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
     start_walk_write_usage("capped", &usage);
 
     let mut gated = start_walk_profile("capped");
-    gated.check_scoped = true;
-    let gated_config = config_with_chain(vec![gated], "capped");
-    let (rows, pick) = start_walk(&gated_config, None, false);
+    gated.profile.check_scoped = true;
+    let (gated_config, _readings) = config_with_chain(vec![gated], "capped");
+    let (rows, pick) = start_walk(
+        &gated_config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None, "no demand keeps the blanket check_scoped gate");
     assert!(matches!(
         rows[0].block,
@@ -7165,9 +8446,16 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
     ));
 
     let mut ungated = start_walk_profile("capped");
-    ungated.check_scoped = false;
-    let ungated_config = config_with_chain(vec![ungated], "capped");
-    let (rows, pick) = start_walk(&ungated_config, None, false);
+    ungated.profile.check_scoped = false;
+    let (ungated_config, _readings) = config_with_chain(vec![ungated], "capped");
+    let (rows, pick) = start_walk(
+        &ungated_config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -7182,10 +8470,10 @@ fn start_walk_a_known_demand_overrides_check_scoped_off() {
     }];
     start_walk_write_usage("capped", &usage);
     let mut profile = start_walk_profile("capped");
-    profile.check_scoped = false;
-    let config = config_with_chain(vec![profile], "capped");
-    let demand = ["opus".to_owned()];
-    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    profile.profile.check_scoped = false;
+    profile.profile.models.default = Some("opus".to_owned());
+    let (config, _readings) = config_with_chain(vec![profile], "capped");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None, "a known demand supersedes the blanket gate");
     assert!(matches!(
         rows[0].block,
@@ -7206,7 +8494,7 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     ]);
 
     let mut disabled = start_walk_profile("disabled");
-    disabled.disabled = true;
+    disabled.profile.disabled = true;
 
     let mut canceled_usage = start_walk_usage(240, 5.0, 10.0);
     canceled_usage.plan = Some(PlanInfo {
@@ -7219,12 +8507,12 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     start_walk_write_usage("fivehour", &start_walk_usage(240, 100.0, 10.0));
     start_walk_write_usage("weeklyspent", &start_walk_usage(240, 5.0, 100.0));
     let mut weeklysoft = start_walk_profile("weeklysoft");
-    weeklysoft.weekly_threshold = Some(98.0);
+    weeklysoft.profile.weekly_threshold = Some(98.0);
     start_walk_write_usage("weeklysoft", &start_walk_usage(240, 5.0, 99.0));
 
     start_walk_write_kick("kickrejected");
 
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             disabled,
             start_walk_profile("authbroken"),
@@ -7238,29 +8526,69 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     );
     config.state.auth_broken.push("authbroken".into());
 
-    let (rows, pick) = start_walk(&config, None, false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(rows[0].block, Some(StartBlock::Disabled));
     assert_eq!(rows[1].block, Some(StartBlock::AuthBroken));
     assert_eq!(rows[2].block, Some(StartBlock::Canceled));
     assert_eq!(rows[3].block, Some(StartBlock::KickRejected));
     assert_eq!(rows[4].block, Some(StartBlock::FiveHour { pct: 100.0 }));
-    assert_eq!(rows[5].block, Some(StartBlock::WeeklySpent));
-    assert_eq!(rows[6].block, Some(StartBlock::WeeklySoft { pct: 99.0 }));
+    assert_eq!(
+        rows[5].block,
+        Some(StartBlock::WeeklySpent { monthly: false })
+    );
+    assert_eq!(
+        rows[6].block,
+        Some(StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: false
+        })
+    );
+}
+
+/// An organization's refusal blocks a start as the dead state it is, named
+/// apart from a canceled plan, and the walk takes neither. The control: the
+/// canceled member beside it reads its own block.
+#[test]
+fn start_walk_blocks_an_organizations_refusal_apart_from_a_canceled_plan() {
+    let _sb = start_walk_sandbox(&["refused", "canceled"]);
+    for (name, status) in [
+        ("refused", crate::usage::ORG_REFUSED_STATUS),
+        ("canceled", "canceled"),
+    ] {
+        let mut usage = start_walk_usage(240, 5.0, 10.0);
+        usage.plan = Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some(status.to_owned()),
+            codex_plan: None,
+        });
+        start_walk_write_usage(name, &usage);
+    }
+    let (config, _readings) = config_with_chain(
+        vec![
+            start_walk_profile("refused"),
+            start_walk_profile("canceled"),
+        ],
+        "refused",
+    );
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(pick, None);
+    assert_eq!(rows[0].block, Some(StartBlock::OrgRefused));
+    assert_eq!(rows[1].block, Some(StartBlock::Canceled));
 }
 
 #[test]
 fn start_walk_refuses_a_non_oauth_member_only_under_with_fallback() {
     let _sb = start_walk_sandbox(&["thirdparty"]);
     let mut third_party = start_walk_profile("thirdparty");
-    third_party.base_url = Some("https://api.example.com".to_owned());
-    let config = config_with_chain(vec![third_party], "thirdparty");
+    third_party.profile.base_url = Some("https://api.example.com".to_owned());
+    let (config, _readings) = config_with_chain(vec![third_party], "thirdparty");
 
-    let (rows, pick) = start_walk(&config, None, true);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], true, None);
     assert_eq!(pick, None, "--with-fallback refuses a non-OAuth member");
     assert_eq!(rows[0].block, Some(StartBlock::NotOauth));
 
-    let (rows, pick) = start_walk(&config, None, false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -7272,8 +8600,9 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
     start_walk_write_usage("c", &start_walk_usage(10_800, 5.0, 10.0));
 
-    let two = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&two, None, false);
+    let (two, _readings) =
+        config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&two, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(1),
@@ -7281,8 +8610,8 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     );
     assert!(rows[0].stale && !rows[1].stale);
 
-    let one = config_with_chain(vec![start_walk_profile("c")], "c");
-    let (rows, pick) = start_walk(&one, None, false);
+    let (one, _readings) = config_with_chain(vec![start_walk_profile("c")], "c");
+    let (rows, pick) = start_walk(&one, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0), "the only clear member still launches stale");
     assert!(rows[0].stale);
 
@@ -7290,7 +8619,14 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     // outranks no reading at all in the any-freshness pass.
     let stale_then_unread =
         config_with_chain(vec![start_walk_profile("a"), start_walk_profile("d")], "a");
-    let (rows, pick) = start_walk(&stale_then_unread, None, false);
+    let (rows, pick) = start_walk(
+        &stale_then_unread.0,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(0),
@@ -7298,8 +8634,15 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     );
     assert!(rows[0].stale && !rows[0].fresh && !rows[1].fresh);
 
-    let only_unread = config_with_chain(vec![start_walk_profile("d")], "d");
-    let (rows, pick) = start_walk(&only_unread, None, false);
+    let (only_unread, _readings) = config_with_chain(vec![start_walk_profile("d")], "d");
+    let (rows, pick) = start_walk(
+        &only_unread,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0), "the only member still launches unread");
     assert!(!rows[0].fresh);
 }
@@ -7308,14 +8651,14 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
 fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
     let _sb = start_walk_sandbox(&["a", "b", "c"]);
     let mut a = start_walk_profile("a");
-    a.disabled = true;
+    a.profile.disabled = true;
     start_walk_write_usage("b", &start_walk_usage(240, 100.0, 10.0));
     start_walk_write_usage("c", &start_walk_usage(240, 5.0, 100.0));
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![a, start_walk_profile("b"), start_walk_profile("c")],
         "a",
     );
-    let (rows, pick) = start_walk(&config, None, false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(rows.len(), 3);
     assert!(
@@ -7324,7 +8667,77 @@ fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
     );
     assert_eq!(rows[0].block, Some(StartBlock::Disabled));
     assert_eq!(rows[1].block, Some(StartBlock::FiveHour { pct: 100.0 }));
-    assert_eq!(rows[2].block, Some(StartBlock::WeeklySpent));
+    assert_eq!(
+        rows[2].block,
+        Some(StartBlock::WeeklySpent { monthly: false })
+    );
+}
+
+/// The `--auto` arm's real call site: a two-member chain whose walk picks the
+/// SECOND member (`a` default fable with its fable week spent, `b` default
+/// opus clear), and `start_pick` returns `b`'s name and demand — never the
+/// first member's. Pins the `rows[pick]` choice inside the function itself.
+#[test]
+fn start_pick_returns_the_picked_member_and_its_demand() {
+    let _sb = start_walk_sandbox(&["a", "b"]);
+
+    let mut a_usage = start_walk_usage(240, 5.0, 10.0);
+    a_usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d fable".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("a", &a_usage);
+    let mut a = start_walk_profile("a");
+    a.profile.models.default = Some("fable".to_owned());
+
+    start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
+    let mut b = start_walk_profile("b");
+    b.profile.models.default = Some("opus".to_owned());
+
+    let (config, _readings) = config_with_chain(vec![a, b], "a");
+    let (name, rows, pick, demand) =
+        start_pick(&config, Isolation::Shared, &[], [None, None], false, None)
+            .expect("`b` is clear and is the walk's pick");
+
+    assert_eq!(name, ProfileName::from("b"));
+    assert_eq!(demand, vec!["opus".to_owned()], "b's demand, not a's fable");
+    assert_eq!(pick, Some(1));
+    assert!(rows[1].block.is_none());
+}
+
+/// The refusal header names a family only when every judged member carries the
+/// same set of families: order does not matter (`a` names opus-then-sonnet,
+/// `b` sonnet-then-opus — the same launch either way), and the first member's
+/// order is the one printed.
+#[test]
+fn shared_demand_shares_the_same_families_in_any_order() {
+    let rows = vec![
+        StartCandidate {
+            name: ProfileName::from("a"),
+            block: None,
+            age: crate::profile_json::OauthAge::Absent,
+            stale: false,
+            fresh: false,
+            demand: vec!["opus".to_owned(), "sonnet".to_owned()],
+            now: 0,
+            no_poll: None,
+        },
+        StartCandidate {
+            name: ProfileName::from("b"),
+            block: None,
+            age: crate::profile_json::OauthAge::Absent,
+            stale: false,
+            fresh: false,
+            demand: vec!["sonnet".to_owned(), "opus".to_owned()],
+            now: 0,
+            no_poll: None,
+        },
+    ];
+    assert_eq!(
+        shared_demand(&rows),
+        Some(vec!["opus".to_owned(), "sonnet".to_owned()]),
+        "the same families in a different order still share; the first member's order is kept"
+    );
 }
 
 /// The scoped half of the start walk's accept, spelled from the walk's own
@@ -7353,8 +8766,8 @@ fn start_walk_scoped_clear(
 #[test]
 fn a_day_list_reaches_the_chain_member_with_the_flag_off() {
     let mut listed = start_walk_profile("p");
-    listed.preferred = false;
-    listed.preferred_days = vec![
+    listed.profile.preferred = false;
+    listed.profile.preferred_days = vec![
         Weekday::Mon,
         Weekday::Tue,
         Weekday::Wed,
@@ -7363,7 +8776,7 @@ fn a_day_list_reaches_the_chain_member_with_the_flag_off() {
         Weekday::Sat,
         Weekday::Sun,
     ];
-    let config = config_with_chain(vec![listed], "p");
+    let (config, _readings) = config_with_chain(vec![listed], "p");
     let member = chain_member(
         &config,
         &ProfileName::from("p"),
@@ -7384,11 +8797,11 @@ fn a_day_list_blocker_names_the_first_thing_in_the_way() {
     let on_chain = start_walk_profile("work");
     let off_chain = start_walk_profile("spare");
     let mut disabled = start_walk_profile("old");
-    disabled.disabled = true;
+    disabled.profile.disabled = true;
 
-    let mut config = config_with_chain(vec![on_chain, disabled], "work");
+    let (mut config, _readings) = config_with_chain(vec![on_chain, disabled], "work");
     config.state.profiles.push(ProfileName::from("spare"));
-    config.profiles.push(off_chain);
+    config.profiles.push(off_chain.profile);
 
     assert_eq!(
         day_claim_blocker(&config, &ProfileName::from("work"), &HashSet::new()).as_deref(),
@@ -7415,9 +8828,9 @@ fn a_day_list_blocker_names_the_first_thing_in_the_way() {
 #[test]
 fn every_named_blocker_is_a_state_the_claim_scan_also_refuses() {
     let mut listed = start_walk_profile("old");
-    listed.preferred_days = vec![Weekday::Sat];
-    listed.disabled = true;
-    let config = config_with_chain(vec![start_walk_profile("work"), listed], "work");
+    listed.profile.preferred_days = vec![Weekday::Sat];
+    listed.profile.disabled = true;
+    let (config, _readings) = config_with_chain(vec![start_walk_profile("work"), listed], "work");
 
     let old = ProfileName::from("old");
     assert!(day_claim_blocker(&config, &old, &HashSet::new()).is_some());
@@ -7433,8 +8846,8 @@ fn every_named_blocker_is_a_state_the_claim_scan_also_refuses() {
 #[test]
 fn an_empty_day_list_leaves_the_flag_in_charge_at_the_chain() {
     let mut flagged = start_walk_profile("p");
-    flagged.preferred = true;
-    let config = config_with_chain(vec![flagged], "p");
+    flagged.profile.preferred = true;
+    let (config, _readings) = config_with_chain(vec![flagged], "p");
     let member = chain_member(
         &config,
         &ProfileName::from("p"),
@@ -7444,9 +8857,49 @@ fn an_empty_day_list_leaves_the_flag_in_charge_at_the_chain() {
     assert!(member.preferred, "no list, so the flag decides");
 }
 
+/// A monthly-only member past the SOFT line gets the monthly start-block label:
+/// `start_block` sets `monthly` from the long window, so `start_block_label`
+/// reads `30d 99%`, never "weekly 99%".
 #[test]
-fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
-    let on_config = config_with_chain(vec![start_walk_profile("p")], "p");
+fn start_block_names_a_monthly_only_members_soft_block() {
+    let (config, _readings) = config_with_chain(vec![start_walk_profile("p")], "p");
+    let member = chain_member(
+        &config,
+        &ProfileName::from("p"),
+        config.state.weekly_switch_threshold_pct(),
+        &HashSet::new(),
+    );
+    let profile = config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+    let usage = monthly_usage(99.0);
+    let block = start_block(
+        &config,
+        &member,
+        profile,
+        Some(&usage),
+        false,
+        false,
+        None,
+        false,
+        &[],
+    );
+    assert_eq!(
+        block,
+        Some(StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        })
+    );
+    assert_eq!(
+        crate::format::start_block_label(&block.expect("a block")),
+        "30d 99%"
+    );
+}
+
+#[test]
+fn start_block_is_none_exactly_when_the_hand_computed_demand_is_clear() {
+    let (on_config, _readings) = config_with_chain(vec![start_walk_profile("p")], "p");
     let on_member = chain_member(
         &on_config,
         &ProfileName::from("p"),
@@ -7458,8 +8911,8 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
         .expect("fixture profile");
 
     let mut off_profile = start_walk_profile("p");
-    off_profile.check_scoped = false;
-    let off_config = config_with_chain(vec![off_profile], "p");
+    off_profile.profile.check_scoped = false;
+    let (off_config, _readings) = config_with_chain(vec![off_profile], "p");
     let off_member = chain_member(
         &off_config,
         &ProfileName::from("p"),
@@ -7470,14 +8923,21 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
         .find(&ProfileName::from("p"))
         .expect("fixture profile");
 
+    let credit_billed = crate::claude_json::credit_billed_families_from(None);
     let check = |config: &AppConfig,
                  member: &ChainMember,
                  profile: &Profile,
                  usage: Option<UsageInfo>,
-                 families: Option<&[String]>| {
+                 families: Option<&[String]>,
+                 credit_blocked: bool| {
+        // The credit rung's expectation is hand-written per row: a KNOWN demand
+        // is blocked iff its families cross a credit-billed family, an UNKNOWN
+        // demand on a capped member is blocked whatever the gate says. Never
+        // recomputed from `start_block`'s own predicate.
         let expected =
             !is_exhausted_from_info(member, usage.as_ref(), member.weekly_line, now_epoch_secs())
-                && start_walk_scoped_clear(member, usage.as_ref(), families);
+                && start_walk_scoped_clear(member, usage.as_ref(), families)
+                && !credit_blocked;
         assert_eq!(
             start_block(
                 config,
@@ -7486,19 +8946,22 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                 usage.as_ref(),
                 false,
                 false,
-                families
+                families,
+                false,
+                &credit_billed,
             )
             .is_none(),
             expected,
-            "usage={usage:?} check_scoped={} families={families:?}",
-            member.check_scoped
+            "usage={usage:?} check_scoped={} check_credit_cap={} families={families:?}",
+            member.check_scoped,
+            member.check_credit_cap
         );
     };
 
     let live = Some(live_reset());
     let lapsed = Some(expired_reset());
 
-    check(&on_config, &on_member, on_profile, None, None);
+    check(&on_config, &on_member, on_profile, None, None, false);
 
     // 5h at the threshold exactly, one below, 100 — each live and lapsed.
     for resets_at in [live.clone(), lapsed.clone()] {
@@ -7513,6 +8976,7 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                     ..Default::default()
                 }),
                 None,
+                false,
             );
         }
     }
@@ -7530,6 +8994,7 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                     ..Default::default()
                 }),
                 None,
+                false,
             );
         }
     }
@@ -7537,16 +9002,23 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
     // A scoped window at the scoped line exactly, over each family/check arm.
     let demanded = ["fable".to_owned()];
     let other = ["opus".to_owned()];
-    for (config, member, profile, families) in [
-        (&on_config, &on_member, on_profile, None),
-        (&off_config, &off_member, off_profile, None),
+    for (config, member, profile, families, credit_blocked) in [
+        (&on_config, &on_member, on_profile, None, false),
+        (&off_config, &off_member, off_profile, None, false),
         (
             &on_config,
             &on_member,
             on_profile,
             Some(demanded.as_slice()),
+            false,
         ),
-        (&on_config, &on_member, on_profile, Some(other.as_slice())),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(other.as_slice()),
+            false,
+        ),
     ] {
         check(
             config,
@@ -7562,8 +9034,140 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                 ..Default::default()
             }),
             families,
+            credit_blocked,
         );
     }
+
+    // A spent usage-credit cap, × credit gate on/off × families None /
+    // ["fable"] / ["opus"] / mixed. Every row's expectation is hand-written:
+    // an unknown demand (None) on a capped member is blocked whatever the gate
+    // says, and a known family is blocked iff it crosses a credit-billed
+    // family. The mixed rows are where `.any` and `.all` disagree, so a
+    // literal bool pins the expectation rather than the code's own expression.
+    let mut cap_off = start_walk_profile("p");
+    cap_off.profile.check_credit_cap = false;
+    let (cap_off_config, _readings) = config_with_chain(vec![cap_off], "p");
+    let cap_off_member = chain_member(
+        &cap_off_config,
+        &ProfileName::from("p"),
+        cap_off_config.state.weekly_switch_threshold_pct(),
+        &HashSet::new(),
+    );
+    let cap_off_profile = cap_off_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let capped = UsageInfo {
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let fable = ["fable".to_owned()];
+    let opus = ["opus".to_owned()];
+    let fable_opus = ["opus".to_owned(), "fable".to_owned()];
+    let opus_sonnet = ["opus".to_owned(), "sonnet".to_owned()];
+    for (config, member, profile, families, credit_blocked) in [
+        (&on_config, &on_member, on_profile, None, true),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            None,
+            true,
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(fable.as_slice()),
+            true,
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(fable.as_slice()),
+            true,
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(opus.as_slice()),
+            false,
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(opus.as_slice()),
+            false,
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(fable_opus.as_slice()),
+            true,
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(fable_opus.as_slice()),
+            true,
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(opus_sonnet.as_slice()),
+            false,
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(opus_sonnet.as_slice()),
+            false,
+        ),
+    ] {
+        check(
+            config,
+            member,
+            profile,
+            Some(capped.clone()),
+            families,
+            credit_blocked,
+        );
+    }
+
+    // A billing-off account carrying a stale full limit is NOT capped: the rung
+    // keys on `credit_capped()`, never a stale percent. A fable demand still
+    // runs there.
+    let stale_full_limit = UsageInfo {
+        spend: Some(SpendInfo {
+            enabled: false,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    check(
+        &on_config,
+        &on_member,
+        on_profile,
+        Some(stale_full_limit),
+        Some(fable.as_slice()),
+        false,
+    );
 }
 
 /// Ruling 2: a third-party member whose api KEY the provider rejected reads
@@ -7588,6 +9192,8 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -7598,7 +9204,17 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
     let fp = crate::usage::profile_credential_fingerprint(profile).unwrap();
     crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fp);
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(
+            &config,
+            &member,
+            profile,
+            None,
+            false,
+            false,
+            None,
+            false,
+            &[]
+        ),
         Some(StartBlock::AuthBroken),
         "a key-rejected third-party member must read as auth-broken"
     );
@@ -7613,23 +9229,24 @@ fn walk_excluded_rejects_a_key_rejected_member_not_a_console_lapse() {
     crate::testutil::register_names(&["zai", "ali"]);
 
     let mut zai = profile_with_util("zai", None, Some(10.0));
-    zai.api_key = Some("k".to_string());
-    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.provider = crate::providers::Provider::from_base_url(zai.base_url.as_deref().unwrap());
-    let zai_fp = crate::usage::profile_credential_fingerprint(&zai).unwrap();
-    crate::profile_cache::write_auth_expired(&zai.name, zai_fp);
+    zai.profile.api_key = Some("k".to_string());
+    zai.profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.profile.provider =
+        crate::providers::Provider::from_base_url(zai.profile.base_url.as_deref().unwrap());
+    let zai_fp = crate::usage::profile_credential_fingerprint(&zai.profile).unwrap();
+    crate::profile_cache::write_auth_expired(&zai.profile.name, zai_fp);
 
     let mut ali = profile_with_util("ali", None, Some(10.0));
-    ali.provider = Some(crate::providers::Provider::Alibaba);
-    ali.console = Some(crate::profile::ConsoleCredential {
+    ali.profile.provider = Some(crate::providers::Provider::Alibaba);
+    ali.profile.console = Some(crate::profile::ConsoleCredential {
         token: "t".to_string(),
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    let ali_fp = crate::usage::profile_credential_fingerprint(&ali).unwrap();
-    crate::profile_cache::write_auth_expired(&ali.name, ali_fp);
+    let ali_fp = crate::usage::profile_credential_fingerprint(&ali.profile).unwrap();
+    crate::profile_cache::write_auth_expired(&ali.profile.name, ali_fp);
 
-    let config = config_with_chain(vec![zai, ali], "zai");
+    let (config, _readings) = config_with_chain(vec![zai, ali], "zai");
     // `walk_excluded` takes the pre-read set; the no-live-set form is the
     // durable verdict, which excludes the key-rejected member and keeps the
     // Alibaba one (its console lapse is usage-only).
@@ -7653,17 +9270,122 @@ fn the_walk_never_picks_a_key_rejected_member() {
     crate::testutil::register_names(&["b"]);
     let a = profile_with_util("a", None, Some(100.0));
     let mut b = profile_with_util("b", None, Some(10.0));
-    b.api_key = Some("k".to_string());
-    b.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    b.provider = crate::providers::Provider::from_base_url(b.base_url.as_deref().unwrap());
-    let fp = crate::usage::profile_credential_fingerprint(&b).unwrap();
-    crate::profile_cache::write_auth_expired(&b.name, fp);
-    let config = config_with_chain(vec![a, b], "a");
+    b.profile.api_key = Some("k".to_string());
+    b.profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    b.profile.provider =
+        crate::providers::Provider::from_base_url(b.profile.base_url.as_deref().unwrap());
+    let fp = crate::usage::profile_credential_fingerprint(&b.profile).unwrap();
+    crate::profile_cache::write_auth_expired(&b.profile.name, fp);
+    let (config, readings) = config_with_chain(vec![a, b], "a");
     let key_rejected = crate::fallback::durable_key_rejected(&config);
     assert_eq!(
-        walk_config(&config, &key_rejected),
+        walk_config(&config, &key_rejected, &readings),
         None,
         "a key-rejected member must never be picked (or projected) as the switch target"
+    );
+}
+
+/// The dead-key record is keyed on the api key alone: re-capturing an Alibaba
+/// console session leaves a dead key rejected, and re-capturing the key
+/// retires it.
+#[test]
+fn a_console_relogin_keeps_a_dead_key_rejected_and_a_key_recapture_retires_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali"]);
+    let console = |token: &str| crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let mut p = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-dead".to_string()),
+    );
+    p.console = Some(console("console-old"));
+    crate::profile::save_profile(&p).expect("save profile");
+    let p = crate::profile::load_profile(&p.name).expect("load profile");
+    assert_eq!(p.provider, Some(crate::providers::Provider::Alibaba));
+    let key = crate::usage::profile_key_fingerprint(&p).expect("a keyed profile");
+    crate::profile_cache::write_dead_key(&p.name, key);
+    assert!(
+        third_party_key_rejected(&p, &p.name),
+        "fixture control: the dead key reads rejected"
+    );
+
+    let mut relogged = p.clone();
+    relogged.console = Some(console("console-new"));
+    crate::profile::save_profile(&relogged).expect("save the console re-login");
+    let relogged = crate::profile::load_profile(&relogged.name).expect("load profile");
+    assert!(
+        third_party_key_rejected(&relogged, &relogged.name),
+        "a console re-login leaves the same dead key rejected"
+    );
+
+    let mut rekeyed = relogged.clone();
+    rekeyed.api_key = Some("sk-new".to_string());
+    crate::profile::save_profile(&rekeyed).expect("save the key re-capture");
+    let rekeyed = crate::profile::load_profile(&rekeyed.name).expect("load profile");
+    assert!(
+        !third_party_key_rejected(&rekeyed, &rekeyed.name),
+        "a re-captured key retires the dead-key record"
+    );
+}
+
+/// A usage-credential record written before the dead-key record existed is the
+/// provider's refusal of the key on a console-less non-Alibaba profile (its
+/// usage fetch sends the key), so it seeds the dead-key record, which then
+/// outlives an endpoint edit that leaves the key alone. On Alibaba the same
+/// record names the console, never the key, so it seeds nothing.
+#[test]
+fn a_usage_verdict_from_before_the_dead_key_record_seeds_it_on_a_key_provider_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["gen", "ali"]);
+    let generic = Profile::new(
+        "gen".to_string(),
+        Some("https://llm.example.com".to_string()),
+        Some("sk-gen".to_string()),
+    );
+    crate::profile::save_profile(&generic).expect("save generic");
+    let fp = crate::usage::profile_credential_fingerprint(&generic).expect("credentialed");
+    crate::profile_cache::write_auth_expired(&generic.name, fp);
+    let record = crate::profile_cache::profile_cache_path(
+        &generic.name,
+        crate::profile_cache::DEAD_KEY_FILE,
+    )
+    .expect("record path");
+    assert!(!record.exists(), "fixture control: no dead-key record yet");
+    assert!(
+        third_party_key_rejected(&generic, &generic.name),
+        "the earlier record reads as a dead key"
+    );
+    assert!(
+        record.exists(),
+        "the earlier record seeds the dead-key record"
+    );
+    let mut moved = generic.clone();
+    moved.base_url = Some("https://llm2.example.com".to_string());
+    assert!(
+        third_party_key_rejected(&moved, &moved.name),
+        "the seeded record is keyed on the key alone, so an endpoint edit keeps it"
+    );
+
+    let mut ali = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali".to_string()),
+    );
+    ali.console = Some(crate::profile::ConsoleCredential {
+        token: "t".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&ali).expect("save alibaba");
+    let ali_fp = crate::usage::profile_credential_fingerprint(&ali).expect("credentialed");
+    crate::profile_cache::write_auth_expired(&ali.name, ali_fp);
+    assert!(
+        !third_party_key_rejected(&ali, &ali.name),
+        "an Alibaba usage record names the console, never the key"
     );
 }
 
@@ -7675,14 +9397,14 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ali"]);
     let mut ali = profile_with_util("ali", None, None);
-    ali.provider = Some(crate::providers::Provider::Alibaba);
-    ali.console = Some(crate::profile::ConsoleCredential {
+    ali.profile.provider = Some(crate::providers::Provider::Alibaba);
+    ali.profile.console = Some(crate::profile::ConsoleCredential {
         token: "t".to_string(),
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    let fp = crate::usage::profile_credential_fingerprint(&ali).unwrap();
-    crate::profile_cache::write_auth_expired(&ali.name, fp);
+    let fp = crate::usage::profile_credential_fingerprint(&ali.profile).unwrap();
+    crate::profile_cache::write_auth_expired(&ali.profile.name, fp);
     let member = ChainMember {
         oauth: true,
         name: "ali".into(),
@@ -7693,14 +9415,26 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let config = AppConfig {
         state: AppState::default(),
-        profiles: vec![ali],
+        profiles: vec![ali.profile],
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(
+            &config,
+            &member,
+            profile,
+            None,
+            false,
+            false,
+            None,
+            false,
+            &[]
+        ),
         None,
         "a console-lapsed Alibaba member stays pickable by the start walk"
     );
@@ -7714,10 +9448,11 @@ fn walk_blocker_reports_a_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["zai"]);
     let mut zai = profile_with_util("zai", None, Some(10.0));
-    zai.api_key = Some("k".to_string());
-    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.provider = crate::providers::Provider::from_base_url(zai.base_url.as_deref().unwrap());
-    let config = config_with_chain(vec![zai], "zai");
+    zai.profile.api_key = Some("k".to_string());
+    zai.profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.profile.provider =
+        crate::providers::Provider::from_base_url(zai.profile.base_url.as_deref().unwrap());
+    let (config, _readings) = config_with_chain(vec![zai], "zai");
     let key_rejected = HashSet::from([ProfileName::from("zai")]);
     assert_eq!(
         walk_blocker(&config, &ProfileName::from("zai"), &key_rejected).as_deref(),
@@ -7734,16 +9469,55 @@ fn health_blocked_reason_reports_a_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["zai"]);
     let mut zai = profile_with_util("zai", None, Some(10.0));
-    zai.api_key = Some("k".to_string());
-    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.provider = crate::providers::Provider::from_base_url(zai.base_url.as_deref().unwrap());
-    let config = config_with_chain(vec![zai], "zai");
+    zai.profile.api_key = Some("k".to_string());
+    zai.profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.profile.provider =
+        crate::providers::Provider::from_base_url(zai.profile.base_url.as_deref().unwrap());
+    let (config, readings) = config_with_chain(vec![zai], "zai");
     let profile = config.find(&ProfileName::from("zai")).unwrap();
     let key_rejected = HashSet::from([ProfileName::from("zai")]);
     assert_eq!(
-        health_blocked_reason(&config, profile, None, &key_rejected),
+        health_blocked_reason(
+            &config,
+            profile,
+            None,
+            &key_rejected,
+            readings.usage.get(profile.name.as_str()),
+            None,
+            false
+        ),
         Some(BlockedReason::KeyRejected),
         "a key-rejected member's chip must carry the KeyRejected rung"
+    );
+}
+
+/// A pairless account whose setup token the probe refused sits in the same
+/// dead-login set as a rejected key, and its chip and day-list reason name the
+/// token, whose fix is a re-mint.
+#[test]
+fn a_refused_setup_token_is_its_own_dead_login_rung() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["minted"]);
+    let mut minted = with_long_lived_sidecar(profile_with_util("minted", None, Some(10.0)));
+    minted.profile.usage_probe = true;
+    let (config, readings) = config_with_chain(vec![minted], "minted");
+    let profile = config.find(&ProfileName::from("minted")).unwrap();
+    let key_rejected = HashSet::from([ProfileName::from("minted")]);
+    assert_eq!(
+        health_blocked_reason(
+            &config,
+            profile,
+            None,
+            &key_rejected,
+            readings.usage.get(profile.name.as_str()),
+            None,
+            true
+        ),
+        Some(BlockedReason::TokenRejected)
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("minted"), &key_rejected).as_deref(),
+        Some("its setup token was rejected")
     );
 }
 
@@ -7757,12 +9531,13 @@ fn a_key_rejected_members_day_list_claims_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["zai"]);
     let mut zai = profile_with_util("zai", None, Some(10.0));
-    zai.api_key = Some("k".to_string());
-    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.provider = crate::providers::Provider::from_base_url(zai.base_url.as_deref().unwrap());
-    zai.preferred = true;
-    zai.preferred_days = vec![Weekday::Sat];
-    let config = config_with_chain(vec![zai], "zai");
+    zai.profile.api_key = Some("k".to_string());
+    zai.profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    zai.profile.provider =
+        crate::providers::Provider::from_base_url(zai.profile.base_url.as_deref().unwrap());
+    zai.profile.preferred = true;
+    zai.profile.preferred_days = vec![Weekday::Sat];
+    let (config, _readings) = config_with_chain(vec![zai], "zai");
     let key_rejected = HashSet::from([ProfileName::from("zai")]);
     assert!(
         !config.is_home_on(&ProfileName::from("zai"), Weekday::Sat, &key_rejected),
@@ -7785,13 +9560,13 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ali"]);
     let mut ali = profile_with_util("ali", None, None);
-    ali.provider = Some(crate::providers::Provider::Alibaba);
-    ali.console = None;
+    ali.profile.provider = Some(crate::providers::Provider::Alibaba);
+    ali.profile.console = None;
     // Alibaba's fetch writes the durable `AuthExpired` verdict for a missing
     // console session (usage-only).
-    let fp = crate::usage::profile_credential_fingerprint(&ali).unwrap();
-    crate::profile_cache::write_auth_expired(&ali.name, fp);
-    let config = config_with_chain(vec![ali], "ali");
+    let fp = crate::usage::profile_credential_fingerprint(&ali.profile).unwrap();
+    crate::profile_cache::write_auth_expired(&ali.profile.name, fp);
+    let (config, _readings) = config_with_chain(vec![ali], "ali");
 
     assert!(
         crate::fallback::durable_key_rejected(&config).is_empty(),
@@ -7815,10 +9590,22 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(
+            &config,
+            &member,
+            profile,
+            None,
+            false,
+            false,
+            None,
+            false,
+            &[]
+        ),
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
     );
@@ -7831,7 +9618,7 @@ fn round1_duplicate_blocker_names_an_active_profile_outside_the_chain() {
     for name in ["outside", "candidate"] {
         crate::usage::seed_login_anchor(&name.into(), Some(&"shared-uuid".into()));
     }
-    let mut config = config_with_chain(
+    let (mut config, _readings) = config_with_chain(
         vec![
             profile_with_util("outside", Some(10.0), Some(10.0)),
             profile_with_util("candidate", Some(10.0), Some(10.0)),
@@ -7854,7 +9641,7 @@ fn round1_duplicate_blocker_names_an_active_profile_outside_the_chain() {
 fn round1_unverified_installs_block_walks_in_both_directions_until_proven() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["first", "second"]);
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             profile_with_util("first", Some(90.0), Some(10.0)),
             profile_with_util("second", Some(10.0), Some(10.0)),
@@ -7869,7 +9656,8 @@ fn round1_unverified_installs_block_walks_in_both_directions_until_proven() {
         assert!(candidate_excluded(
             &config,
             &"second".into(),
-            &HashSet::new()
+            &HashSet::new(),
+            false
         ));
         assert!(
             walk_blocker(&config, &"second".into(), &HashSet::new())
@@ -7881,7 +9669,10 @@ fn round1_unverified_installs_block_walks_in_both_directions_until_proven() {
                 &config,
                 config.find(&"second".into()).unwrap(),
                 None,
-                &HashSet::new()
+                &HashSet::new(),
+                None,
+                None,
+                false,
             ),
             Some(BlockedReason::IdentityUnverified { .. })
         ));
@@ -7899,12 +9690,13 @@ fn round1_unverified_installs_block_walks_in_both_directions_until_proven() {
         assert!(!candidate_excluded(
             &config,
             &"second".into(),
-            &HashSet::new()
+            &HashSet::new(),
+            false
         ));
     }
     crate::usage::seed_login_anchor(&"second".into(), Some(&"uuid-a".into()));
     assert!(
-        candidate_excluded(&config, &"second".into(), &HashSet::new()),
+        candidate_excluded(&config, &"second".into(), &HashSet::new(), false),
         "a proven duplicate remains excluded"
     );
 }
@@ -7914,8 +9706,8 @@ fn round1_an_unverified_endpoint_profile_does_not_block_an_oauth_walk() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["endpoint", "oauth"]);
     let mut endpoint = profile_with_util("endpoint", Some(90.0), Some(10.0));
-    endpoint.base_url = Some("https://proxy.example.test".into());
-    let config = config_with_chain(
+    endpoint.profile.base_url = Some("https://proxy.example.test".into());
+    let (config, _readings) = config_with_chain(
         vec![endpoint, profile_with_util("oauth", Some(10.0), Some(10.0))],
         "endpoint",
     );
@@ -7923,7 +9715,8 @@ fn round1_an_unverified_endpoint_profile_does_not_block_an_oauth_walk() {
     assert!(!candidate_excluded(
         &config,
         &"oauth".into(),
-        &HashSet::new()
+        &HashSet::new(),
+        false
     ));
 }
 
@@ -7931,7 +9724,7 @@ fn round1_an_unverified_endpoint_profile_does_not_block_an_oauth_walk() {
 #[test]
 fn home_walk_reset_jitter_never_relinks_and_sort_keeps_chain_position() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut config = walk_order_config();
+    let (mut config, _readings) = walk_order_config();
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
     snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
@@ -7970,7 +9763,7 @@ fn home_walk_reset_jitter_never_relinks_and_sort_keeps_chain_position() {
 #[test]
 fn home_walk_two_hour_gain_switches_once_then_parks_and_honours_cooldown() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut config = walk_order_config();
+    let (mut config, _readings) = walk_order_config();
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
     snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
@@ -7995,6 +9788,8 @@ fn home_walk_two_hour_gain_switches_once_then_parks_and_honours_cooldown() {
         &usage,
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
     .unwrap();
     assert_eq!(decision.action, SwitchAction::To("beta".into()));
@@ -8022,10 +9817,12 @@ fn home_walk_two_hour_gain_switches_once_then_parks_and_honours_cooldown() {
         &usage,
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
     .unwrap();
     assert_eq!(decision.action, SwitchAction::To("beta".into()));
-    assert_eq!(decision.reason, "5h at 96% ≥ threshold 95%");
+    assert_eq!(decision.reason, "5h at 96% >= threshold 95%");
     assert!(!decision.proactive);
     // The gain knob is independent of exhaustion.
     snap.walk_min_gain_secs = 3 * 3600;
@@ -8048,7 +9845,7 @@ fn home_walk_two_hour_gain_switches_once_then_parks_and_honours_cooldown() {
 fn most_headroom_tolerates_usage_jitter_and_ignores_non_oauth_ranking() {
     let _home = crate::testutil::HomeSandbox::new();
     for (a, b) in [(20.0, 20.2), (20.3, 19.9), (19.8, 20.1)] {
-        let mut config = headroom_config(weekly_read(10.0, a), weekly_read(10.0, b));
+        let (mut config, _readings) = headroom_config(weekly_read(10.0, a), weekly_read(10.0, b));
         config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
         let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
         snap.last_switch_at = Some(now_epoch_secs().max(0) as u64);
@@ -8067,19 +9864,15 @@ fn most_headroom_tolerates_usage_jitter_and_ignores_non_oauth_ranking() {
         snap.last_switch_at = None;
         assert_eq!(next_auto_switch_target_for_test(&snap, &usage), None);
     }
-    let mut config = headroom_config(weekly_read(10.0, 0.0), weekly_read(10.0, 80.0));
+    let (mut config, readings) = headroom_config(weekly_read(10.0, 0.0), weekly_read(10.0, 80.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     config.profiles[0].base_url = Some("https://example.invalid".into());
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new(), &readings),
         Some(SwitchAction::To("beta".into()))
     );
     let snap = snapshot_chain(&config, &HashSet::new()).unwrap();
-    let usage = config
-        .profiles
-        .iter()
-        .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
-        .collect();
+    let usage = readings.usage.clone();
     assert_eq!(
         next_auto_switch_target_for_test(&snap, &usage),
         Some(SwitchAction::To("beta".into()))
@@ -8089,7 +9882,7 @@ fn most_headroom_tolerates_usage_jitter_and_ignores_non_oauth_ranking() {
 #[test]
 fn switch_reason_reports_exhaustion_when_an_ambient_key_rejection_was_not_needed() {
     let _home = crate::testutil::HomeSandbox::new();
-    let config = walk_order_config();
+    let (config, _readings) = walk_order_config();
     let mut without = snapshot_chain(&config, &HashSet::new()).unwrap();
     without.active = "alpha".into();
     without.fresh = without.chain.iter().map(|m| m.name.clone()).collect();
@@ -8115,17 +9908,19 @@ fn switch_reason_reports_exhaustion_when_an_ambient_key_rejection_was_not_needed
         &usage,
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
     .unwrap();
     assert!(!decision.key_rejection_necessary);
     assert!(!decision.proactive);
-    assert_eq!(decision.reason, "5h at 96% ≥ threshold 95%");
+    assert_eq!(decision.reason, "5h at 96% >= threshold 95%");
 }
 
 #[test]
 fn zero_gain_and_cooldown_do_not_reopen_reset_jitter_ping_pong() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut config = walk_order_config();
+    let (mut config, _readings) = walk_order_config();
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     config.state.walk_min_gain_mins = Some(0);
     config.state.walk_cooldown_mins = Some(0);
@@ -8165,7 +9960,7 @@ fn zero_gain_and_cooldown_do_not_reopen_reset_jitter_ping_pong() {
 #[test]
 fn a_future_switch_timestamp_does_not_extend_the_home_cooldown() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut config = walk_order_config();
+    let (mut config, _readings) = walk_order_config();
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     let mut snapshot = snapshot_chain(&config, &HashSet::new()).unwrap();
     snapshot.active = "alpha".into();
@@ -8217,7 +10012,7 @@ fn anchored_reset_bands_stay_stable_for_three_members_fifty_seconds_apart() {
 #[test]
 fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
     let _home = crate::testutil::HomeSandbox::new();
-    let config = walk_order_config();
+    let (config, _readings) = walk_order_config();
     let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
     snap.active = "alpha".into();
     snap.fresh = snap.chain.iter().map(|m| m.name.clone()).collect();
@@ -8256,9 +10051,10 @@ fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
         ),
     ]);
     let reading = UsageReading::new(usage.clone(), now * 1000);
-    let decision = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    let decision =
+        next_auto_switch_decision_with_reading(&snap, &snap, &reading, false, false).unwrap();
     assert_eq!(decision.action, SwitchAction::To("beta".into()));
-    assert_eq!(decision.reason, "5h at 97% ≥ threshold 95%");
+    assert_eq!(decision.reason, "5h at 97% >= threshold 95%");
     assert!(!decision.proactive);
     // A new reading at the boundary has reset; the old decision remains a
     // non-proactive exhaustion decision even though today's wall clock is later.
@@ -8266,7 +10062,9 @@ fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
         next_auto_switch_decision_with_reading(
             &snap,
             &snap,
-            &UsageReading::new(usage, (now + 1) * 1000)
+            &UsageReading::new(usage, (now + 1) * 1000),
+            false,
+            false,
         )
         .is_none()
     );
@@ -8275,7 +10073,7 @@ fn an_exhaustion_decision_keeps_its_trigger_at_the_frozen_reset_boundary() {
 #[test]
 fn burn_decisions_reuse_the_frozen_rate_after_history_changes() {
     let _home = crate::testutil::HomeSandbox::new();
-    let config = walk_order_config();
+    let (config, _readings) = walk_order_config();
     let mut snap = snapshot_chain(&config, &HashSet::new()).unwrap();
     snap.active = "alpha".into();
     snap.burn_aware = true;
@@ -8302,7 +10100,8 @@ fn burn_decisions_reuse_the_frozen_rate_after_history_changes() {
         ("gamma".into(), sample(10.0)),
     ]);
     let reading = UsageReading::new(usage.clone(), now);
-    let before = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    let before =
+        next_auto_switch_decision_with_reading(&snap, &snap, &reading, false, false).unwrap();
     assert_eq!(before.action, SwitchAction::To("beta".into()));
     assert!(!before.proactive);
     assert!(
@@ -8311,24 +10110,31 @@ fn burn_decisions_reuse_the_frozen_rate_after_history_changes() {
         before.reason
     );
     write_history("alpha", &[]);
-    let after = next_auto_switch_decision_with_reading(&snap, &snap, &reading).unwrap();
+    let after =
+        next_auto_switch_decision_with_reading(&snap, &snap, &reading, false, false).unwrap();
     assert_eq!(
         before, after,
         "counterfactual and reason must reuse the captured rate"
     );
     assert!(
-        next_auto_switch_decision_with_reading(&snap, &snap, &UsageReading::new(usage, now))
-            .is_none()
+        next_auto_switch_decision_with_reading(
+            &snap,
+            &snap,
+            &UsageReading::new(usage, now),
+            false,
+            false,
+        )
+        .is_none()
     );
 }
 
 /// A hybrid (an OAuth pair behind a `base_url` + key) for the picker tests: its
 /// figures live in the third-party store per `usage_cache_is_third_party`.
-fn hybrid_profile(name: &str, threshold: Option<f64>) -> Profile {
-    let mut p = profile_with_util(name, threshold, None);
-    p.base_url = Some("https://example.com".to_string());
-    p.api_key = Some("key".to_string());
-    p.credentials = Some(crate::profile::ClaudeCredentials {
+fn hybrid_profile(name: &str, threshold: Option<f64>) -> Fixture {
+    let mut f = profile_with_util(name, threshold, None);
+    f.profile.base_url = Some("https://example.com".to_string());
+    f.profile.api_key = Some("key".to_string());
+    f.profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
             refresh_token: Some("rt".into()),
@@ -8338,7 +10144,7 @@ fn hybrid_profile(name: &str, threshold: Option<f64>) -> Profile {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    p
+    f
 }
 
 /// A third-party store entry whose provider publishes one live 5h bar at `pct`.
@@ -8353,6 +10159,7 @@ fn tp_stats(pct: f64) -> crate::providers::ThirdPartyStats {
             resets_at: Some(live_reset()),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -8381,7 +10188,13 @@ fn the_picker_reads_a_hybrids_provider_windows_over_its_oauth_reading() {
     ];
     let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("hybrid")]);
 
-    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    let usage = usage_snapshot_for_chain(
+        &store,
+        &tp_store,
+        &third_party_names,
+        &third_party_names,
+        &members,
+    );
     assert_eq!(
         usage
             .get("hybrid")
@@ -8414,7 +10227,13 @@ fn the_picker_reads_a_pure_third_party_members_provider_windows() {
     let members = vec![headroom_member("tp", false)];
     let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("tp")]);
 
-    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    let usage = usage_snapshot_for_chain(
+        &store,
+        &tp_store,
+        &third_party_names,
+        &third_party_names,
+        &members,
+    );
     assert_eq!(
         usage
             .get("tp")
@@ -8439,7 +10258,13 @@ fn the_picker_removes_a_member_whose_provider_stopped_publishing() {
     let members = vec![headroom_member("tp", false)];
     let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("tp")]);
 
-    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    let usage = usage_snapshot_for_chain(
+        &store,
+        &tp_store,
+        &third_party_names,
+        &third_party_names,
+        &members,
+    );
     assert!(
         !usage.contains_key("tp"),
         "a provider that stopped publishing windows has no walk entry"
@@ -8453,7 +10278,7 @@ fn the_picker_removes_a_member_whose_provider_stopped_publishing() {
 fn a_hybrid_active_walks_on_its_provider_windows() {
     use crate::usage::ThirdPartyUsageStore;
 
-    let config = config_with_chain(
+    let (config, _readings) = config_with_chain(
         vec![
             hybrid_profile("a", Some(95.0)),
             profile_with_util("b", Some(95.0), Some(10.0)),
@@ -8468,17 +10293,126 @@ fn a_hybrid_active_walks_on_its_provider_windows() {
     )])));
     let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("a")]);
 
-    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &snap.chain);
+    let usage = usage_snapshot_for_chain(
+        &store,
+        &tp_store,
+        &third_party_names,
+        &third_party_names,
+        &snap.chain,
+    );
     assert_eq!(
         next_auto_switch_target_with_usage(
             &snap,
             &usage,
             &third_party_names,
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "a hybrid active with provider headroom must not switch on its stale OAuth reading"
     );
+}
+
+/// A third-party store entry whose provider publishes one live `30d` bar at
+/// `pct`: the shape Alibaba's Qwen Cloud Token Plan reads as (a monthly quota,
+/// no 5h or 7d window), the bar marked as the account's inference quota the way
+/// the Alibaba arm writes it to the cache.
+fn tp_monthly_stats(pct: f64) -> crate::providers::ThirdPartyStats {
+    let mut v = serde_json::to_value(tp_stats(pct)).unwrap();
+    v["bars"][0]["label"] = "30d".into();
+    v["bars"][0]["inference_quota"] = true.into();
+    serde_json::from_value(v).unwrap()
+}
+
+/// A monthly-only member's monthly quota meets the weekly line (98 by default)
+/// when it has no 7d window: past the line the active walks off, under it it
+/// stays. The OAuth arm is the control: the same 99% on a 7d window walks off
+/// today, so the third-party arm differs only in the window's label.
+#[test]
+fn a_monthly_only_active_walks_off_past_the_weekly_line() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    // Control: an OAuth active whose 7d window sits past the weekly line.
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let weekly_spent = UsageInfo {
+        five_hour: Some(window(10.0, Some(live_reset()))),
+        seven_day: Some(window(99.0, Some(live_reset()))),
+        ..UsageInfo::default()
+    };
+    let usage: HashMap<String, UsageInfo> = HashMap::from([
+        ("a".to_string(), weekly_spent),
+        (
+            "b".to_string(),
+            usage_info(Some(window(10.0, Some(live_reset())))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+            false,
+            false,
+        ),
+        Some(SwitchAction::To("b".to_string())),
+        "control: a 7d window past the weekly line walks the active off"
+    );
+
+    for (pct, expected, why) in [
+        (
+            99.0,
+            Some(SwitchAction::To("b".to_string())),
+            "a monthly quota past the weekly line walks the active off",
+        ),
+        (
+            50.0,
+            None,
+            "a monthly quota under the weekly line keeps the active",
+        ),
+    ] {
+        let mut a = profile_with_util("a", Some(95.0), None);
+        a.profile.base_url =
+            Some("https://token-plan.maas.qwencloudapi.com/apps/anthropic".to_string());
+        a.profile.api_key = Some("key".to_string());
+        let (config, _readings) =
+            config_with_chain(vec![a, profile_with_util("b", Some(95.0), Some(10.0))], "a");
+        let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+        let store = store_with_utils(&[("b", 10.0)]);
+        let tp_store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            tp_monthly_stats(pct),
+        )])));
+        let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("a")]);
+
+        let usage = usage_snapshot_for_chain(
+            &store,
+            &tp_store,
+            &third_party_names,
+            &third_party_names,
+            &snap.chain,
+        );
+        assert_eq!(
+            next_auto_switch_target_with_usage(
+                &snap,
+                &usage,
+                &third_party_names,
+                ActiveBurnRate::FromDisk,
+                false,
+                false,
+            ),
+            expected,
+            "{why} (monthly at {pct}%)"
+        );
+    }
 }
 
 /// A hybrid active under burn-aware switching never pairs
@@ -8497,8 +10431,9 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
-
         oauth: true,
+        check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "gamma".into(),
@@ -8513,12 +10448,15 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
-
         walk_min_gain_secs: 3600,
         walk_cooldown_secs: 1800,
         last_switch_at: None,
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     };
     // The OAuth leg's burn history: 32 → 92 over 6 minutes = 600 %/h.
     let now = crate::usage::now_ms();
@@ -8558,8 +10496,1451 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
             &usage,
             &third_party_names,
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "a hybrid's provider window never pairs its OAuth burn history"
+    );
+}
+
+// ── the `credit gate` (`Profile::check_credit_cap`, #93) ─────────────────────
+//
+// A member whose usage-credit cap is spent refuses credit-billed models only,
+// so the global walk (which knows no model) keeps it out of the TARGET passes
+// while its gate is on; it never moves an account off the chain by itself.
+
+/// Every window clear, the usage-credit cap spent (billing on, used == limit).
+fn usage_credit_capped() -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(0.0, Some(live_reset()))),
+        seven_day: Some(window(10.0, Some(week_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: None,
+        }),
+        ..UsageInfo::default()
+    }
+}
+
+#[test]
+fn auto_switch_skips_a_credit_capped_member_while_its_gate_is_on() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+        ("c", usage_with_scoped(10.0, 18.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "the capped member is passed over for the next clear one"
+    );
+
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+        ("c", usage_info(Some(window(100.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a capped member is never the target while its gate is on"
+    );
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its spent cap keeps it out of no pass, gate on.
+#[test]
+fn auto_switch_takes_a_credit_capped_member_on_its_own_endpoint() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let b = &mut config.profiles[1];
+    assert!(b.check_credit_cap, "fixture control: the gate is on");
+    b.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    b.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    assert!(
+        crate::claude::has_own_inference_endpoint(b),
+        "fixture control: b serves from its own endpoint"
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// A credit-demand leave reads a target's cap off the RAW verdict (its gate
+/// ignored), but an own-endpoint member never spends OAuth credits: it is clear
+/// even while its cached cap reads spent, so the leave lands on it.
+#[test]
+fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
+    let member = |name: &str, own_inference: bool| ChainMember {
+        name: name.into(),
+        oauth: true,
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference,
+    };
+    let snap = ChainSnapshot {
+        walk_min_gain_secs: 3600,
+        walk_cooldown_secs: 1800,
+        last_switch_at: None,
+        active: "a".into(),
+        chain: vec![member("a", false), member("b", true)],
+        switch_off_when_spent: false,
+        broken: vec![],
+        burn_aware: false,
+        walk_order: WalkOrder::Chain,
+        interval_ms: 60_000,
+        burn_floor_pct: 98.0,
+        burn_horizon_cap_ms: 60_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        skipped_unreadable: vec![],
+        reading_dead: vec![],
+        fresh: vec![],
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
+    };
+    let usage = HashMap::from([
+        ("a".to_string(), usage_credit_capped()),
+        ("b".to_string(), usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+            true,
+            true,
+        ),
+        Some(SwitchAction::To("b".to_string())),
+        "a capped own-endpoint member is a valid credit-leave target"
+    );
+}
+
+/// Recovery (switch-off-all) reads a target's cap off the raw verdict in its
+/// scoped-clear pass: an own-endpoint member's spent OAuth cap does not block
+/// it, so it wins that pass over a plain capped member the pass skips. The
+/// aggregate fallback picks the FIRST member, so the two-pick fixture is what
+/// pins the own-endpoint exemption rather than the fallback.
+#[test]
+fn a_capped_own_endpoint_member_recovers() {
+    let member = |name: &str, own_inference: bool| ChainMember {
+        name: name.into(),
+        oauth: true,
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference,
+    };
+    let chain = vec![member("a", false), member("b", true)];
+    let store = store_with_infos(vec![
+        ("a", usage_credit_capped()),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "the own-endpoint member recovers in the scoped-clear pass; the plain capped one does not"
+    );
+}
+
+#[test]
+fn auto_switch_takes_a_credit_capped_member_once_its_gate_is_off() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_credit_cap = false;
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn a_credit_capped_active_with_headroom_never_switches_away_by_itself() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_credit_capped()),
+        ("b", usage_with_scoped(10.0, 18.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn a_billing_off_stale_limit_never_trips_the_credit_gate() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let mut stale = usage_credit_capped();
+    if let Some(s) = stale.spend.as_mut() {
+        s.enabled = false;
+    }
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", stale),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// Recovery mirrors the scoped gate (cloudy, 2026-10-19): an uncapped
+/// recovered member is relinked first, and a capped one only when it is the
+/// only member recovered (relinking beats leaving every session signed out).
+#[test]
+fn find_recovered_prefers_a_member_whose_credit_cap_is_not_spent() {
+    let member = |name: &str| ChainMember {
+        name: name.into(),
+        oauth: true,
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
+    };
+    let chain = vec![member("b"), member("c")];
+    let store = store_with_infos(vec![
+        ("b", usage_credit_capped()),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("c".to_string()),
+        "recovery relinks the uncapped member first"
+    );
+    let store = store_with_infos(vec![("b", usage_credit_capped())]);
+    assert_eq!(
+        find_recovered_member_for_test(&[member("b")], &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "with only the capped member recovered, it is still taken"
+    );
+}
+
+/// The pay-as-you-go pass never lands on a member `credit_capped()` calls
+/// spent, even when its `spend` block alone still shows room.
+#[test]
+fn the_spend_pass_never_lands_on_a_credit_capped_member() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 10.0, 1.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let mut b = usage_spent_with_spend(spend_block(true, 1.0, Some(50.0)));
+    b.extra_usage = Some(crate::usage::ExtraUsage {
+        is_enabled: true,
+        utilization: Some(100.0),
+        ..Default::default()
+    });
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", b.clone()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "an extra_usage-capped member is no spend target"
+    );
+
+    // Control: the same member with its extra_usage block under the cap IS
+    // the spend pass's target, so the assertion above binds the cap.
+    b.extra_usage = Some(crate::usage::ExtraUsage {
+        is_enabled: true,
+        utilization: Some(12.0),
+        ..Default::default()
+    });
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", b),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// Codex has no spend reading (`wham/usage`), so no codex member arms the
+/// credit gate.
+#[test]
+fn codex_members_never_arm_the_credit_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.chain.iter().all(|m| !m.check_credit_cap));
+}
+
+/// A member that answered a session with a credit-required 429 is spent for a
+/// credit demand whatever its reading says: the home pass leaves it alone while
+/// its reading, no cap figures in it, reads clear. Without a credit demand the
+/// refusal keeps it out of nothing.
+#[test]
+fn a_member_that_refused_credit_is_spent_only_for_a_credit_demand() {
+    let mut home = profile_with_util("a", Some(95.0), Some(10.0));
+    home.profile.preferred = true;
+    let (config, _readings) = config_with_chain(
+        vec![home, profile_with_util("b", Some(95.0), Some(10.0))],
+        "b",
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec!["a".into(), "b".into()];
+    snap.credit_refused = vec!["a".into()];
+    let usage = usage_snapshot(&store_with_utils(&[("a", 10.0), ("b", 10.0)]));
+    let walk = |credit_demand| {
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+            false,
+            credit_demand,
+        )
+    };
+    assert_eq!(
+        walk(true),
+        None,
+        "the refusal keeps a credit demand off its home"
+    );
+    assert_eq!(
+        walk(false),
+        Some(SwitchAction::To("a".to_string())),
+        "without a demand the home pass brings the account back"
+    );
+}
+
+// ── members tollgate cannot measure (#110) ────────────────────────────────────
+// A member whose sessions run on a long-lived `claude setup-token` mint with no
+// OAuth pair beside it has no usage source: `/usage` needs that pair's scope.
+// The Fallback marker names it; the walk is left exactly as it was.
+
+/// `f` with an OAuth login, the one subscription shape `/usage` can poll.
+/// A fixture marker in the `mark_fresh` family: the login sits on the profile
+/// half, so it composes with the reading the fixture carries beside it.
+fn with_oauth_login(mut f: Fixture) -> Fixture {
+    f.profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    f
+}
+
+/// The predicate is a conjunction of the profile shape and the sidecar fact the
+/// caller holds, so every shape is asked BOTH ways: a session token with no
+/// OAuth pair IS this marker, and a member holding no login at all is NOT (it
+/// serves nothing, and carries its own logged-out state).
+#[test]
+fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
+    // The predicate reads the profile alone (no reading, no store), so each
+    // shape is taken off its fixture's profile half.
+    let bare = |n: &str| no_login(profile_with_usage(n, None, None)).profile;
+    assert!(
+        no_usage_source(&bare("st"), true),
+        "a long-lived token with no pair: the setup-token shape, nothing to poll"
+    );
+    assert!(
+        !no_usage_source(&bare("out"), false),
+        "no login at all is not this marker: nothing serves from it either"
+    );
+    let mut empty = bare("e");
+    empty.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: None,
+    });
+    assert!(
+        no_usage_source(&empty, true),
+        "a credentials record without an OAuth login polls nothing either"
+    );
+    assert!(
+        !no_usage_source(
+            &with_oauth_login(profile_with_usage("o", None, None)).profile,
+            true
+        ),
+        "the pair is what `/usage` polls, sidecar beside it or not"
+    );
+    let mut direct_key = bare("k");
+    direct_key.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&direct_key, true),
+        "an api key without an endpoint is still an api-key account"
+    );
+    let mut endpoint = bare("p");
+    endpoint.base_url = Some("https://api.example.test".into());
+    endpoint.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&endpoint, true),
+        "a provider endpoint answers through its own leg"
+    );
+    let mut keyless = bare("c");
+    keyless.base_url = Some("https://api.example.test".into());
+    assert!(
+        !no_usage_source(&keyless, true),
+        "an endpoint without a key (a console-only Alibaba member) is no subscription"
+    );
+    // The `[env] ANTHROPIC_BASE_URL` half `is_oauth` cannot see: such a member
+    // routes its requests to another pool, so the login this marker asks for
+    // would feed the walk windows that pool never spends.
+    let mut env_routed = bare("env");
+    env_routed.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.example.test".to_string(),
+    );
+    assert!(
+        !no_usage_source(&env_routed, true),
+        "an env-routed member is measured where its requests go, not here"
+    );
+    let mut blank_env = bare("blank");
+    blank_env
+        .env
+        .insert("ANTHROPIC_BASE_URL".to_string(), "   ".to_string());
+    assert!(
+        no_usage_source(&blank_env, true),
+        "an entry blank once trimmed is no override, as `routing_endpoint` reads it"
+    );
+    // The key half reads `claude::has_inference_auth` and not `api_key`, in
+    // both directions. A key can ride the profile's own `[env]`, where the
+    // managed field is None: such a member authenticates its own inference, so
+    // it is no more measurable here than one with the managed field set, and
+    // marking it would ask it for a login it does not need.
+    let mut env_key = bare("ek");
+    env_key
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string());
+    assert!(
+        !no_usage_source(&env_key, true),
+        "an env-carried api key is inference auth of its own, like the managed field"
+    );
+    let mut env_auth = bare("ea");
+    env_auth
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-test".to_string());
+    assert!(
+        !no_usage_source(&env_auth, true),
+        "the auth-token entry is the other half of the same test"
+    );
+    // And the other direction: a key blank once trimmed authenticates nothing,
+    // so it must not HIDE the marker on a member whose sessions really do run on
+    // the sidecar alone.
+    let mut blank_key = bare("bk");
+    blank_key.api_key = Some("   ".into());
+    assert!(
+        no_usage_source(&blank_key, true),
+        "a managed key blank once trimmed is no credential, and must not hide the marker"
+    );
+    let mut blank_env_key = bare("bek");
+    blank_env_key
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "  ".to_string());
+    assert!(
+        no_usage_source(&blank_env_key, true),
+        "an env entry blank once trimmed is no credential either"
+    );
+}
+
+/// The gate is the shared membership rule, not the OAuth pair test alone, so a
+/// member ANOTHER leg polls does not wear the marker beside the reading that leg
+/// writes it.
+///
+/// The fixture is hand-built, and deliberately so: the shape it needs is a
+/// third-party member with no endpoint, and PRODUCTION HAS NONE TODAY, because
+/// every path that writes `provider` derives it from `base_url`
+/// (`Profile::new`, the load boundary, `edit_profile_endpoint` and the capture
+/// overwrite) and `Profile` has no `Deserialize` to carry one in from disk. So
+/// a member the third-party leg polls always has an endpoint, and this
+/// predicate's endpoint conjunct excludes it one line earlier. What this pins is
+/// therefore the gate's STRUCTURE rather than a bug reachable now: the rule
+/// reads every leg, so a leg whose membership implies no endpoint (the usage
+/// probe's) moves the marker without a change here.
+///
+/// The Alibaba arm is what makes the fixture constructible at all: that quota
+/// surface cannot read an api key, so the third-party leg schedules the member
+/// keyless (`third_party_credentialed_fields`' Alibaba arm), which leaves the
+/// endpoint and inference-auth halves of this predicate clear.
+#[test]
+fn no_usage_source_leaves_a_member_another_leg_polls_alone() {
+    let bare = |n: &str| no_login(profile_with_usage(n, None, None)).profile;
+    let mut console_only = bare("ali");
+    console_only.provider = Some(crate::providers::Provider::Alibaba);
+    console_only.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    // Preconditions, so a later change to either fixture half cannot make this
+    // pass for the wrong reason.
+    assert!(
+        console_only.routing_endpoint().is_none(),
+        "fixture precondition: no endpoint, so the endpoint half cannot be what clears it"
+    );
+    assert!(
+        !crate::claude::has_inference_auth(&console_only),
+        "fixture precondition: keyless, so the inference-auth half cannot be it either"
+    );
+    assert!(
+        crate::usage::usage_poll_pair(&console_only).is_none(),
+        "fixture precondition: no OAuth pair, which is what the old gate asked about"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_admits(&console_only),
+        "the third-party leg's rule admits it, which is what the marker reads"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_polls(&console_only),
+        "and it is enabled, so that leg's work list holds it"
+    );
+    assert!(
+        !no_usage_source(&console_only, true),
+        "a member another leg polls is measured by that leg, not marked here"
+    );
+}
+
+/// Disabled-ness is not this predicate's axis, and the split that keeps it out
+/// is pinned in BOTH directions. The marker reads the gate's
+/// membership half, which answers for the profile's shape, so a disabled member
+/// holding a login is measurable the moment it is enabled and the `Disabled`
+/// rung is what describes it meanwhile. The poll gate keeps disabled-ness,
+/// because the work lists do.
+///
+/// The card is why the difference matters: it stacks the health ladder under
+/// `[ disabled ]` rather than stopping at it, so while the marker read the whole
+/// gate it told every disabled member with a login to log in again
+/// (`tui_render_chain`'s
+/// `a_disabled_member_with_a_login_is_not_called_unmeasurable`).
+#[test]
+fn no_usage_source_leaves_disabled_ness_to_the_disabled_rung() {
+    let paired = || with_oauth_login(profile_with_usage("d", None, None)).profile;
+    let enabled = paired();
+    assert!(
+        !no_usage_source(&enabled, true),
+        "enabled and paired: the OAuth leg polls it"
+    );
+    let mut disabled = paired();
+    disabled.disabled = true;
+    assert!(
+        !crate::usage::any_fetch_leg_polls(&disabled),
+        "the POLL gate still filters it: a disabled profile is on neither work list"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_admits(&disabled),
+        "its shape is admitted all the same — the stored pair is what the OAuth rule reads"
+    );
+    assert!(
+        !no_usage_source(&disabled, true),
+        "so the marker stays off it: the operator switched it off, nothing is unreadable"
+    );
+}
+
+/// The rung fires on the SHAPE, not on the reading the caller happens to hold,
+/// and every rung above it still outranks it.
+#[test]
+fn no_usage_marks_a_member_tollgate_cannot_measure_whatever_reading_it_holds() {
+    let keeper = || {
+        mark_fresh(with_oauth_login(profile_with_util(
+            "keep",
+            Some(90.0),
+            Some(10.0),
+        )))
+    };
+    let reason = |cand: Fixture, session_token: bool| {
+        let (config, readings) = config_with_chain(vec![keeper(), cand], "keep");
+        let cand = config
+            .find(&crate::profile::ProfileName::from("cand"))
+            .expect("cand");
+        blocked_reason(
+            &config,
+            cand,
+            None,
+            &HashSet::new(),
+            readings.usage.get(cand.name.as_str()),
+            readings.status.get(cand.name.as_str()).copied(),
+            session_token,
+        )
+    };
+    assert_eq!(
+        reason(
+            with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+            true
+        ),
+        Some(BlockedReason::NoUsage),
+    );
+    assert_eq!(
+        reason(
+            no_login(profile_with_usage("cand", Some(90.0), None)),
+            false
+        ),
+        Some(BlockedReason::LoggedOut),
+        "without a session token it is the logged-out shape, which is not this rung"
+    );
+    // Why the rung reads no reading at all: whether anything polls this member
+    // is a question of its shape, so a figure it carries is never a current
+    // one, and a guard on `usage.is_none()` would ask what has been READ
+    // instead — which let a leftover figure hide the marker while the hazard
+    // stayed live.
+    assert_eq!(
+        reason(
+            with_long_lived_sidecar(profile_with_util("cand", Some(90.0), Some(40.0))),
+            true
+        ),
+        Some(BlockedReason::NoUsage),
+        "a leftover reading from a login since removed does not retire it"
+    );
+    assert_eq!(
+        reason(
+            with_oauth_login(profile_with_usage("cand", Some(90.0), None)),
+            true
+        ),
+        None,
+        "an OAuth member not read yet is not marked: its first poll is coming"
+    );
+    // Lowest rung by design, and that is what keeps it honest: a leftover
+    // reading over the line names the figure the walk is acting on too.
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_util("cand", Some(90.0), Some(95.0))),
+                true
+            ),
+            Some(BlockedReason::FiveHour { .. })
+        ),
+        "a reading past the line is what the walk reads, so it names the pill"
+    );
+    assert_eq!(
+        reason(
+            mark_disabled(with_long_lived_sidecar(profile_with_usage(
+                "cand",
+                Some(90.0),
+                None
+            ))),
+            true
+        ),
+        Some(BlockedReason::Disabled),
+        "lowest rung: every other reason outranks it"
+    );
+    // The three rungs below FiveHour that read a window: each must still
+    // outrank NoUsage on the sidecar-only member NoUsage is about, or the card
+    // would say "can't read usage" over a figure the walk is acting on.
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(usage_credit_capped())
+                )),
+                true
+            ),
+            Some(BlockedReason::CreditCap)
+        ),
+        "a spent usage-credit cap outranks NoUsage on a sidecar-only member"
+    );
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(both_windows(40.0, 99.0))
+                )),
+                true
+            ),
+            Some(BlockedReason::WeeklySoft { .. })
+        ),
+        "a soft weekly line outranks NoUsage on a sidecar-only member"
+    );
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(usage_with_scoped(
+                        10.0,
+                        50.0,
+                        vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+                    ))
+                )),
+                true
+            ),
+            Some(BlockedReason::ScopedSpent { .. })
+        ),
+        "a spent per-model window outranks NoUsage on a sidecar-only member"
+    );
+    let (config, readings) = {
+        let (mut config, readings) = config_with_chain(
+            vec![
+                keeper(),
+                with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+            ],
+            "keep",
+        );
+        config.state.auth_broken = vec![ProfileName::from("cand")];
+        (config, readings)
+    };
+    assert_eq!(
+        health_blocked_reason(
+            &config,
+            &config.profiles[1],
+            None,
+            &HashSet::new(),
+            readings.usage.get("cand"),
+            readings.status.get("cand").copied(),
+            true,
+        ),
+        Some(BlockedReason::AuthBroken),
+        "a health rung outranks it too"
+    );
+}
+
+// The marker is display-only: the walk treats an unmeasured member like any
+// member it holds no fresh reading for. `a` is spent, `blind` (unmeasured)
+// sits before `c` (measured headroom). With nothing fresh, the walk lands on
+// `blind` in chain order; once `c` reads fresh, its pass comes first. A walk
+// that demoted members it cannot measure would land on `c` in the first case.
+// One walk answers both surfaces: the scheduler's pass and the TUI's
+// projection run `next_auto_switch_target_with_usage` over a snapshot.
+//
+// What the hazard copy promises about the ACTIVE member is pinned where it is
+// decided, at the scheduler's `reading_is_actionable` gate
+// (`scheduler::an_unmeasured_active_is_never_switched_away_from`), not here.
+#[test]
+fn the_walk_treats_an_unmeasured_member_like_any_member_without_a_fresh_reading() {
+    let chain = |c: Fixture| {
+        config_with_chain(
+            vec![
+                with_oauth_login(profile_with_util("a", Some(95.0), Some(100.0))),
+                with_long_lived_sidecar(profile_with_usage("blind", Some(95.0), None)),
+                c,
+            ],
+            "a",
+        )
+    };
+
+    let (config, readings) = chain(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    )));
+    let blind = config
+        .find(&crate::profile::ProfileName::from("blind"))
+        .expect("blind");
+    assert_eq!(
+        blocked_reason(
+            &config,
+            blind,
+            None,
+            &HashSet::new(),
+            readings.usage.get(blind.name.as_str()),
+            readings.status.get(blind.name.as_str()).copied(),
+            true,
+        ),
+        Some(BlockedReason::NoUsage),
+        "the fixture carries the marker the walk must ignore"
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &readings.usage),
+        Some(SwitchAction::To("blind".into())),
+        "the walk reaches the unmeasured member once nothing fresh has room"
+    );
+
+    let (config, readings) = chain(mark_fresh(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    ))));
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    // `snapshot_chain` leaves `fresh` empty by contract; the scan fills it from
+    // the status store, the fixture from its `mark_fresh` set.
+    snap.fresh = readings.fresh.clone();
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &readings.usage),
+        Some(SwitchAction::To("c".into())),
+        "a freshly read member with room comes first"
+    );
+}
+
+/// #93: the credit-cap rung describes exactly the member the walk skips as a
+/// target — its `check_credit_cap` gate on over a spent cached cap — and never
+/// one the gate is off for or one serving inference from its own endpoint.
+/// `BudgetSpent`, the spent 5h window and a spent per-model week still outrank
+/// it, and it sits above the merely-dispreferred weekly soft band.
+#[test]
+fn blocked_reason_says_credit_cap_only_where_the_walk_skips() {
+    let capped = || UsageInfo {
+        five_hour: Some(window(10.0, Some(live_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..UsageInfo::default()
+    };
+    assert!(
+        capped().credit_capped(),
+        "fixture control: the cap reads spent"
+    );
+    let reason = |mut f: Fixture, usage: UsageInfo, budget_on: bool| {
+        f.usage = Some(usage);
+        let (mut cfg, readings) = config_with_chain(vec![f], "a");
+        cfg.state.spend_budget_switching = budget_on;
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false,
+        )
+    };
+
+    // The walk's own target-side credit skip for the same member, so each
+    // chip verdict below is checked against the decision it describes.
+    let walk_skips = |mut f: Fixture, usage: UsageInfo| {
+        f.usage = Some(usage);
+        let (cfg, readings) = config_with_chain(vec![f], "a");
+        let snap = snapshot_chain(&cfg, &HashSet::new()).expect("snapshot");
+        let member = snap
+            .chain
+            .iter()
+            .find(|m| m.name.as_str() == "a")
+            .expect("a is a chain member");
+        credit_capped_from_usage(member, &readings.usage)
+    };
+
+    assert_eq!(
+        reason(profile_with_usage("a", Some(95.0), None), capped(), false),
+        Some(BlockedReason::CreditCap),
+        "gate on and cap spent: the walk skips it, so the card says why"
+    );
+    assert!(
+        walk_skips(profile_with_usage("a", Some(95.0), None), capped()),
+        "the walk skips the member the chip names"
+    );
+
+    let off = || {
+        let mut f = profile_with_usage("a", Some(95.0), None);
+        f.profile.check_credit_cap = false;
+        f
+    };
+    assert_eq!(
+        reason(off(), capped(), false),
+        None,
+        "gate off: the walk takes it, so no chip claims a block"
+    );
+    assert!(!walk_skips(off(), capped()), "gate off: the walk takes it");
+
+    let own = || {
+        let mut f = profile_with_usage("a", Some(95.0), None);
+        f.profile.base_url = Some("https://api.z.ai/api/anthropic".to_owned());
+        f.profile.api_key = Some("k".to_owned());
+        f
+    };
+    assert_eq!(
+        reason(own(), capped(), false),
+        None,
+        "an own-endpoint account serves elsewhere: the credit gates do not apply"
+    );
+    assert!(
+        !walk_skips(own(), capped()),
+        "the walk takes an own-endpoint member too, so the chip hides no block"
+    );
+
+    // A spent billing budget keeps the rung it owns when both hold.
+    let mut spent = profile_with_usage("a", Some(95.0), None);
+    spent.profile.max_auto_spend = Some(10.0);
+    let over_budget = UsageInfo {
+        five_hour: Some(window(100.0, Some(live_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(60.0),
+            limit: Some(50.0),
+            percent: Some(120.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        reason(spent, over_budget.clone(), true),
+        Some(BlockedReason::BudgetSpent),
+        "BudgetSpent outranks the credit cap when both hold"
+    );
+
+    // A spent per-model week outranks the whole-account cap, the order
+    // `start_block` names in.
+    let capped_and_scoped = UsageInfo {
+        weekly_scoped: vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+        ..capped()
+    };
+    let scoped = reason(
+        profile_with_usage("a", Some(95.0), None),
+        capped_and_scoped,
+        false,
+    );
+    assert!(
+        matches!(scoped, Some(BlockedReason::ScopedSpent { .. })),
+        "the spent model's week outranks the credit cap: {scoped:?}"
+    );
+
+    let five_hour = reason(
+        profile_with_usage("a", Some(95.0), None),
+        over_budget,
+        false,
+    );
+    assert!(
+        matches!(five_hour, Some(BlockedReason::FiveHour { .. })),
+        "the spent 5h window outranks the credit cap: {five_hour:?}"
+    );
+}
+
+// ── logged-out members: no automatic walk lands on an account holding no login ──
+//
+// cloudy 2026-10-12: every automatic walk reads "holds a login" (a stored OAuth
+// pair, a long-lived session-token sidecar, or an api key / env token); a
+// member holding none is skipped, while sidecar-only and key-only members stay
+// eligible. The walk fixtures above hold a login by default, so these tests
+// strip it only from the member the walk must skip.
+
+/// The shared core behind the daemon walk and the TUI one-shot: an exhausted
+/// active walks past a login-less clear member to the next member that holds
+/// a login. Linking `x` would install an empty login into the global slot.
+#[test]
+fn the_switch_walk_skips_a_member_holding_no_login() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            no_login(profile_with_util("x", Some(95.0), Some(10.0))),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_utils(&[("a", 100.0), ("x", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "the walk must pass over the member holding no login"
+    );
+}
+
+/// The return-to-preferred pass never walks home onto a preferred member that
+/// holds no login: with the active healthy and nothing else to return to, the
+/// walk stays put.
+#[test]
+fn return_to_preferred_skips_a_home_member_holding_no_login() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            mark_preferred(no_login(profile_with_util("a", Some(95.0), None))),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a login-less preferred member is no home to return to"
+    );
+}
+
+/// The reason form every non-switch surface reads (home-day eligibility, the
+/// day-list editor hint, the `+ add` picker) names the missing login with the
+/// ruled copy; a key-only member has nothing to name.
+#[test]
+fn walk_blocker_names_a_member_holding_no_login() {
+    let mut key_only = no_login(profile_with_util("k", Some(95.0), None));
+    key_only.profile.api_key = Some("sk-test".to_string());
+    let (config, _readings) = config_with_chain(
+        vec![no_login(profile_with_util("x", Some(95.0), None)), key_only],
+        "x",
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("x"), &HashSet::new()).as_deref(),
+        Some("it has no login or api key"),
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("k"), &HashSet::new()),
+        None,
+        "an api key alone is a login the walk can use"
+    );
+}
+
+/// Sidecar-only and key-only members stay eligible, read the way every process
+/// reads them: off the profiles a config load puts in memory.
+#[test]
+fn the_switch_walk_keeps_a_key_only_and_a_sidecar_only_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut active = crate::testutil::blank_profile(&ProfileName::from("a"));
+    active.credentials = Some(crate::testutil::oauth_pair("a"));
+    let mut key_only = crate::testutil::blank_profile(&ProfileName::from("k"));
+    key_only.api_key = Some("sk-test".to_string());
+    let sidecar_only = crate::testutil::blank_profile(&ProfileName::from("s"));
+    for p in [&active, &key_only, &sidecar_only] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::testutil::write_long_lived_sidecar(&ProfileName::from("s"));
+
+    for target in ["k", "s"] {
+        crate::profile::save_app_state(&AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "k".into(), "s".into()],
+            fallback_chain: vec!["a".into(), target.into()],
+            ..AppState::default()
+        })
+        .expect("save app state");
+        let config = crate::profile::load_config().expect("load config");
+        let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+        let store = store_with_utils(&[("a", 100.0), (target, 10.0)]);
+        assert_eq!(
+            next_auto_switch_target(&snap, &store),
+            Some(SwitchAction::To(target.to_string())),
+            "{target} holds a login the walk can install"
+        );
+        assert_eq!(
+            walk_blocker(&config, &ProfileName::from(target), &HashSet::new()),
+            None,
+            "{target} serves the chain"
+        );
+    }
+}
+
+/// `start --auto` refuses a login-less member and starts on the next one; its
+/// row carries the `logged out` rung so `--explain` says why.
+#[test]
+fn the_start_walk_skips_a_member_holding_no_login() {
+    let _sb = start_walk_sandbox(&["x", "c"]);
+    let c = start_walk_profile("c");
+    let (config, _readings) = config_with_chain(vec![no_login(start_walk_profile("x")), c], "x");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        rows[0].block,
+        Some(StartBlock::LoggedOut),
+        "the login-less member's row must carry the logged-out rung"
+    );
+    assert_eq!(
+        pick,
+        Some(1),
+        "the start must land on the member holding a login"
+    );
+}
+
+/// A member tollgate cannot measure (a long-lived sidecar, no OAuth pair) holds a
+/// login, so its `--explain` verdict stays `ok`; its age cell says tollgate
+/// cannot read its usage, never `no usage yet`, which promises a first poll
+/// that never comes. The refusal renders the same rows, so it says it too —
+/// reachable only once nothing is picked, here with the member disabled and the
+/// other spent.
+#[test]
+fn the_start_walk_marks_a_member_tollgate_cannot_measure() {
+    let _sb = start_walk_sandbox(&["blind", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let (config, _readings) = config_with_chain(
+        vec![
+            with_long_lived_sidecar(start_walk_profile("blind")),
+            start_walk_profile("work"),
+        ],
+        "work",
+    );
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  blind  ok   can't read usage\n* work   ok   usage 4m ago",
+    );
+
+    // A real refusal renders only a no-pick walk: `blind` disabled, `work` spent.
+    start_walk_write_usage("work", &start_walk_usage(240, 100.0, 10.0));
+    let mut blind = with_long_lived_sidecar(start_walk_profile("blind"));
+    blind.profile.disabled = true;
+    let (config, _readings) = config_with_chain(vec![blind, start_walk_profile("work")], "work");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(pick, None);
+    assert_eq!(
+        crate::format::start_refusal(&[], &rows),
+        "--auto found no chain member with headroom\n  blind  disabled   can't read usage\n  work   5h 100%    usage 4m ago",
+    );
+}
+
+/// A member holding only an Anthropic api key sits in no fetch leg's work list
+/// (no login pair, no provider endpoint), so no poll is ever coming: its age
+/// cell says it has no usage windows, never `no usage yet`.
+#[test]
+fn the_start_walk_says_an_api_key_member_has_no_usage_windows() {
+    let _sb = start_walk_sandbox(&["api", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let mut api = start_walk_profile("api");
+    api.profile.credentials = None;
+    api.profile.api_key = Some("sk-ant-api-key".to_string());
+    let (config, _readings) = config_with_chain(vec![api, start_walk_profile("work")], "work");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  api   ok   api key, no usage windows\n* work  ok   usage 4m ago",
+    );
+}
+
+/// `api key, no usage windows` is a claim about an Anthropic key alone. A key
+/// routed to another endpoint through `[env] ANTHROPIC_BASE_URL` talks to a
+/// provider that may have windows, and a key beside a long-lived sidecar is the
+/// sidecar's account too: neither gets that cell.
+#[test]
+fn the_api_key_cell_skips_a_routed_key_and_a_key_beside_a_sidecar() {
+    let _sb = start_walk_sandbox(&["envkey", "keysc", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let mut routed = start_walk_profile("envkey");
+    routed.profile.credentials = None;
+    routed.profile.api_key = Some("zai-key".to_string());
+    routed.profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.z.ai/api/anthropic".to_string(),
+    );
+    let mut beside = with_long_lived_sidecar(start_walk_profile("keysc"));
+    beside.profile.api_key = Some("sk-ant-api-key".to_string());
+    let (config, _readings) =
+        config_with_chain(vec![routed, beside, start_walk_profile("work")], "work");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  envkey  ok   no usage yet\n  keysc   ok   no usage yet\n* work    ok   usage 4m ago",
+    );
+}
+
+/// The fix line's logins join with `and`, so the probe is its one `or`.
+#[test]
+fn the_fix_line_offers_the_logins_or_the_probe() {
+    assert_eq!(
+        no_usage_fix(&["a"]),
+        "log in the same account with `tollgate login a`, or turn on its usage probe, so \
+         tollgate can read its usage"
+    );
+    assert_eq!(
+        no_usage_fix(&["a", "b", "c"]),
+        "log in the same accounts with `tollgate login a`, `tollgate login b` and `tollgate login \
+         c`, or turn on their usage probes, so tollgate can read their usage"
+    );
+}
+
+/// A reading a credit refusal's reset clear judges, as of `now`: the 5h window
+/// at `five`, with its reset `five_reset` seconds from `now` or none, and the 7d
+/// window at `week`, resetting `week_reset` seconds from `now`.
+fn reset_reading(
+    now: i64,
+    five: f64,
+    five_reset: Option<i64>,
+    week: f64,
+    week_reset: i64,
+) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, five_reset.map(|s| epoch_secs_to_iso(now + s)))),
+        seven_day: Some(window(week, Some(epoch_secs_to_iso(now + week_reset)))),
+        ..UsageInfo::default()
+    }
+}
+
+/// A 5h window that opened after the refusal, with the member under its
+/// threshold and weekly line, clears it at the window's start.
+#[test]
+fn a_window_opened_after_a_credit_refusal_clears_it_at_its_start() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let info = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, refused, now),
+        Some((now + 3_600 - 5 * 3_600) as u64 * 1000)
+    );
+}
+
+/// A 5h reset counts for nothing while the 7d sits over the member's line. The
+/// control: the same reset with the 7d under it clears.
+#[test]
+fn a_5h_reset_with_the_7d_over_its_line_clears_nothing() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    let under = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    assert!(
+        credit_refusal_reset_at(&member, None, &under, refused, now).is_some(),
+        "control: with the 7d under its line the 5h reset clears"
+    );
+    let over = reset_reading(now, 10.0, Some(3_600), 99.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &over, refused, now),
+        None
+    );
+}
+
+/// Neither does a 7d reset while the 5h sits over the member's threshold. The
+/// control: with the 5h under it, the earlier of the two resets is the floor.
+#[test]
+fn a_7d_reset_with_the_5h_over_its_threshold_clears_nothing() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    // The 7d opened four days ago, the 5h four hours ago, the refusal between.
+    let refused = (now - 5 * 86_400) as u64 * 1000;
+    let under = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &under, refused, now),
+        Some((now + 3 * 86_400 - 7 * 86_400) as u64 * 1000),
+        "control: the 7d reset is the earlier of the two and floors the clear"
+    );
+    let over = reset_reading(now, 96.0, Some(3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &over, refused, now),
+        None
+    );
+}
+
+/// A refusal stamped after every reset, or at one, holds. The control: one
+/// stamped a millisecond before the 5h opened clears at its start.
+#[test]
+fn a_credit_refusal_at_or_after_the_reset_holds() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let info = reset_reading(now, 10.0, Some(3_600), 20.0, 3 * 86_400);
+    let start = (now + 3_600 - 5 * 3_600) as u64 * 1000;
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start - 1, now),
+        Some(start),
+        "control: a refusal before the 5h opened clears at its start"
+    );
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start, now),
+        None
+    );
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &info, start + 60_000, now),
+        None
+    );
+}
+
+/// An idle member's reading shows no live 5h window, so no window opened since
+/// the refusal: the reset the last reading named and that has passed since is
+/// the one seen, and it clears at that reset. The control: a reset the last
+/// reading named before the refusal clears nothing.
+#[test]
+fn a_reset_the_last_reading_named_clears_a_credit_refusal_once_it_passed() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let idle = reset_reading(now, 0.0, None, 20.0, 3 * 86_400);
+    let refused = (now - 3 * 3_600) as u64 * 1000;
+    let prev_after = reset_reading(now, 60.0, Some(-600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&prev_after), &idle, refused, now),
+        Some((now - 600) as u64 * 1000)
+    );
+    let prev_before = reset_reading(now, 60.0, Some(-4 * 3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&prev_before), &idle, refused, now),
+        None
+    );
+}
+
+/// The reset clear judges the member at its own threshold and weekly line, not
+/// the chain's defaults: a 5h at 70% is over a threshold of 50, and a 7d at 65%
+/// over a line of 60. The control: under both, it clears.
+#[test]
+fn the_reset_clear_judges_the_members_own_threshold_and_weekly_line() {
+    let now = now_epoch_secs();
+    let mut member = headroom_member("a", true);
+    member.threshold = 50.0;
+    member.weekly_line = 60.0;
+    let refused = (now - 6 * 3_600) as u64 * 1000;
+    let under = reset_reading(now, 40.0, Some(3_600), 50.0, 3 * 86_400);
+    assert!(
+        credit_refusal_reset_at(&member, None, &under, refused, now).is_some(),
+        "control: under its own threshold and line it clears"
+    );
+    let five_over = reset_reading(now, 70.0, Some(3_600), 50.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &five_over, refused, now),
+        None
+    );
+    let week_over = reset_reading(now, 40.0, Some(3_600), 65.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &week_over, refused, now),
+        None
+    );
+}
+
+/// An idle 5h window reads 0% with its reset up to a full window ahead, a
+/// placeholder that slides with the clock: no window opened there, so it clears
+/// nothing, in the fresh reading or in the one before it. The control: a 5h
+/// window in use that opened after the refusal clears at its start.
+#[test]
+fn an_idle_5h_placeholder_clears_no_credit_refusal() {
+    let now = now_epoch_secs();
+    let member = headroom_member("a", true);
+    let refused = (now - 3_600) as u64 * 1000;
+    let used = reset_reading(now, 10.0, Some(4 * 3_600 + 1_800), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &used, refused, now),
+        Some((now - 1_800) as u64 * 1000),
+        "control: a 5h window in use since after the refusal clears at its start"
+    );
+    let idle = reset_reading(now, 0.0, Some(5 * 3_600), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &idle, refused, now),
+        None,
+        "the fresh reading's placeholder opened nothing"
+    );
+    let lapsed = reset_reading(now, 0.0, Some(-60), 20.0, 3 * 86_400);
+    assert_eq!(
+        credit_refusal_reset_at(&member, Some(&lapsed), &idle, refused, now),
+        None,
+        "the last reading's placeholder named no reset"
+    );
+    // The weekly window keeps a fixed reset, so a 7d at 0% that opened after
+    // the refusal is a real reset beside the 5h placeholder.
+    let week_opened = reset_reading(now, 0.0, Some(5 * 3_600), 0.0, 7 * 86_400 - 1_800);
+    assert_eq!(
+        credit_refusal_reset_at(&member, None, &week_opened, refused, now),
+        Some((now - 1_800) as u64 * 1000),
+        "a 7d window at 0% that opened after the refusal clears at its start"
+    );
+}
+
+/// Every configured profile has a member the reset clear judges, at the
+/// threshold and weekly line the walks give it, in the fallback chain or not; a
+/// name no profile holds has none.
+#[test]
+fn every_configured_profile_is_judged_for_a_reset_clear() {
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.fallback_threshold = Some(50.0);
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.fallback_threshold = Some(40.0);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    let member = reset_member_of(&config, &ProfileName::from("a")).expect("a is in the chain");
+    assert_eq!(member.threshold, 50.0);
+    let outside =
+        reset_member_of(&config, &ProfileName::from("b")).expect("b is configured, off the chain");
+    assert_eq!(outside.threshold, 40.0);
+    assert!(reset_member_of(&config, &ProfileName::from("ghost")).is_none());
+}
+
+/// A setup token the probe found refused, on an account that also carries an
+/// inference key in its env, is a dead login by its token alone: reading the
+/// verdict writes no dead-key record, so a re-minted token clears the state.
+#[test]
+fn a_refused_setup_token_beside_an_env_key_clears_on_a_remint() {
+    let _sb = start_walk_sandbox(&["tok"]);
+    let mut p = Profile::new("tok".to_string(), None, None);
+    p.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-tok".to_string());
+    crate::testutil::make_probed_account(&mut p);
+    let digest = p
+        .setup_token_digest
+        .expect("the probed account's token digest");
+    assert!(
+        crate::usage::profile_key_fingerprint(&p).is_some(),
+        "fixture control: the env token is an inference key"
+    );
+    crate::profile_cache::write_auth_expired(&p.name, digest);
+    assert!(
+        third_party_key_rejected(&p, &p.name),
+        "the refused token reads as a dead login"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(&p.name, crate::profile_cache::DEAD_KEY_FILE)
+            .expect("the record's path")
+            .exists(),
+        "a setup-token verdict writes no dead-key record"
+    );
+    let mut reminted = p.clone();
+    reminted.setup_token_digest = Some(digest ^ 1);
+    assert!(
+        !third_party_key_rejected(&reminted, &reminted.name),
+        "a re-minted token clears the dead login"
     );
 }

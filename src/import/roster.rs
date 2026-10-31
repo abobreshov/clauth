@@ -161,7 +161,7 @@ pub(crate) fn check_names(
         if !profiles.iter().any(|(n, _)| n == old) {
             blockers.push(Finding::new(
                 "rename_unknown",
-                format!("--rename {old}=…: upstream clauth has no profile named '{old}'"),
+                format!("--rename {old}=...: upstream clauth has no profile named '{old}'"),
             ));
         }
     }

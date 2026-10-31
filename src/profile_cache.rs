@@ -62,7 +62,7 @@ pub(crate) fn sanitize_identity_detail(value: &str) -> Option<String> {
     let value: String = value
         .trim()
         .chars()
-        .filter(|c| !c.is_control() && !crate::jobs_cli::reorders_display(*c))
+        .filter(|c| !c.is_control() && !crate::format::reorders_display(*c))
         .take(254)
         .collect();
     let value = value.trim();
@@ -234,16 +234,21 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
-/// The last third-party fetch for this profile died on a credential that can
-/// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
-/// against the fingerprint of the credential that produced it.
+/// The last third-party fetch for this profile, or the last usage probe of its
+/// setup token, died on a credential that can never self-heal
+/// ([`crate::usage::FetchStatus::AuthExpired`]), recorded against the
+/// fingerprint of the credential that produced it: the USAGE credential, which
+/// on Alibaba is the console session and everywhere else the api key, or a
+/// pairless account's setup-token digest
+/// ([`crate::usage::dead_login_fingerprint`]).
 ///
 /// It exists for the surfaces with no scheduler in the process — `tollgate list`
 /// and `tollgate status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
 /// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
-/// a matched verdict demotes the dead-chain sentence to the keyless one.
+/// a matched verdict on an Alibaba profile renders the dead-console sentence.
+/// Whether the api KEY is dead is [`DEAD_KEY_FILE`]'s question, not this one's.
 ///
 /// This is NOT a freshness claim and cannot go stale in the dangerous
 /// direction: it is a terminal verdict BOUND to one credential, so a re-login
@@ -255,8 +260,27 @@ pub(crate) const THIRD_PARTY_AUTH_FILE: &str = "third_party_auth.json";
 /// second field can join without a format break.
 #[derive(Debug, Serialize, Deserialize)]
 struct AuthVerdict {
-    /// `ThirdPartyEntry::credential_fingerprint` of the credential that failed.
+    /// [`crate::usage::dead_login_fingerprint`] of the credential that failed:
+    /// a third-party entry's credential fingerprint, or a setup token's digest.
     credential: u64,
+}
+
+/// The provider refused this profile's api KEY — the inference credential its
+/// sessions and delegates spend — recorded against
+/// [`crate::usage::inference_key_fingerprint`], a digest of that key alone.
+/// Written by a delegate's 401 on the key and by a usage fetch that
+/// authenticated with the key and got `AuthExpired`; cleared only by a live
+/// body from a fetch that authenticated with the same key
+/// ([`clear_auth_expired`]). A console re-login, a console lapse and an
+/// endpoint edit never touch it, and a re-keyed profile leaves it inert. Read
+/// by [`crate::fallback::third_party_key_rejected`].
+pub(crate) const DEAD_KEY_FILE: &str = "dead_key.json";
+
+/// Body of [`DEAD_KEY_FILE`].
+#[derive(Debug, Serialize, Deserialize)]
+struct DeadKey {
+    /// [`crate::usage::inference_key_fingerprint`] of the refused key.
+    key: u64,
 }
 
 /// Record that `name`'s usage credential is dead. Best-effort like every other
@@ -266,9 +290,17 @@ pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
     write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
 }
 
-/// Drop the record — any outcome other than `AuthExpired` proves the verdict no
-/// longer holds. Cheap and unconditional: the file is usually absent.
+/// Drop both records — a live body from a fetch that authenticated with the
+/// api key proves the usage credential AND the key alive. Cheap and
+/// unconditional: the files are usually absent.
 pub(crate) fn clear_auth_expired(name: &ProfileName) {
+    clear_usage_verdict(name);
+    remove_profile_cache(name, DEAD_KEY_FILE);
+}
+
+/// Drop the usage-credential record alone — a live body from a fetch that never
+/// read the api key (Alibaba's console-only quota) proves nothing about the key.
+pub(crate) fn clear_usage_verdict(name: &ProfileName) {
     remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
 }
 
@@ -278,6 +310,380 @@ pub(crate) fn clear_auth_expired(name: &ProfileName) {
 pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool {
     load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
         .is_some_and(|v| v.credential == credential)
+}
+
+/// Record that the provider refused `name`'s api key, `key` being its
+/// [`crate::usage::inference_key_fingerprint`]. Best-effort like
+/// [`write_auth_expired`].
+pub(crate) fn write_dead_key(name: &ProfileName, key: u64) {
+    write_profile_cache(name, DEAD_KEY_FILE, &DeadKey { key });
+}
+
+/// Whether `name`'s dead-key record names the key it holds RIGHT NOW. A record
+/// for any other key is inert.
+pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
+    load_profile_cache::<DeadKey>(name, DEAD_KEY_FILE).is_some_and(|v| v.key == key)
+}
+
+/// This member answered a session with Claude Code's spend-cap 429 (`apiError:
+/// "model_requires_usage_credits"`): it refused a request billed against usage
+/// credits. Written by the instance that fetches usage when it drains a
+/// spend-cap 429, and by the lift of an isolated run's tree; read in every
+/// process, so a restart or a lease handover keeps it: the session walks skip
+/// the member for a demand that may need credits until every other pass is
+/// spent, the global walk in its headroom and home passes. It goes on any later
+/// successful turn on the member ([`CreditRefusal`]), on a reading that shows a
+/// window reset after it with the member back under its lines
+/// ([`crate::fallback::credit_refusal_reset_at`]), on a login as another account
+/// or a `/profile` read naming one, or with the profile; never by age alone,
+/// since the cap resets with a billing month tollgate does not know.
+pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
+
+/// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
+/// `file` are required, so a foreign file fails the read rather than parse as
+/// a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditRefusal {
+    /// The 429 row's own instant, epoch ms.
+    pub(crate) at_ms: u64,
+    /// The transcript the 429 came from: a successful turn on the member in
+    /// that file is ordered against the refusal by line, one in any other file
+    /// by stamp.
+    pub(crate) file: PathBuf,
+    /// The 429 line's `uuid`, when it carries one: the tps producer's record of
+    /// where that line lies in `file` is pulled by it, so a turn in that file
+    /// is ordered against the refusal by line rather than by stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uuid: Option<String>,
+}
+
+/// Body of [`CREDIT_REFUSAL_CACHE_FILE`]: the refusal on record, and the floor
+/// a login change or a clear leaves. Read through [`credit_refusal`] alone, so
+/// every reader takes a record that carries only the floor for no refusal.
+/// A key this build does not know is ignored, as [`AuthVerdict`] ignores one,
+/// so a record a newer tollgate wrote with one more field still reads and the
+/// next write here keeps its floor.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CreditRefusalRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<CreditRefusal>,
+    /// A refusal at or before this instant, epoch ms, is never recorded again:
+    /// it answered a login the account has since left, or it is stamped no
+    /// later than a refusal a later turn cleared, or than that turn. A lease
+    /// holder that takes over re-reads the hot transcripts whole, the refused
+    /// session's 429 included, and the turn that cleared it may be gone from
+    /// what it reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_ms: Option<u64>,
+    /// The account the identity anchor named when the refusal went on record:
+    /// a `/profile` read naming another one drops it whether or not the anchor
+    /// still stands ([`forget_credit_refusal_of_another_account`]). Absent for
+    /// a refusal recorded with no anchor on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<crate::profile::AccountId>,
+}
+
+fn credit_refusal_record(name: &ProfileName) -> CreditRefusalRecord {
+    load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE).unwrap_or_default()
+}
+
+/// The account `name`'s identity anchor names, read for the record a refusal
+/// goes on.
+fn anchored_account(name: &ProfileName) -> Option<crate::profile::AccountId> {
+    load_profile_cache::<crate::profile::AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .filter(|u| !u.trim().is_empty())
+}
+
+/// The credit refusal on record for `name`, if any: the one gate every reader
+/// goes through.
+pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
+    credit_refusal_record(name).refusal
+}
+
+/// Record `refusal` for `name`, unless the one on record is as new, two
+/// sessions refused on one member keeping the later 429, or it is no newer
+/// than the floor on record.
+///
+/// The read and the write hold the state flock, which a login change's forget
+/// ([`forget_credit_refusal`]) runs under, so a forget from another process
+/// cannot land between them and lose its floor. A flock wait that times out
+/// records nothing and logs it: the 429 is lost, and the member's next one
+/// places it again. The hold shares the tick's `timed_out` flag: once any
+/// landing or kick hold of the tick has timed out, it takes that path at once
+/// rather than wait out the flock again.
+pub(crate) fn write_credit_refusal_flagged(
+    name: &ProfileName,
+    refusal: &CreditRefusal,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        let mut record = credit_refusal_record(name);
+        #[cfg(test)]
+        credit_refusal_park::park_if_armed();
+        if record.take(refusal, anchored_account(name)) {
+            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        }
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("tollgate: {name}: could not record its credit refusal: {e}");
+    }
+}
+
+/// [`write_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
+    write_credit_refusal_flagged(name, refusal, None);
+}
+
+/// Drop `name`'s credit refusal, a later successful turn on the member or a
+/// window reset after it having cleared it, and floor the record at
+/// `floor_ms`: for a turn the later of the cleared refusal's instant and the
+/// clearing turn's stamp, for a reset the reset's instant. A re-read of that 429
+/// carries the first, and a second refusal stamped before the turn but drained
+/// after the clear sits below the second, so neither is recorded again. A
+/// higher floor on record stays, and so does a refusal past `floor_ms`, which
+/// another session recorded after the caller read the one the turn cleared.
+/// Held under the state flock like [`write_credit_refusal_flagged`], and a
+/// timed-out wait clears nothing.
+pub(crate) fn clear_credit_refusal_flagged(
+    name: &ProfileName,
+    floor_ms: u64,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        let mut record = credit_refusal_record(name);
+        record.clear(floor_ms);
+        write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("tollgate: {name}: could not clear its credit refusal: {e}");
+    }
+}
+
+/// [`clear_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
+    clear_credit_refusal_flagged(name, floor_ms, None);
+}
+
+/// Record `refusal` for `name` as [`write_credit_refusal_flagged`] does, then
+/// clear the refusal that stands on record as [`clear_credit_refusal_flagged`]
+/// does when `served_past` names the stamp of a successful turn on the member
+/// past it, for a caller that holds every turn of a run at once. Both run in
+/// one state-flock hold, so a refusal another process records in between is
+/// ordered against the same turns rather than outliving them.
+pub(crate) fn settle_credit_refusal(
+    name: &ProfileName,
+    refusal: Option<&CreditRefusal>,
+    served_past: impl FnOnce(&CreditRefusal) -> Option<u64>,
+) {
+    let held = crate::lock::with_state_lock(|_held| {
+        let mut record = credit_refusal_record(name);
+        let mut changed =
+            refusal.is_some_and(|refusal| record.take(refusal, anchored_account(name)));
+        if let Some(held) = record.refusal.clone()
+            && let Some(turn_ts) = served_past(&held)
+        {
+            record.clear(held.at_ms.max(turn_ts));
+            changed = true;
+        }
+        if changed {
+            write_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        }
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("tollgate: {name}: could not settle its credit refusal: {e}");
+    }
+}
+
+impl CreditRefusalRecord {
+    /// Take `refusal`, placed while the anchor named `account`, unless the one
+    /// held is as new or the floor lies at or past it
+    /// ([`write_credit_refusal_flagged`]); whether it took it.
+    fn take(
+        &mut self,
+        refusal: &CreditRefusal,
+        account: Option<crate::profile::AccountId>,
+    ) -> bool {
+        if self.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
+            || self
+                .refusal
+                .as_ref()
+                .is_some_and(|held| held.at_ms >= refusal.at_ms)
+        {
+            return false;
+        }
+        self.refusal = Some(refusal.clone());
+        self.account = account;
+        true
+    }
+
+    /// Drop the refusal held unless it lies past `floor_ms`, and floor the
+    /// record at `floor_ms`, a higher floor held staying
+    /// ([`clear_credit_refusal_flagged`]).
+    fn clear(&mut self, floor_ms: u64) {
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|held| held.at_ms <= floor_ms)
+        {
+            self.refusal = None;
+            self.account = None;
+        }
+        self.floor_ms = Some(self.floor_ms.map_or(floor_ms, |held| held.max(floor_ms)));
+    }
+}
+
+// Test seam parking the next credit-refusal write between its read and its
+// write, inside its state-flock hold: a test arms it, the writer signals
+// `parked` and blocks until the test sends on `release`, so a second process's
+// forget can be ordered against the hold by channel, never wall time. Inert
+// while unarmed; a dropped `Park` clears an un-consumed arm.
+#[cfg(test)]
+pub(crate) mod credit_refusal_park {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// A park the test holds: `parked` fires once the armed write reaches its
+    /// park point; `release` unblocks it.
+    pub(crate) struct Park {
+        pub(crate) parked: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    static ARMED: Mutex<Option<(Receiver<()>, Sender<()>)>> = Mutex::new(None);
+
+    /// Arm the seam for the next credit-refusal write.
+    pub(crate) fn arm() -> Park {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (parked, parked_rx) = std::sync::mpsc::channel();
+        let mut armed = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(armed.is_none(), "a credit-refusal park is already armed");
+        *armed = Some((release_rx, parked));
+        Park {
+            parked: parked_rx,
+            release,
+        }
+    }
+
+    pub(super) fn park_if_armed() {
+        let (release_rx, parked) = match ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(armed) => armed,
+            None => return,
+        };
+        let _ = parked.send(());
+        let _ = release_rx.recv();
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+}
+
+/// Drop `name`'s credit refusal for a login change and floor the record at
+/// `now_ms`: a refusal from before answered the login the account left, and
+/// nothing may record it again. Deleting the file by hand drops the floor too,
+/// a full reset. A profile with no directory gets no record.
+pub(crate) fn forget_credit_refusal(name: &ProfileName, now_ms: u64) {
+    let dir_exists = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(Path::is_dir);
+    if !dir_exists {
+        return;
+    }
+    write_profile_cache(
+        name,
+        CREDIT_REFUSAL_CACHE_FILE,
+        &CreditRefusalRecord {
+            refusal: None,
+            floor_ms: Some(now_ms),
+            account: None,
+        },
+    );
+}
+
+/// Drop `name`'s credit refusal as [`forget_credit_refusal`] does when it went
+/// on record for another account than `account`, the one a `/profile` read
+/// just named. The record's own account decides, not the anchor: an install
+/// that proves no uuid removes the anchor, and a refusal from the account the
+/// profile ran as before must go all the same. A refusal recorded with no
+/// anchor names no account and stays. Called inside the read's state-flock
+/// hold.
+pub(crate) fn forget_credit_refusal_of_another_account(
+    name: &ProfileName,
+    account: &crate::profile::AccountId,
+    now_ms: u64,
+) {
+    let record = credit_refusal_record(name);
+    if record.refusal.is_some()
+        && record
+            .account
+            .as_ref()
+            .is_some_and(|placed| placed.trim() != account.trim())
+    {
+        forget_credit_refusal(name, now_ms);
+    }
+}
+
+/// Each profile's credit refusal on record, re-read for a profile only when
+/// its record's stat moves (an mtime move, or the file appearing or going), so
+/// a pass costs one stat per profile. The TUI's mirror and the daemon's log
+/// lines read it; the instance that fetches usage writes and clears the
+/// records, possibly in another process.
+#[derive(Debug, Default)]
+pub(crate) struct CreditRefusalWatch {
+    seen: std::collections::HashMap<ProfileName, (Option<SystemTime>, Option<CreditRefusal>)>,
+}
+
+impl CreditRefusalWatch {
+    /// Re-read the records of `names` whose stat moved, and forget the names
+    /// no longer listed. Returns each name whose refusal came on record or
+    /// went this pass, with whether it is on record now; a name seen for the
+    /// first time with a refusal counts as come.
+    pub(crate) fn refresh(&mut self, names: &[ProfileName]) -> Vec<(ProfileName, bool)> {
+        self.seen.retain(|name, _| names.contains(name));
+        let mut edges = Vec::new();
+        for name in names {
+            let stat = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .and_then(|meta| meta.modified().ok());
+            let was = match self.seen.get(name) {
+                Some((seen, _)) if *seen == stat => continue,
+                Some((_, refusal)) => refusal.is_some(),
+                None => false,
+            };
+            let refusal = credit_refusal(name);
+            let now = refusal.is_some();
+            self.seen.insert(name.clone(), (stat, refusal));
+            if now != was {
+                edges.push((name.clone(), now));
+            }
+        }
+        edges
+    }
+
+    /// The refusals on record as of the last pass.
+    pub(crate) fn refusals(&self) -> std::collections::HashMap<ProfileName, CreditRefusal> {
+        self.seen
+            .iter()
+            .filter_map(|(name, (_, refusal))| refusal.clone().map(|r| (name.clone(), r)))
+            .collect()
+    }
 }
 
 /// The one credential-store mtime bump tollgate makes with NO bytes behind it

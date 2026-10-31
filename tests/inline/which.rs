@@ -16,6 +16,8 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -27,6 +29,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
@@ -40,11 +43,10 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -54,6 +56,8 @@ fn endpoint_profile(name: &str) -> Profile {
         base_url: Some("https://example.test".to_string()),
         api_key: Some("sk-x".to_string()),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -65,15 +69,15 @@ fn endpoint_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -83,6 +87,8 @@ fn blank_profile(name: &str) -> Profile {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -94,15 +100,15 @@ fn blank_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -1170,6 +1176,9 @@ fn json_tier_agrees_with_the_status_json_surface() {
 /// so a consumer's key lookup never has to branch on presence.
 #[test]
 fn json_tier_is_null_when_nothing_resolved() {
+    // `json_view` reaches `tps_view` -> `load_cache` -> `home_dir`, which panics
+    // in a test build without a sandbox override.
+    let _home = HomeSandbox::new();
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let value = json_view(&config, None);
 
@@ -1676,6 +1685,214 @@ fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
     assert!(
         claude_session_dir_claims_this_process(),
         "a tollgate runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
+    );
+}
+
+// ── tps: `which --json` tps field ─────────────────────────────────────────────
+
+/// Write a tps cache naming `account`, aged `age_ms` before `now_ms`, with an
+/// optional `sess-1` session row.
+fn write_tps_cache_at(
+    home: &HomeSandbox,
+    now_ms: u64,
+    age_ms: u64,
+    account: &str,
+    with_session: bool,
+) {
+    let generated_at = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(now_ms - age_ms).expect("age in range"),
+    )
+    .expect("valid ms")
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let figures = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at,
+        total: figures(67.0, Some(92.0)),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts
+        .insert(account.to_owned(), figures(67.0, Some(92.0)));
+    if with_session {
+        snap.sessions.insert(
+            "sess-1".to_owned(),
+            crate::tps::SessionFigures {
+                account: Some(account.to_owned()),
+                figures: figures(50.0, Some(33.0)),
+            },
+        );
+    }
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+}
+
+fn resolved_cl() -> (String, Source) {
+    ("cl".to_owned(), Source::CredentialLessActive)
+}
+
+/// No cache, or one older than 30 s, reads `tps: null`; a fresh cache carries
+/// the resolved profile's live figures with `session: null` when the env names
+/// no cached session.
+#[test]
+fn json_tps_is_null_without_a_fresh_cache_and_carries_live_figures_with_one() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+
+    assert_eq!(
+        json_view(&config, Some(&resolved))["tps"],
+        serde_json::Value::Null
+    );
+
+    // Stale by 5 s.
+    write_tps_cache_at(
+        &home,
+        crate::usage::now_ms(),
+        crate::tps::STALE_AFTER_MS + 5_000,
+        "cl",
+        false,
+    );
+    assert_eq!(
+        json_view(&config, Some(&resolved))["tps"],
+        serde_json::Value::Null
+    );
+
+    // Fresh: 5 s inside the staleness edge (the exact edge is pinned by
+    // `json_tps_staleness_edge_is_exact` with a fixed clock).
+    write_tps_cache_at(
+        &home,
+        crate::usage::now_ms(),
+        crate::tps::STALE_AFTER_MS - 5_000,
+        "cl",
+        false,
+    );
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(v["tps"]["speed"], 92.0);
+    assert_eq!(v["tps"]["rate"], 67.0);
+    assert_eq!(v["tps"]["session"], serde_json::Value::Null);
+    let age = v["tps"]["age_secs"].as_u64().expect("age_secs is a number");
+    assert!(age < 30, "age off generated_at: {}", v["tps"]);
+}
+
+/// The staleness edge is exact: age == 30 s is fresh, age == 30 s + 1 ms is
+/// null. Pinned with a fixed clock through [`tps_view_at`].
+#[test]
+fn json_tps_staleness_edge_is_exact() {
+    let home = HomeSandbox::new();
+    let now = 1_800_000_000_000u64;
+    write_tps_cache_at(&home, now, crate::tps::STALE_AFTER_MS, "cl", false);
+
+    let fresh = tps_view_at(Some("cl"), now);
+    assert_eq!(fresh["speed"], 92.0, "age == 30 s is fresh");
+    assert_eq!(fresh["age_secs"], 30);
+
+    // Query AFTER the stamp so the age is 30 s + 1 ms, exercising the
+    // staleness check itself rather than the future-stamp guard.
+    let stale = tps_view_at(Some("cl"), now + 1);
+    assert_eq!(stale, serde_json::Value::Null, "age == 30 s + 1 ms is null");
+}
+
+/// With `CLAUDE_CODE_SESSION_ID` naming a session in the cache, `session`
+/// carries that session's live figures.
+#[test]
+fn json_tps_reads_the_session_row_when_the_env_names_one() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+    write_tps_cache_at(&home, crate::usage::now_ms(), 3_000, "cl", true);
+    // SAFETY: test-only, serialized by HomeSandbox's lock, restored on its Drop.
+    unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "sess-1") };
+
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(v["tps"]["speed"], 92.0);
+    assert_eq!(v["tps"]["session"]["speed"], 33.0);
+    assert_eq!(v["tps"]["session"]["rate"], 50.0);
+}
+
+/// `which --json` carries the resolved profile's own peaks for today as
+/// `tps.peaks.today` (the cache's `peaks.today.accounts[<profile>]`), so an
+/// all-time half can join beside it.
+#[test]
+fn json_tps_carries_the_profiles_peaks_today() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+    write_tps_cache_at(&home, crate::usage::now_ms(), 1_000, "cl", false);
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let pair = serde_json::json!({
+        "speed": {"value": 412.3, "at": "2026-10-19T21:14:03.120+00:00", "account": "cl", "model": "claude-opus-5-5"},
+        "rate": {"value": 1803.0, "at": "2026-10-19T21:02:10.000+00:00"},
+    });
+    cache["peaks"] = serde_json::json!({
+        "today": {"accounts": {"cl": pair.clone(), "other": {"rate": {"value": 9.0, "at": "2026-10-19T20:00:00.000+00:00"}}}, "models": {}},
+        "ever": {"accounts": {}, "models": {}},
+    });
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(
+        v["tps"]["peaks"],
+        serde_json::json!({"today": pair}),
+        "tps: {}",
+        v["tps"]
+    );
+
+    // A profile with no peak today reads an empty `today`, never `null`.
+    let none = config_with(vec![blank_profile("idle")], Some("idle"));
+    let idle = ("idle".to_owned(), Source::CredentialLessActive);
+    let v = json_view(&none, Some(&idle));
+    assert_eq!(
+        v["tps"]["peaks"],
+        serde_json::json!({"today": {}}),
+        "tps: {}",
+        v["tps"]
+    );
+}
+
+/// The producer's attribution timeline is producer-only state in its own
+/// file: `which --json`'s tps view never carries it.
+#[test]
+fn json_tps_never_publishes_the_attribution_timeline() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    };
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    // The timeline lives in its own file, never in the cache the view reads.
+    std::fs::write(
+        home.home()
+            .join(".tollgate")
+            .join(crate::tps::TPS_ATTRIBUTION_FILE),
+        r#"{"version":1,"entries":[{"session":"s","since":0,"member":"cl","pos":null}]}"#,
+    )
+    .unwrap();
+    let v = tps_view_at(Some("cl"), now);
+    assert!(
+        v.get("entries").is_none() && v.get("attribution").is_none(),
+        "which --json hides the timeline: {v}"
     );
 }
 

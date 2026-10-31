@@ -19,6 +19,13 @@ use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_i
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
 /// tollgate only ever holds ChatGPT logins, so only this one is reachable here.
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "only the non-test arm of codex_usage_url borrows it"
+    )
+)]
 pub(crate) const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Anything longer than a day is the weekly slot; anything shorter is the 5h
@@ -356,7 +363,46 @@ pub(crate) fn fetch_codex_usage(
     fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
-    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, fedramp, now_secs)
+    fetch_codex_usage_at(
+        codex_usage_url().as_ref(),
+        access_token,
+        account_id,
+        fedramp,
+        now_secs,
+    )
+}
+
+/// The codex usage URL, or a test's override. A test build without an override
+/// fails loudly rather than escaping to the real host (same shape as the OAuth
+/// `usage_endpoint`).
+fn codex_usage_url() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    {
+        if let Some(url) = CODEX_USAGE_URL_OVERRIDE.with(|c| c.borrow().clone()) {
+            return std::borrow::Cow::Owned(url);
+        }
+        panic!("codex usage endpoint requested with no test override");
+    }
+    #[cfg(not(test))]
+    {
+        std::borrow::Cow::Borrowed(CODEX_USAGE_URL)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_USAGE_URL_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_codex_usage_url_override(url: &str) {
+    CODEX_USAGE_URL_OVERRIDE.with(|c| *c.borrow_mut() = Some(url.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_codex_usage_url_override() {
+    CODEX_USAGE_URL_OVERRIDE.with(|c| *c.borrow_mut() = None);
 }
 
 /// Read-only native-monitor capture: callback sees the raw provider response

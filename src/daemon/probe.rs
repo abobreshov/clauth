@@ -25,10 +25,13 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::logline::logline;
+use crate::plugin_host::ExeChange;
 use crate::profile::tollgate_dir;
 
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
@@ -47,8 +50,8 @@ use crate::profile::tollgate_dir;
 ///
 /// Neither bound covers a switch tick whose install gate also makes a token
 /// call: `oauth::TOKEN_HTTP_DEADLINES` (19 s) runs outside the tick's window,
-/// so such a tick can take 20 + 19 = 39 s, past both this window and the 30 s
-/// watchdog, and reads amber while it runs.
+/// so such a tick is capped at 20 + 19 = 39 s, still past both this window and
+/// the 30 s watchdog, and reads amber while it runs.
 const DAEMON_STALE_MS: u64 = super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000;
 
 const _: () = assert!(
@@ -129,6 +132,36 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     }
     let generated_ms = (secs as u64).saturating_mul(1000);
     now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
+}
+
+/// How a fresh daemon's own executable changed since it started, so its plugin
+/// heal stands down until it restarts: `binary_removed: true` reads as removed,
+/// else `binary_replaced: true` as replaced. Any other daemon health, an
+/// unreadable feed, absent keys (an older daemon) or a value this binary cannot
+/// parse reads `None`: a dead daemon's last write says nothing, and a feed this
+/// binary cannot read is never guessed at.
+pub(crate) fn daemon_binary_change(health: DaemonHealth) -> Option<ExeChange> {
+    if health != DaemonHealth::Fresh {
+        return None;
+    }
+    let body = std::fs::read_to_string(tollgate_dir().ok()?.join(super::STATUS_FILE)).ok()?;
+    // Parse only the two binary keys: one unrelated profile entry or slot this
+    // binary cannot read must not discard a fresh daemon's verdict.
+    #[derive(serde::Deserialize)]
+    struct BinaryFeed {
+        #[serde(default)]
+        binary_replaced: bool,
+        #[serde(default)]
+        binary_removed: bool,
+    }
+    let feed = serde_json::from_str::<BinaryFeed>(&body).ok()?;
+    if feed.binary_removed {
+        Some(ExeChange::Removed)
+    } else if feed.binary_replaced {
+        Some(ExeChange::Replaced)
+    } else {
+        None
+    }
 }
 
 /// What a starting `tollgate daemon` is allowed to become (#57).
@@ -212,12 +245,27 @@ const CLAIM_RETRY: Duration = Duration::from_millis(100);
 // is here rather than in one.
 const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
-/// How long `--replace` waits for a terminated holder's flock to auto-release on
-/// death before it escalates (SIGTERM → SIGKILL on unix, another `/F` on
-/// Windows) and, after the escalation, before it gives up. A dying process
-/// releases its advisory flock within a handful of scheduler ticks; 5 s is
-/// generous headroom over that.
-pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
+/// How long `--replace` (and the TUI's `stop daemon`) waits for a terminated
+/// holder's flock to auto-release on death before it escalates (SIGTERM →
+/// SIGKILL on unix, another `/F` on Windows). A holder signalled mid token
+/// spend waits that spend out ([`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND))
+/// while its children stop inside `DAEMON_STOP_BUDGET` plus their answer
+/// grace, so the force kill must wait past the longer of the two plus one
+/// poll, or it lands between the token endpoint's answer and the save. This
+/// derives that longer term (the drain) plus five seconds of headroom; the
+/// children's side is pinned beside its own constants.
+pub(super) const REPLACE_WAIT: Duration =
+    super::SPEND_DRAIN_BOUND.saturating_add(Duration::from_secs(5));
+const _: () = assert!(
+    super::SPEND_DRAIN_BOUND.as_millis() >= crate::oauth::TOKEN_HTTP_DEADLINES.as_millis()
+        && super::SPEND_DRAIN_BOUND.as_millis() + REPLACE_POLL.as_millis()
+            < REPLACE_WAIT.as_millis(),
+    "the drain must outlast one token call, and the force kill that drain by at least one poll"
+);
+/// How long the pass after the escalation waits for the force-killed holder's
+/// flock: a dead process's flock releases on death, so this needs no token
+/// save's time, only headroom over the kernel's teardown.
+pub(super) const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
 pub(super) const REPLACE_POLL: Duration = Duration::from_millis(50);
@@ -247,7 +295,7 @@ pub(crate) fn claim_singleton_with(
         debug_assert!(
             matches!(claim, Claim::Redundant),
             "only a Redundant reaches the retry: a won claim still owns its flocks here, because \
-             assignment drops the old value AFTER claim_once has already run — the next attempt \
+             assignment drops the old value AFTER claim_once has already run. The next attempt \
              would race its own slot lock and read itself as a foreign holder"
         );
         std::thread::sleep(retry);
@@ -331,15 +379,20 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
 /// recycled onto an unrelated process, or onto another tollgate subcommand, is
 /// never signalled.
 pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
-    claim_by_replacing_with(dir, REPLACE_WAIT, REPLACE_POLL)
+    claim_by_replacing_with(dir, REPLACE_WAIT, KILL_WAIT, REPLACE_POLL)
 }
 
 /// [`claim_by_replacing`] with the wait schedule injected, so a test can pin the
 /// poll loop and the escalation without sleeping the full [`REPLACE_WAIT`].
 /// Always yields [`Claim::Active`] on success; every failure mode is an `Err`,
 /// never a silent [`Claim::Redundant`] that would log-and-exit-0 on the caller.
-pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration) -> Result<Claim> {
-    claim_by_replacing_retry_with(dir, wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
+pub(crate) fn claim_by_replacing_with(
+    dir: &Path,
+    wait: Duration,
+    kill_wait: Duration,
+    poll: Duration,
+) -> Result<Claim> {
+    claim_by_replacing_retry_with(dir, wait, kill_wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
 }
 
 /// [`claim_by_replacing_with`] with the retry schedule injected, so a test can
@@ -347,6 +400,7 @@ pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration
 pub(crate) fn claim_by_replacing_retry_with(
     dir: &Path,
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     attempts: u32,
     retry: Duration,
@@ -363,7 +417,7 @@ pub(crate) fn claim_by_replacing_retry_with(
     // The flock a dying holder released is what this waits on, so the poll is
     // load-bearing: the first attempt races the death and normally still reads
     // the lock held.
-    let lock = terminate_holder(wait, poll, |_| claim_active(dir))?;
+    let lock = terminate_holder(wait, kill_wait, poll, |_| claim_active(dir))?;
     Ok(Claim::Active(lock))
 }
 
@@ -390,7 +444,13 @@ pub(crate) enum DaemonStop {
 /// The TUI's `stop daemon`: the termination `--replace` sends, with no claim
 /// after it, so the box is left with no daemon rather than this process.
 pub(crate) fn stop_running() -> Result<DaemonStop> {
-    stop_running_with(REPLACE_WAIT, REPLACE_POLL, CLAIM_ATTEMPTS, CLAIM_RETRY)
+    stop_running_with(
+        REPLACE_WAIT,
+        KILL_WAIT,
+        REPLACE_POLL,
+        CLAIM_ATTEMPTS,
+        CLAIM_RETRY,
+    )
 }
 
 /// [`stop_running`] with the wait and retry schedules injected, so a test can
@@ -398,6 +458,7 @@ pub(crate) fn stop_running() -> Result<DaemonStop> {
 /// either.
 pub(crate) fn stop_running_with(
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     attempts: u32,
     retry: Duration,
@@ -408,7 +469,7 @@ pub(crate) fn stop_running_with(
     // Death is the event, not the free lock: a parked standby takes the flock
     // the instant it is released, so a free-lock wait would sit out both
     // passes and then SIGKILL a pid that is already gone.
-    terminate_holder(wait, poll, |pid| {
+    terminate_holder(wait, kill_wait, poll, |pid| {
         (!pid_is_tollgate_daemon(pid)).then_some(())
     })?;
     if held_past_probes(attempts, retry)? {
@@ -438,11 +499,13 @@ fn held_past_probes(attempts: u32, retry: Duration) -> Result<bool> {
 }
 
 /// Signal the daemon the [`PID_FILE`] sidecar names until `released` answers
-/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait, one
-/// escalation (SIGKILL, another `/F`), a second bounded wait. Shared by
-/// `--replace` and [`stop_running`], which differ only in what counts as done.
+/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait of `wait`,
+/// one escalation (SIGKILL, another `/F`), then a bounded wait of `kill_wait`
+/// for the dead process's flock to go. Shared by `--replace` and
+/// [`stop_running`], which differ only in what counts as done.
 fn terminate_holder<T>(
     wait: Duration,
+    kill_wait: Duration,
     poll: Duration,
     mut released: impl FnMut(u32) -> Option<T>,
 ) -> Result<T> {
@@ -460,7 +523,7 @@ fn terminate_holder<T>(
         return Ok(done);
     }
     let sent_kill = terminate_pid(pid, true);
-    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+    if let Some(done) = poll_until(kill_wait, poll, || released(pid)) {
         return Ok(done);
     }
     if !sent_term && !sent_kill {
@@ -472,12 +535,16 @@ fn terminate_holder<T>(
     anyhow::bail!(
         "the running tollgate daemon (pid {pid}) did not release the lock within {}s of the force \
          kill; it may be wedged uninterruptibly",
-        wait.as_secs()
+        kill_wait.as_secs()
     )
 }
 
 /// Ask `done` every `poll` until it answers, up to `wait`; `None` on timeout.
-fn poll_until<T>(wait: Duration, poll: Duration, mut done: impl FnMut() -> Option<T>) -> Option<T> {
+pub(super) fn poll_until<T>(
+    wait: Duration,
+    poll: Duration,
+    mut done: impl FnMut() -> Option<T>,
+) -> Option<T> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(value) = done() {
@@ -723,6 +790,26 @@ pub(crate) fn standby_waiting() -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
+/// The stand-down / acquired lines, each logged only on its own edge of
+/// [`FetchLease::stood_down`]. An upstream-refresher park reads as a
+/// stand-down too, so the line names that holder as well.
+const STOOD_DOWN_LINE: &str = concat!(
+    "tollgate: another instance (or upstream clauth's refresher) holds ",
+    "the usage-fetch lease: standing down (rendering from the shared cache)"
+);
+const ACQUIRED_LINE: &str = "tollgate: acquired the usage-fetch lease: fetching";
+
+/// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
+/// can stand down (whichever didn't win the lease). [`logline!`] routes by
+/// PROCESS, never by the calling thread: the daemon's line (stamping on) to
+/// `daemon.log`, an interactive TUI's (stderr still a terminal) to
+/// `~/.tollgate/tollgate.log` — so the line a TUI raises on its UI thread from
+/// `App::finish_bootstrap` is recorded without ever painting over the accounts
+/// pane.
+fn standdown_transition_log(msg: &str) {
+    logline!("{msg}");
+}
+
 /// The single-fetcher lease over `usage-fetch.lock` (#27). Once acquired the
 /// [`File`] is retained for the process lifetime, so the flock is held for life
 /// and released only on exit — deliberately NOT re-acquired per tick, which
@@ -735,6 +822,16 @@ pub(crate) fn standby_waiting() -> bool {
 #[derive(Default)]
 pub(crate) struct FetchLease {
     held: Mutex<Option<File>>,
+    /// Whether the last [`acquire`](Self::acquire) stood down. The one record of
+    /// who fetches: a display surface reads it to tell a row of its own due
+    /// schedule from a mirror's cache-mtime estimate, and its two edges are the
+    /// only places the stand-down / acquired lines are logged, so a UI-thread
+    /// acquire and a tick acquire can never disagree about either.
+    stood_down: AtomicBool,
+    /// Set when THIS instance takes the lease, wherever the take happened (a
+    /// TUI's bootstrap acquires on the UI thread before the first tick), and
+    /// taken once by [`Self::take_new_hold`].
+    new_hold: AtomicBool,
 }
 
 impl FetchLease {
@@ -747,8 +844,19 @@ impl FetchLease {
     /// instance holds it, the lock is unreadable, or upstream clauth's
     /// refresher is live ([`upstream_refresher_active`]) (stand down and hydrate
     /// from the shared cache). Idempotent once held: a held lease short-circuits to
-    /// `true`, so the flock is never re-taken. Both error arms of the try-lock
-    /// stand down — an io error is never a licence to dup-fetch.
+    /// `true`, so the flock is never re-taken. Every step of the attempt past
+    /// that short-circuit — an unresolvable `~/.tollgate`, an unopenable lock file,
+    /// either try-lock error — yields no lease, so all of them stand down
+    /// through the one tail below: an io error is never a licence to dup-fetch.
+    ///
+    /// Each transition line is logged on [`Self::stood_down`]'s own edge: the
+    /// callers include a TUI's `finish_bootstrap` on the UI thread and the
+    /// scheduler's tick, so a caller-side flag would miss the other caller's
+    /// stand-down and log it never or twice. The edge is decided under the
+    /// `held` guard — two concurrent callers still split one transition between
+    /// them — and the line is logged after the guard drops, so two callers'
+    /// lines can reach the log in either order: the log's order across threads
+    /// is not the edge order, and `stood_down` alone says which edge came last.
     pub(crate) fn acquire(&self) -> bool {
         let mut held = match self.held.lock() {
             Ok(g) => g,
@@ -758,32 +866,84 @@ impl FetchLease {
         // same `~/.claude/.credentials.json`: two fetchers rotate and
         // auto-switch that one slot against each other. Re-checked every call,
         // a held lease included, so an upstream instance starting later still
-        // parks this one.
-        if upstream_refresher_active() {
-            return false;
-        }
-        if held.is_some() {
-            return true;
-        }
-        let Ok(dir) = tollgate_dir() else {
-            return false;
+        // parks this one. The park stands down through the same tail as a lost
+        // lease, so `fetches_here` and the transition lines never miss it.
+        let fetched = if upstream_refresher_active() {
+            false
+        } else if held.is_some() {
+            // Held for life, so a held lease reads stood down only after an
+            // upstream park; the tail below logs that park's end once.
+            if self.fetches_here() {
+                return true;
+            }
+            true
+        } else {
+            let taken = self.try_take_lease();
+            let fetched = taken.is_some();
+            if let Some(file) = taken {
+                *held = Some(file);
+                self.new_hold.store(true, Ordering::Relaxed);
+            }
+            fetched
         };
+        let transition = if fetched {
+            self.mark_acquired()
+        } else {
+            self.mark_stood_down()
+        };
+        drop(held);
+        if let Some(line) = transition {
+            standdown_transition_log(line);
+        }
+        fetched
+    }
+
+    /// Take the lease file, or `None` when the attempt cannot yield one. Every
+    /// failure collapses here, so no failure can skip the caller's tail and
+    /// answer `false` without recording the stand-down.
+    fn try_take_lease(&self) -> Option<File> {
+        let dir = tollgate_dir().ok()?;
         // The lease file lives in `~/.tollgate`; ensure the dir exists (best-effort,
         // 0o700) so a first-run TUI with no daemon can still take the lease.
         // `serve()` already creates it for the daemon; a TUI normally reaches here
         // with the dir already present (profiles live in it).
         let _ = crate::profile::mkdir_700(&dir);
-        let Ok(file) = crate::profile::open_state_file(&dir.join(super::FETCH_LOCK_FILE)) else {
-            return false;
-        };
+        let file = crate::profile::open_state_file(&dir.join(super::FETCH_LOCK_FILE)).ok()?;
         match file.try_lock() {
-            Ok(()) => {
-                *held = Some(file);
-                true
-            }
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(std::fs::TryLockError::Error(_)) => false,
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => None,
         }
+    }
+
+    /// Record a stand-down and return the line to log when this call is the
+    /// false→true edge, so a tick that keeps losing the lease says so once.
+    /// The caller logs it after the `held` guard drops.
+    fn mark_stood_down(&self) -> Option<&'static str> {
+        (!self.stood_down.swap(true, Ordering::Relaxed)).then_some(STOOD_DOWN_LINE)
+    }
+
+    /// Record an acquire and return the line to log when this call is the
+    /// true→false edge. The caller logs it after the `held` guard drops.
+    fn mark_acquired(&self) -> Option<&'static str> {
+        self.stood_down
+            .swap(false, Ordering::Relaxed)
+            .then_some(ACQUIRED_LINE)
+    }
+
+    /// Whether this instance runs the usage fetches itself. `false` means it
+    /// mirrors another process's disk, so the deadline it publishes is its own
+    /// cache-mtime estimate rather than a fetch it is about to run. A lease not
+    /// yet tried reads `true`: an instance that has not stood down is the one
+    /// about to fetch.
+    pub(crate) fn fetches_here(&self) -> bool {
+        !self.stood_down.load(Ordering::Relaxed)
+    }
+
+    /// Whether this instance took the lease since the last call: `true` once
+    /// per take, so the first tick under a lease taken over from another
+    /// instance can read what the old holder recorded.
+    pub(crate) fn take_new_hold(&self) -> bool {
+        self.new_hold.swap(false, Ordering::Relaxed)
     }
 }
 

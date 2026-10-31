@@ -7,7 +7,7 @@ Four files, all TOML, all safe to hand-edit while tollgate runs (it reloads on e
 - `~/.tollgate/codex-profiles.toml` for the codex roster: its own active marker, chain and weekly line ([Codex](Codex)).
 - `~/.tollgate/monitors.toml` for monitoring-only accounts ([below](Configuration#monitorstoml)).
 
-Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by tollgate itself; those cells say which. The codex file, `monitors.toml`, `palette`, `local_api` and `billing_key_env` have no TUI equivalent; `monitors.toml` is edited with `tollgate monitor add` / `remove` or by hand.
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by tollgate itself; those cells say which. The codex file's chain keys, `monitors.toml`, `palette`, `local_api` and `billing_key_env` have no TUI equivalent (Setup creates and deletes codex profiles); `monitors.toml` is edited with `tollgate monitor add` / `remove` or by hand.
 
 ## Account types
 
@@ -17,7 +17,9 @@ Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin t
 
 **Long-lived setup token.** `tollgate login <name> --setup-token` stores a `claude setup-token` mint as `session-token.json`. Sessions run on that static login, which never races tollgate's token refresher. The Setup tab then shows a `token` row counting down to the re-mint. The mint reads as untiered to Claude Code (its scope set cannot read `/profile`, so no tier can be stamped), and plan-gated flags evaluate against their untiered default.
 
-The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `tollgate login <name>` updates only what tollgate polls usage with. `tollgate static-token <name> --clear` drops it and puts the OAuth login back in front of sessions — the full exit: the preserved mint backup and the `rolling_token` flag go with it, so nothing re-creates a sidecar afterwards.
+The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `tollgate login <name>` updates only what tollgate polls usage with — unless `rolling_token` is set, when every rotation re-stamps the token from that login instead, so the sessions move onto it at the next rotation, another account's if that is what you logged in as. The note the login prints says which of the two applies. `tollgate static-token <name> --clear` drops it and puts the OAuth login back in front of sessions — the full exit: the preserved mint backup and the `rolling_token` flag go with it, so nothing re-creates a sidecar afterwards.
+
+**Usage probe.** A setup token alone gives `/usage` nothing to read, since its two scopes lack `user:profile`. With `usage_probe = true` on such an account (the Setup tab's `usage probe` row), tollgate sends the auto-start kick's 1-token Haiku request on the setup token every `usage_probe_interval_ms` and reads the account's 5h and 7d windows off the rate-limit headers the response carries. The reading lands as a `/usage` reading does: on the Usage tab and the Overview, in `usage_history.jsonl`, which the burn rate and the auto-start queue read, and in the fallback walk. Every probe is inference on that account and may start its 5-hour window. The interval defaults to 90s and stays between 60s and 450s; a value outside is clamped into it. The floor bounds what the probes cost. The cap keeps the gap between two probes, the interval plus a spread of up to a quarter of it, under the 10 minutes past which the burn rate cuts its history, so a probe at the cap still gets a burn rate. An organization that refuses the account (on hold, disabled, a key whose creator left it, an endpoint closed to its region or an address outside its allowed range) reads `org refused`, apart from a canceled subscription, and no automatic switch lands there; the next good reading lifts it. A 401 or 403 is a refused token only when its body is the server's own refusal of the credential: a page a proxy or a firewall in front of the API answers with is a failed probe. A token the server refuses is a dead login, as a rejected api key is: no automatic switch, `tollgate start --auto`, day claim or recovery lands on the account, and a `delegate` onto it is refused before it spends. The Usage tab, the Fallback card, `tollgate list` and the plugin's `profiles` read `token rejected`, the card with `re-mint with tollgate login <name> --setup-token`, and the selector and the Overview mark the account (`×`, and `⊘` before its name). The verdict is kept against that token in `third_party_auth.json`, so a restart, the daemon's included, or a switched-off probe keeps it; any other probe outcome lifts it, as for a rejected key, and a new token retires it. An OAuth pair stored beside the token keeps it: a switch installs the token ahead of the pair, so sessions there would still run on it. The token is not probed again until `tollgate login <name> --setup-token` captures a new one `claude setup-token` minted, tollgate restarts, another tollgate process takes over fetching usage, or the probe is switched off and on, since the rest lives in memory only. A manual refresh retries it once too, but only in the tollgate process that fetches usage; beside a stored OAuth pair that retry settles the token's verdict alone, and the pair's `/usage` reading stays. While an OAuth pair is stored the switch does nothing, since `/usage` reads that account, and so it does where no setup token is stored, since the probe would have nothing to send: the Setup tab shows the row only where one is.
 
 A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back — or arm `tollgate rolling-token <name>`, which has the daemon re-stamp the sidecar from the profile's own usage chain: still no refresh token in front of sessions, but the chain's full scope set, plan stamp and `rateLimitTier`, so plan-gated models and flags work. A second live session holding one rotating login earns a warning naming `tollgate rolling-token <name>` before a refresh signs the others out, and a session started before the arming converges onto the sidecar on its own next poll. The superseded mint waits at `session-token.static.json` and the bare `tollgate static-token <name>` puts it back.
 
@@ -44,9 +46,9 @@ Six providers get typed usage panels (the full per-provider reference, including
 | Provider | Base URL | Shows |
 |----------|----------|-------|
 | DeepSeek | `https://api.deepseek.com` | balance rows per currency: api balance, granted, topped up |
-| Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
+| Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d) plus an `mcp tools` bar (the MCP web tools' monthly quota), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | `GET /api/v1/key` first (the key's own figures: today / this week / this month / lifetime spend, the key cap and what is left of it, BYOK spend, the free-model daily requests), then the wallet from `GET /api/v1/credits`: api balance (remaining credits, negative when overdrawn), used, purchased. A failed `/credits` drops the wallet row alone. Figures are kept as exact decimals from the raw JSON. With `billing_key_env` set, `/credits` is read with that management key instead ([below](Configuration#configtoml)) |
-| Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
+| Alibaba Model Studio | the Qwen preset endpoint below and the four Model Studio hosts (`token-plan.ap-southeast-1.maas.aliyuncs.com`, `token-plan.cn-beijing.maas.aliyuncs.com`, `coding-intl.dashscope.aliyuncs.com`, `coding.dashscope.aliyuncs.com`) | a 30d bar carrying your tier's monthly allowance, gated at the weekly line, a 5h bar when the API reports one, plan tier, subscription status and days left |
 | MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 | Ollama Cloud | `https://ollama.com` | read from `GET https://ollama.com/api/usage` with the account's own key. A legacy plan reports a 5h and a 7d bar (both feed auto-switch); a new-pricing plan reports one `month` bar for its dollar pool (display only). Bars can pass 100 %, a window the API names without a figure reads `usage not reported` rather than 0 %, and the API publishes no reset time. Then the spend over the last four weeks (exact, in USD) and per-model request counts per window. A month at or past 100 % reads `included credits used up`: extra use draws on purchased credits or team billing, which the API does not show |
 
@@ -69,8 +71,9 @@ For those six, `open provider console` in the TUI action menu ([Interface and ke
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
 | Alibaba Coding Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan> |
+| Qwen Cloud Token Plan | <https://home.qwencloud.com/api-keys> |
 
-Alibaba gets four rows because Token Plan and Coding Plan are separate products with separate quotas, sold on two consoles that do not share accounts. Take the key from the page matching the endpoint you configured, or your calls bill against a plan you did not mean. The key is the `sk-sp-…` one on your plan's own page, not a workspace key from the general api-key page, which is billed pay-as-you-go instead of drawing your plan's quota.
+Alibaba gets five rows because Token Plan and Coding Plan are separate products with separate quotas, sold on two consoles that do not share accounts, and Qwen Cloud's Token Plan lives on Qwen Cloud's own console. Take the key from the page matching the endpoint you configured, or your calls bill against a plan you did not mean. The key is the `sk-sp-…` one for your plan: on a Model Studio console that is your plan's own page, not a workspace key from the general api-key page, which is billed pay-as-you-go instead of drawing your plan's quota; on Qwen Cloud's API Keys page, take it from the Token Plan section (Individual or Team tab), not a pay-as-you-go key.
 
 An AccessKey pair from the RAM console is a different thing again and tollgate has no use for one. It cannot read a Solo plan's quota (measured, on the signed OpenAPI), so nothing here asks for one.
 
@@ -82,7 +85,7 @@ The 48-hour clock runs from your aliyun console sign-in, so it is already tickin
 
 An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key (or an auth token in its `[env]`).
 
-The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account a Qwen preset first, then log in.
+The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account an Alibaba endpoint first (the Qwen preset on the Setup tab, or `--base-url` here), then log in.
 
 ## Model routing
 
@@ -102,7 +105,7 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair, plus a few non-secret env switches, that you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu (`apply preset`). There is no CLI flag for it: create the account with `tollgate login <name> --base-url <endpoint>`, then apply the preset. Nine ship built in:
+A preset is a named `base_url` + `[models]` pair, plus a few non-secret env switches, that you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu (`apply preset`). There is no CLI flag for it: create the account with `tollgate login <name> --base-url <endpoint>`, then apply the preset. Six ship built in:
 
 | Preset | Endpoint | Models | Env it adds |
 |---|---|---|---|
@@ -110,21 +113,19 @@ A preset is a named `base_url` + `[models]` pair, plus a few non-secret env swit
 | `Z.ai` | `https://api.z.ai/api/anthropic` | tier binds below; `default = opus` | none |
 | `OpenRouter` | `https://openrouter.ai/api` | `default = opus`, `opus` = `~anthropic/claude-opus-latest[1m]`, `sonnet` = `~anthropic/claude-sonnet-latest[1m]`, `haiku` = `~anthropic/claude-haiku-latest`, `fable` = `~anthropic/claude-fable-latest[1m]`; subagent unset | `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1` |
 | `MiniMax` | `https://api.minimax.io/anthropic` | tier binds below; `default = opus` | none |
-| `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | every tier `qwen3.8-max` | none |
-| `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` | every tier `qwen3.8-max` | none |
-| `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | every tier `qwen3-coder-plus` | none |
-| `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | every tier `qwen3-coder-plus` | none |
+| `Qwen` | `https://token-plan.maas.qwencloudapi.com/apps/anthropic` | tier binds below; `default = opus` | none |
 | `Ollama-Cloud` | `https://ollama.com` | none | `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, `DISABLE_ERROR_REPORTING=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` |
 
-`DeepSeek`, `Z.ai` and `MiniMax` bind the provider's strongest current model to `opus` and `fable` and its fast one to `sonnet` and `haiku`, and set `default` to `opus`, so the main model follows the `opus` row:
+`DeepSeek`, `Z.ai`, `MiniMax` and `Qwen` bind the provider's strongest current model to `opus` and `fable` and its fast one to `sonnet` and `haiku`, and set `default` to `opus`, so the main model follows the `opus` row:
 
 | Preset | `opus`, `fable` | `sonnet`, `haiku` |
 |---|---|---|
 | `DeepSeek` | `deepseek-v4-pro[1m]` | `deepseek-flash[1m]` |
 | `Z.ai` | `glm-5.3[1m]` | `glm-5.3-flash[1m]` |
 | `MiniMax` | `MiniMax-M3[1m]` | `MiniMax-M3.1-Flash-Preview[1m]` |
+| `Qwen` | `qwen3.8-max[1m]` | `qwen3.8-flash[1m]` |
 
-MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-point `sonnet` and `haiku`. `OpenRouter` serves the real Claude models, so each row takes its own family's moving alias: `~anthropic/claude-opus-latest[1m]`, `~anthropic/claude-sonnet-latest[1m]`, `~anthropic/claude-haiku-latest` and `~anthropic/claude-fable-latest[1m]`, with `default` on `opus` too. The `[1m]` suffix tells Claude Code the model takes a 1M-token context. The four Alibaba ones put their one model on every row, the subagent row included, because those endpoints reject a Claude model id outright rather than serving something for it, so any row left unpinned fails on use. `Ollama-Cloud` sets the endpoint and no model at all (see below). All nine leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-point `sonnet` and `haiku`. `OpenRouter` serves the real Claude models, so each row takes its own family's moving alias: `~anthropic/claude-opus-latest[1m]`, `~anthropic/claude-sonnet-latest[1m]`, `~anthropic/claude-haiku-latest` and `~anthropic/claude-fable-latest[1m]`, with `default` on `opus` too. The `[1m]` suffix tells Claude Code the model takes a 1M-token context. The `Qwen` preset binds every tier because that endpoint rejects a Claude model id outright rather than serving something for it; its `subagent` row stays unset, and an unset subagent row inherits the main model. `Ollama-Cloud` sets the endpoint and no model at all (see below). All six leave the api key alone. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.tollgate/presets/<name>.json`:
 
@@ -165,6 +166,10 @@ Applying the `Ollama-Cloud` preset from the Setup tab sets the endpoint and adds
 The plan label (`pro-legacy`, `pro`, `max`, `team`) is not in the usage response, so an Ollama account shows no tier unless you name one. Personal and team keys are separate Ollama accounts, so give each its own profile.
 
 When an account or `+ new` draft carries a value the preset leaves unset, the confirmation names those fields and offers `keep them` (the default) or `clear them`. The account’s API key stays unchanged.
+
+A saved preset whose name matches a built-in (`qwen` saved before the `Qwen` built-in shipped, say) still lists among the saved presets, without the built-in mark, and applies and deletes as your own.
+
+tollgate offers to move your accounts onto each built-in's current models. An account whose endpoint matches a built-in's is offered that built-in's value on every model row that is empty or still holds an id the built-in shipped in an earlier release; any other id stays. A row the built-in leaves unset (`subagent`, on every built-in) stays empty, and is cleared if it holds an earlier release's id. The first TUI launch with something to offer opens one confirm, the first launch after installing or updating included: accounts with the same changes share a block, each with its own toggle line, all checked. <kbd>space</kbd> flips one and `apply` writes the checked accounts. `not now` (or <kbd>esc</kbd>), and an `apply` that writes every checked account, keep it closed until a release changes the built-in presets; a failed write brings it back on the next launch. From the shell, `tollgate presets rebind` prints the same moves at any time, `not now` or not, and `tollgate presets rebind --yes` applies them; naming accounts limits either to them. An account that fails is named on stderr while the rest still move; rows it saved before failing count as moved, and the command exits 1.
 
 ## Auto-start the 5-hour window
 
@@ -226,7 +231,7 @@ How the Omarchy keys map onto tollgate's colour roles:
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
-| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
+| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line (a monthly-only account's 30d quota gates on it instead), 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
@@ -267,7 +272,7 @@ A key tollgate does not know (written by a newer release, or added by hand) is k
 
 ## `codex-profiles.toml`
 
-The codex roster, kept apart from `profiles.toml` so a codex switch never rewrites the Claude Code file and an older tollgate never opens this one. `tollgate login <name> --codex` creates it; the threshold and `wrap_off` keys are hand-edited only, there is no tab for it, while `active_profile` moves with `tollgate <name>` and the codex auto-switch, and `profiles` and `fallback_chain` with each codex login and delete ([Codex](Codex)).
+The codex roster, kept apart from `profiles.toml` so a codex switch never rewrites the Claude Code file and a tollgate older than codex support never opens this one; tollgate 0.1.0 to 0.4.4 opens it but drops `[ids]` on its next save, and a codex browser re-login in flight across that save is refused. `tollgate login <name> --codex` or Setup's `+ new` creates it; the threshold and `wrap_off` keys are hand-edited only (Setup lists the roster and creates and deletes its profiles; it has no editor for the chain keys), while `active_profile` moves with `tollgate <name>` and the codex auto-switch, and `profiles` and `fallback_chain` with each codex login and delete ([Codex](Codex)).
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
@@ -276,6 +281,7 @@ The codex roster, kept apart from `profiles.toml` so a codex switch never rewrit
 | `fallback_chain` | list | `[]` | the codex chain, in walk order ([Auto-switch](Auto-Switch#codex)) |
 | `wrap_off` | bool | `false` | clear the active slot once every codex member is spent, instead of staying on the last one |
 | `weekly_switch_threshold` | float | `98.0` | the codex chain's 7d exhaustion line, 50-100; a value outside the band reads as the default and is rewritten to `98.0` on the next save, and a key the file never carried is not invented into it |
+| `[ids]` | table | `{}` | written by tollgate, one per profile; leave it as written |
 
 A codex profile's own `config.toml` carries `harness = "codex"` and one optional key of its own, `hooks_json` (below); the Claude Code keys in the next table do not apply to it.
 
@@ -283,19 +289,23 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
+| `id` | string | none | written by tollgate; a login started for this account lands only while this name still holds the same id, so a rename away, a delete, or a recreate under a fresh id during the login refuses it (`profile '<name>' no longer exists`). leave it as written, and drop it from a copied profile directory |
 | `base_url` | string | none | API endpoint; unset means an OAuth account |
 | `api_key` | string | none | key for that endpoint |
 | `auto_start` | bool | `false` | the 1-token window-opening ping (alias `kick_timer`) |
+| `usage_probe` | bool | `false` | read a setup-token account with no OAuth pair through a 1-token Haiku request; may start its 5h window |
+| `usage_probe_interval_ms` | integer | `90000` | how often the usage probe runs, 60000 to 450000, a value outside clamped into it; the Setup tab's `probe every` row steps it by 30s |
 | `disabled` | bool | `false` | hide from auto-switch, polling, and the status feed |
 | `fallback_threshold` | float | `95.0` | 5h utilization % that switches away from this account |
-| `weekly_threshold` | float | chain value | per-account override of the 7d line, 50-100 |
+| `weekly_threshold` | float | chain value | per-account override of the 7d line (a monthly-only account's 30d quota gates on it instead), 50-100 |
 | `check_weekly` | bool | `true` | count the aggregate weekly window against this account |
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
+| `check_credit_cap` | bool | `true` | keep auto-switch off this account while its usage-credit cap is spent, and sort it after the others on its line in the plugin's `profiles` roster; never a refusal (a delegate or `start --auto` launch whose model tollgate cannot tell is refused whatever this says); an account that serves its own endpoint with its own key never spends those credits, so no gate applies to it |
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account tollgate returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below. The Setup tab's `alert at` row edits it |
+| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `tollgate rolling-token`, cleared by `tollgate static-token` (bare or `--clear`) |
 | `billing_key_env` | string | none | the NAME of an environment variable holding a monitoring-only key (an OpenRouter management key today). Only the name is stored. The daemon reads the value from its own environment at fetch time and sends it to `GET /api/v1/credits` and nowhere else; it is never written, printed or handed to a session, and every named variable is scrubbed from each `claude` / `codex` spawn. Process variables (`PATH`, `HOME`, `XDG_*`, …) are refused as names. Set it by hand; no TUI row writes it |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
@@ -307,7 +317,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `preferred_days` has a `preferred days` row on the member's Fallback card, listing the presets `never  weekdays  weekends  every day` with the current one lit: <kbd>space</kbd> steps through them and back to `never`, saving each step, and <kbd>⏎</kbd> opens a day picker for any other set ([Interface and keys](Interface-And-Keys#tab-dependent)). A list matching no preset shows its days after the presets and stays one more stop after `every day` while the card is open, so stepping past it and back brings it back. The card's `preferred` row names the days once a list is set, and `+ add` names a list an account still carries from before it left the chain. In a hand-written list, full names and three-letter forms parse in any case (`["sat", "Sunday"]`), and an entry that does not parse is dropped on the next rewrite. The list is re-read per chain build, so the rollover at midnight needs no restart.
 
-A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled, auth-broken or carrying a rejected api key claims nothing: a member's `preferred days` row names the blocker (`its api key was rejected` for that case), `+ add` names one that is off the chain, and saving such a list warns (once per day-picker visit, and on each <kbd>space</kbd> step that sets days). A lapsed Alibaba console login does not block the claim because its inference key still serves. A list can also go inert later, or arrive by hand-editing the file, so tollgate says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled, auth-broken, carrying a rejected api key or setup token, or logged out claims nothing: a member's `preferred days` row names the blocker (`its api key was rejected` or `its setup token was rejected` for those cases), `+ add` names one that is off the chain, and saving such a list warns (once per day-picker visit, and on each <kbd>space</kbd> step that sets days). A lapsed Alibaba console login does not block the claim because its inference key still serves. A list can also go inert later, or arrive by hand-editing the file, so tollgate says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
 
 **A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
 
@@ -379,9 +389,15 @@ The daemon must be started from an environment that holds the named variables; `
   import-backup/           # the import's non-secret byte backups (rosters, herdr's config.toml)
   devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `tollgate devices pair` runs (0600)
+  push-vapid-key.der       # the daemon's VAPID signing key (P-256 PKCS#8), minted once on first use (0600)
+  push-subscriptions.json  # one push subscription row per device: endpoint, p256dh, auth, the event set (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
+  tps_cache.json           # the lease holder's live token-speed cache, republished into status.json's `tps` slot (0600)
+  token_speed.json         # the per-day speed ledger behind the token-speed surfaces, written by the producer alone (0600); one that does not parse is renamed token_speed.json.corrupt-<epoch_ms> (0600) before the next save, and one tollgate cannot read, or one a newer tollgate wrote, is never saved over
+  tps_attribution.json     # which account each session's replies ran on, for the speed history (0600); one that does not parse is renamed tps_attribution.json.corrupt-<epoch_ms> (0600) before the next save, and one tollgate cannot read, or one a newer tollgate wrote, is never saved over
+  tps_days.json            # the producer's list of speed days not yet in token_speed.json (0600); one that does not parse is renamed tps_days.json.corrupt-<epoch_ms> (0600) before the next save, and one tollgate cannot read, or one a newer tollgate wrote, is never saved over
   tollgate.log, daemon.log # event lines from the TUI and the daemon
   tollgated.pid            # the running daemon's process id
   gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
@@ -390,14 +406,19 @@ The daemon must be started from an environment that holds the named variables; `
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
   completions/             # generated shell completion scripts
-  .completions_installed   # marker: completions have been installed
+  .completions_installed   # marker: the first-launch completions prompt was answered
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
+  daemon-stops-in-flight.json # runtime trees whose supervisor stop is in flight, the supervisors that wedged on SIGTERM (pid and start time) and, on macOS and Windows, the trees already announced as spared; no credential (0600)
+  .claude-json-sync.lock   # the flock serializing every `.claude.json` merge, switch strip, session seed and `wire mcp server` across live tollgate processes, so one Claude Code write costs each copy at most one rewrite; empty, 0600
+  .claude-json-sync-written.json # the `.claude.json` copies tollgate wrote: path, mtime, size, a SHA-256 of the bytes and the rank of the Claude Code write they came from; tells tollgate's own unchanged copies apart from Claude Code's writes, no config content (0600)
+  .settings-sync-written.json # the same record for `settings.json` (0600)
+  .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
   jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
   jobs/<id>.json.delivered # exactly-once delivery ledger after collection
   keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
-  live_sessions/<sid>.json # one row per live `tollgate start` session
+  live_sessions/<sid>.json # one row per live session tollgate launched (start, delegate, background)
   mcp_live/<pid>           # one marker per live `tollgate mcp` server, so its delegate jobs read dead once it exits
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
@@ -410,26 +431,34 @@ The daemon must be started from an environment that holds the named variables; `
       credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
       auth.spent.json      # fingerprints of the last 64 refresh tokens tollgate traded in, never the tokens
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
+      note.txt             # the account's free-form note, edited from the Usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
       wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
-      third_party_auth.json# set while the usage login is expired; a hash, never the credential
+      third_party_auth.json# set while the account's api key or setup token is rejected, or its usage login expired; a hash, never the credential
       account_id.json      # bare account UUID anchor
       account_identity.json# local login email, organization and verification time
       identity_pending.json# installed login awaiting an account confirmation
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
+      credit_refusal.json  # the credit-billed request this account last refused, until a request on it succeeds or a window reset leaves it headroom; after either or a login as another account it keeps only an instant, so no older refusal is recorded again
       throughput_cache.json# observed delegate tokens/sec per model
       touch-receipt.json   # what the last credential swap wrote, for the watchdog
       adopt_refusal.json   # last standing live-credential adoption refusal announced
       quarantine/          # credentials parked after a refresh token was rejected
-      runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
-      runtime-isolated-<sid>/
+      runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session, holding its own Claude Code supervisor state (daemon/, daemon.lock, daemon.status.json, daemon.log, daemon.json, daemon.scheduled.status.json) inside it, never linked from ~/.claude; a --with-fallback session's tree outlives it while a background job names it, held by the daemon until none does
+      runtime-isolated-<sid>/ # likewise, linking nothing from ~/.claude, so any supervisor state stays inside it
       sessions-<sid>/      # that session's PID file, flock-held while it runs
       sessions-isolated-<sid>/
+      runtime-bg/         # the tree a tollgate start <p> -- --bg session runs in (a --with-fallback launch keeps its own runtime-<sid>/), daemon-held while a job names it; its own supervisor state lives inside it, and collecting the tree stops that supervisor first
+      sessions-bg/        # that tree's per-holder PID files, flock-held while a launcher or the daemon holds it
+      runtime….rescuing/   # a dead session's tree whose transcripts or session files could not all move into ~/.claude yet; each cleanup retries it, and it goes once they have
+      runtime….rescuing.claim # held by the one cleanup moving that tree's files; stays beside a kept tree and goes with it; empty (0600)
+      spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit; kept while a background session's (tollgate start <p> -- --bg) job names it, until claude rm <id>, or while a job store tollgate reads (the global one, or the tree's own) cannot be read, or holds a job whose recorded launch flags tollgate cannot read and that runs in this session's runtime tree (at tollgate's cleanup of a shared session's file, also one in the profile's unsuffixed runtime/ or runtime-bg/); tollgate's next stale-session cleanup (when tollgate start or resume launches, the TUI opens, or the daemon or the plugin's MCP server starts) removes it after that
+      spawn-settings-isolated-<sid>.json # likewise, only when the isolated tree sits under a symlinked path
     cx/                    # a codex profile (see Codex)
       config.toml          # harness = "codex", plus hooks_json
       auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture
@@ -449,10 +478,12 @@ The daemon must be started from an environment that holds the named variables; `
   markers/<hash>           # the install record `tollgate self-heal` keys on
 ```
 
-Five static lock files sit alongside and are never deleted on purpose: `.lock`, `tollgated.lock`, `tollgated-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other tollgate-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.tollgate` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
+Seven static lock files sit alongside and are never deleted on purpose: `.lock`, `tollgated.lock`, `tollgated-standby.lock`, `usage-fetch.lock`, `.claude-json-sync.lock`, `rescue.lock` (held while one rescue lands a file from a session's runtime tree into `~/.claude`, so two never land on one name at once), `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other tollgate-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Every file under `~/.tollgate` is `0600` (`0700` for one its owner may execute) and every directory `0700`, re-tightened on each launch; inside a codex home, codex's own files keep the modes codex gives them. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting `credentials.json.staged` before tollgate lands it can sign that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
+Deleting any `*_cache.json` or `status.json` costs you history and nothing else. Deleting `third_party_auth.json` also drops the dead-login verdict of a rejected api key or a refused setup token, so automatic switches and `tollgate start --auto` can land on that account again until a fetch or a probe learns the verdict anew, which for a setup token with its usage probe off never happens. Deleting `credit_refusal.json` drops that account's credit refusal, so a credit-billed session can land there again until the account refuses anew. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. A `credentials.json` that cannot be read or parsed signs out that profile alone. The other accounts still load, each CLI command you run names the unreadable profile once on stderr, and switching to it links nothing. tollgate keeps the file until you log in again, log the profile out, or agree to save a newer login Claude Code holds over it; an api re-key (`tollgate login <name> --base-url <url> --api-key <key>`) refuses rather than drop it. Deleting `credentials.json.staged` before tollgate lands it can sign that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
-The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) tollgate builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).
+The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) tollgate builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)). A background session instead lands on the account's one fixed pair, `runtime-bg/` + `sessions-bg/`, on every host that links: `tollgate start <p> -- --bg` (either `--bg` or `--background`) runs there, and the daemon holds the tree while any Claude Code job names it — a hold that needs `tollgate daemon` running. `--bg` with `--isolated` is refused before anything spawns, and `--bg` on a host that copies runtime trees (any host above that copies; on Windows, Developer Mode turns linking on) is refused before anything spawns, since a copied tree cannot follow a rotation the background session would outlive.
+
+Where symlinks work, a shared runtime tree always links `~/.claude/jobs/` and `~/.claude/projects/` (in guest mode the same stores under `~/.tollgate/guest-claude/` instead, so nothing is created in `~/.claude/`; [Guest mode](Guest-Mode)). A missing one is created first (owner-only on Linux and macOS), `~/.claude/` too if it is missing, so a background session's job record and every transcript land where Claude Code and tollgate read them, even on a machine where Claude Code never created them. When `~/.claude/` refuses the new directory (read-only or full), the session still starts and `tollgate start` or `tollgate resume` prints one line to stderr per store it could not create: for `jobs/`, that session's background jobs stay in its own tree, where `claude agents` outside it cannot see them; for `projects/`, its transcripts stay in its own tree until it ends, then move into `~/.claude/projects/`; while `~/.claude/` still refuses them the tree stays as `runtime….rescuing` and each cleanup retries it. On a host that copies runtime trees, tollgate's tree build and its copy sync both skip `jobs/`, so a copy-host tree never gets the job store and a background job's record lands in that tree's own `jobs/`. tollgate reads a background job's record, on every host, from the global `~/.claude/jobs/` plus each tree's own real `jobs/` (a tree-local record naming a different tree is a stale copy and is skipped).
 
 Delegate job records add `host_pid` and `host_session` for the spawning Claude Code process, `cwd` for the run directory, and `spawned_by` for the caller's account. These fields survive heartbeat and completion writes. The Plugin tab shows each delegate's directory and spawning account, plus elapsed time and last-output age (or `no output yet`) for running and blocking jobs, including jobs with no deadline. Older records omit unknown origins. A session-record host pid is accepted only when liveness can be proven; otherwise accounting falls back to the host session identity.

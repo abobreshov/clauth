@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentgear"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773c81a11f35a3842caf3403c9993f3d0d1d9d672d9fb3c4454080c04dfa040f"
+checksum = "ce1ef0eb25ce67cf4d706dea8bf67236bac27937c41e2075882e11e832d01b97"
 dependencies = [
  "agentgear-derive",
  "brotli",
@@ -30,9 +30,9 @@ dependencies = [
 
 [[package]]
 name = "agentgear-derive"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d41224cc1e599031fb55ba3603c0f3cf16b6ab42c20e138e943097e6b18424b"
+checksum = "bb1155487cdf35f0972d52bafab4563d01f547571aadb8ef1e815562df0bc8f6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -661,6 +661,12 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dyn-clone"
@@ -2422,7 +2428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2711,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "tollgate"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "agentgear",
  "anyhow",
@@ -2720,6 +2726,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "dirs",
+ "dunce",
  "getrandom 0.4.3",
  "hex",
  "httparse",
@@ -2728,6 +2735,7 @@ dependencies = [
  "os_info",
  "ratatui",
  "regex",
+ "ring",
  "rmcp",
  "rpassword",
  "rustls",

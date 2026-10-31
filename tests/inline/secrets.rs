@@ -159,7 +159,7 @@ fn the_lookup_reloads_a_changed_store() {
 #[test]
 fn the_confirmation_vendor_prefix_contains_no_key_specific_characters() {
     let line = stored_confirmation("TEST_KEY", "sk-proj-CANARY");
-    assert!(line.contains("14 chars, sk-proj-…"), "{line}");
+    assert!(line.contains("14 chars, sk-proj-..."), "{line}");
     assert!(line.contains("stored TEST_KEY"));
     assert!(!line.contains("CANARY"));
     assert!(!stored_confirmation("TEST_KEY", "unknown-CANARY").contains(", unknown"));

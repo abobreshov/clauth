@@ -236,6 +236,14 @@ fn usage_adopts_one_official_login_and_keeps_the_auth_file() {
     );
 }
 
+/// xAI's own spelling of a billing-period bound: RFC 3339 with microseconds
+/// and a `+00:00` offset.
+fn xai_stamp(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 991_028_000)
+        .expect("a valid stamp")
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
+}
+
 #[test]
 fn usage_maps_proto3_omitted_zero_percent_and_hides_money() {
     let sandbox = crate::testutil::HomeSandbox::new();
@@ -243,17 +251,23 @@ fn usage_maps_proto3_omitted_zero_percent_and_hides_money() {
         sandbox.home(),
         r#"{"https://auth.x.ai::test":{"key":"ACCESS","expires_at":2000000000}}"#,
     );
+    // A live weekly period, three days in: the report drops a window whose
+    // reset has passed, so a fixed date would stop showing it once it went by.
+    let start = crate::usage::now_epoch_secs() - 3 * 86_400;
+    let end = start + 604_800;
+    let (start_iso, end_iso) = (xai_stamp(start), xai_stamp(end));
     let http = billing_http(
-        json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-21T15:38:08.991028+00:00","end":"2026-10-28T15:38:08.991028+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":10000},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","billingPeriodStart":"2026-10-21T15:38:08.991028+00:00","billingPeriodEnd":"2026-10-28T15:38:08.991028+00:00"}}),
+        json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":start_iso,"end":end_iso},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":10000},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","billingPeriodStart":start_iso,"billingPeriodEnd":end_iso}}),
     );
     let accounts =
         crate::usage::report::accounts(&crate::usage::collect::CollectOpts::default(), &http);
     let account = grok_account(&accounts);
     assert_eq!(account.plan.as_deref(), Some("SuperGrok Plus"));
+    assert_eq!(account.windows.len(), 1, "the live window is reported");
     assert_eq!(account.windows[0].label, "7d");
     assert_eq!(account.windows[0].used_pct, Some(0.0));
     assert_eq!(account.windows[0].window_secs, Some(604_800));
-    assert_eq!(account.windows[0].resets_at.unwrap().secs(), 1_793_201_888);
+    assert_eq!(account.windows[0].resets_at.unwrap().secs(), end);
     assert!(account.windows[0].attribution.is_empty());
     assert!(account.money.is_empty());
 }

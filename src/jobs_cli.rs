@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 
-use crate::format::{humanize_span, truncate};
+use crate::format::{humanize_span, terminal_safe, truncate};
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::usage::now_ms;
 use crate::{out, outln};
@@ -189,7 +189,7 @@ fn render_table(rows: &[JobRow]) -> String {
 /// `char::is_whitespace`. So an escape sequence would reach the terminal intact,
 /// and truncation could cut one in half and leave a dangling `\x1b[`.
 ///
-/// **Bidi formatting** ([`reorders_display`]): `is_control` is FALSE for these,
+/// **Bidi formatting** ([`crate::format::reorders_display`]): `is_control` is FALSE for these,
 /// so the first bullet does not reach them, and they are the Trojan-Source
 /// class — one `U+202E` reverses the display order of the rest of the line, so a
 /// delegate's words can be made to read as something they are not, on the one
@@ -224,34 +224,7 @@ fn render_table(rows: &[JobRow]) -> String {
 /// structural one**: the day a column starts carrying a caller-supplied label,
 /// it needs this filter too.
 fn tail_cell(tail: &str) -> String {
-    let printable: String = tail
-        .chars()
-        .filter(|c| !c.is_control() && !reorders_display(*c))
-        .collect();
-    truncate(&printable, TAIL_W)
-}
-
-/// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
-/// overrides (`U+202A..=U+202E`), the isolates (`U+2066..=U+2069`), and the
-/// three directional marks — `U+200E` LRM, `U+200F` RLM, and `U+061C` ALM, the
-/// Arabic-script twin of RLM, which an earlier version of this set missed while
-/// calling itself closed.
-///
-/// Spelled out rather than tested by general category, because the crate carries
-/// no Unicode tables and this task takes no new dependency. The cost of spelling
-/// it out is that it is only closed against the Unicode version it was written
-/// from; `Bidi_Control` has been stable for many releases, and a new member
-/// would surface as a codepoint reaching the terminal rather than as a wrong
-/// figure.
-///
-/// Legitimate right-to-left text needs none of them: the implicit bidi algorithm
-/// renders a plain Arabic or Hebrew tail correctly on its own, measured on
-/// both.
-pub(crate) fn reorders_display(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
-    )
+    truncate(&terminal_safe(tail), TAIL_W)
 }
 
 /// Width of one column: its header, or the widest cell under it.

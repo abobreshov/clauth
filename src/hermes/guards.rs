@@ -311,7 +311,7 @@ pub(crate) fn g2_containment(name: &str, paths: &HermesPaths, operator_home: &Pa
     if child_root.symlink_metadata().is_ok() {
         return Err(refuse(format!(
             "{}{} exists; Hermes would take it as its default root and read its active_profile \
-             — remove it (tollgate never creates it)",
+             (remove it; tollgate never creates it)",
             prefix(name),
             child_root.display()
         )));
@@ -365,7 +365,7 @@ pub(crate) fn g4_profiles(name: &str, paths: &HermesPaths) -> Result<()> {
     if paths.home.join("profiles").symlink_metadata().is_ok() {
         return Err(refuse(format!(
             "{}{}/profiles exists; Hermes sub-profiles inside a tollgate home are not supported \
-             — remove it",
+             (remove it)",
             prefix(name),
             paths.home.display()
         )));
@@ -443,7 +443,7 @@ pub(crate) fn g6_hsp_env(name: &str, hsp: &Path) -> Result<()> {
     if hsp.join(".env").symlink_metadata().is_ok() {
         return Err(refuse(format!(
             "{}{}/.env exists; Hermes loads it into every session and it can refill scrubbed \
-             keys — move it away",
+             keys; move it away",
             prefix(name),
             hsp.display()
         )));
@@ -470,7 +470,7 @@ pub(crate) fn g14_liveness(name: &str, paths: &HermesPaths) -> Result<()> {
 pub(crate) fn m_live(name: &str, sid: &str) -> anyhow::Error {
     refuse(format!(
         "{}a Hermes session is already running on this home (session {sid}); Hermes homes take \
-         one process at a time — start another account home instead",
+         one process at a time; start another account home instead",
         prefix(name)
     ))
 }
@@ -650,7 +650,7 @@ pub(crate) fn audit_projection(
             return Err(m_managed(k.clone()));
         }
         notes.warnings.push(format!(
-            "tollgate: note — managed Hermes scope {} applies to this session",
+            "tollgate: note: managed Hermes scope {} applies to this session",
             dir.display()
         ));
     }
@@ -756,7 +756,7 @@ pub(crate) fn audit_projection(
             .join(super::home::CHILD_HOME_DIR);
         return Err(refuse(format!(
             "{p}auxiliary.{task}.provider is {shown}; Hermes' auto chain can fall through to \
-             Anthropic — run HOME={} HERMES_HOME={} {} config set auxiliary.{task}.provider {} or recreate \
+             Anthropic. Run HOME={} HERMES_HOME={} {} config set auxiliary.{task}.provider {} or recreate \
              the profile",
             super::shell_quote(&child_home.display().to_string()),
             super::shell_quote(&home.display().to_string()),

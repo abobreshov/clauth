@@ -348,7 +348,7 @@ fn managed_scope_refuses_each_key_class_and_otherwise_only_warns() {
     let notes = audit(&clean, Some(dir)).unwrap();
     assert_eq!(
         notes.warnings,
-        ["tollgate: note — managed Hermes scope /etc/hermes applies to this session"]
+        ["tollgate: note: managed Hermes scope /etc/hermes applies to this session"]
     );
     // A managed dir that warns plus an anthropic route elsewhere: still refused.
     let both = projection(|v| {

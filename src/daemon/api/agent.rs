@@ -11,10 +11,13 @@
 //! content.
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use utoipa::ToSchema;
 
 use super::http::{Request, Response, sanitize_for_log};
-use super::panes::{HerdrOut, HerdrProbeOut, NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND};
+use super::panes::{
+    HerdrOut, HerdrProbeOut, NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND, listed_panes,
+};
 use super::routes::{ApiContext, Caller, ErrorBody};
 use crate::logline::logline;
 
@@ -281,3 +284,411 @@ pub(crate) fn keys(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Resp
 #[cfg(test)]
 #[path = "../../../tests/inline/daemon_api_agent.rs"]
 mod tests;
+
+/// The answer both session-keyed command routes carry once the command reached
+/// its target: `via` names the mod or the herdr fallback.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionDriveOk {
+    ok: bool,
+    via: &'static str,
+}
+
+/// The answer the ask route carries once the answer reached a live mod.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AnswerOk {
+    ok: bool,
+}
+
+/// The empty-object body `POST /api/v1/sessions/{id}/interrupt` documents. The
+/// route reads no field, so any JSON object (`{}` or with fields) is accepted
+/// and nothing is taken off it; the object-only shape is enforced in the route
+/// (B#12).
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct InterruptBody {}
+
+/// The one fixed sentence each no-reach state carries; nothing off the wire.
+const SESSION_NOT_LIVE: &str =
+    "no live session with that id: no mod instance and no herdr pane on it";
+/// The ask route's own no-reach sentence: it is mod-only, so a session whose
+/// mod died while its herdr pane lives has no reach here (B#18).
+const ASK_NOT_LIVE: &str = "no live mod instance with that id";
+const SESSION_AMBIGUOUS: &str =
+    "two live sessions share that id; refused rather than handed to either";
+#[cfg(unix)]
+const SESSION_BUSY: &str = "the mod's command queue is full; retry after its next poll";
+#[cfg(unix)]
+const ASK_CLOSED: &str = "that ask is already answered or closed";
+#[cfg(unix)]
+const ASK_NOT_FOUND: &str = "no open ask with that id on that session";
+
+/// Where the herdr fallback landed for one session id.
+enum PaneFallback {
+    /// Exactly one live pane carries the id as its `agent_session_id`.
+    Pane(String),
+    /// None: the session has no pane to reach.
+    None,
+    /// Several panes carry the id, and neither is singled out.
+    Ambiguous,
+}
+
+/// The live pane whose `agent_session_id` equals `id`, through at most one
+/// bounded `herdr pane list` call. herdr absent or unanswerable reads as no
+/// pane, which the routes answer `session_not_live` (SB-16).
+///
+/// Deliberately not guest-gated (U3): in guest mode this fallback can reach a
+/// session upstream runs in herdr, but a paired device holds the same power
+/// through `/panes/{id}/prompt` and `/panes/{id}/keys`.
+fn session_pane(ctx: &ApiContext, id: &str) -> PaneFallback {
+    let Ok(panes) = listed_panes(ctx) else {
+        return PaneFallback::None;
+    };
+    let mut matching = panes
+        .into_iter()
+        .filter(|pane| pane.agent_session_id() == Some(id))
+        .map(|pane| pane.pane_id);
+    match (matching.next(), matching.next()) {
+        (Some(pane), None) => PaneFallback::Pane(pane),
+        (Some(_), Some(_)) => PaneFallback::Ambiguous,
+        _ => PaneFallback::None,
+    }
+}
+
+/// `POST /api/v1/sessions/{id}/prompt` — prompt the session's mod, else the
+/// herdr pane joined on the session id. Control tier; the mod half is unix-only
+/// (Windows has no bridge), while the herdr fallback still applies on Windows.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/prompt",
+    params(
+        ("id" = String, Path, description = "the session id, as `GET /api/v1/sessions` lists it")
+    ),
+    request_body = PromptBody,
+    responses(
+        (status = 200, description = "the prompt reached the session's mod, or the herdr pane joined on the session id", body = SessionDriveOk),
+        (status = 400, description = "the body held no non-empty text, or a text carrying a NUL (`bad_request`)", body = ErrorBody),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 404, description = "no live session with that id (`session_not_live`), or the herdr fallback's pane is gone (`pane_not_found`)", body = ErrorBody),
+        (status = 409, description = "two live sessions share that id (`session_ambiguous`), or the herdr fallback's agent is blocked (`agent_blocked`)", body = ErrorBody),
+        (status = 502, description = "herdr refused the fallback prompt for another reason, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
+        (status = 503, description = "the herdr fallback's pane list answered, but no herdr server answered the prompt (`herdr_unavailable`), or the mod's command queue is full (`session_busy`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["control"]))
+)]
+pub(crate) fn session_prompt(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    let Some(id) = caller.target else {
+        return Response::error(500, "internal");
+    };
+    let Ok(body) = serde_json::from_slice::<PromptBody>(&req.body) else {
+        return Response::error(400, "bad_request");
+    };
+    if body.text.is_empty() || body.text.contains('\0') {
+        return Response::error(400, "bad_request");
+    }
+    #[cfg(unix)]
+    {
+        if let Some(hub) = &ctx.bridge {
+            match hub.deliver(id, json!({ "kind": "prompt", "text": body.text })) {
+                crate::daemon::bridge::ModDelivery::Delivered => {
+                    logline!(
+                        "tollgate api: device '{}' prompted session '{}' via mod text_len={}",
+                        caller.device_for_log(),
+                        sanitize_for_log(id),
+                        body.text.len()
+                    );
+                    return Response::serialize(
+                        200,
+                        &SessionDriveOk {
+                            ok: true,
+                            via: "mod",
+                        },
+                    );
+                }
+                crate::daemon::bridge::ModDelivery::Ambiguous => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': ambiguous",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS);
+                }
+                crate::daemon::bridge::ModDelivery::Busy => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': busy",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(503, "session_busy", SESSION_BUSY);
+                }
+                crate::daemon::bridge::ModDelivery::NoMod => {}
+            }
+        }
+    }
+    match session_pane(ctx, id) {
+        PaneFallback::None => Response::refused(404, "session_not_live", SESSION_NOT_LIVE),
+        PaneFallback::Ambiguous => {
+            logline!(
+                "tollgate api: device '{}' refused on session '{}': ambiguous",
+                caller.device_for_log(),
+                sanitize_for_log(id)
+            );
+            Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS)
+        }
+        PaneFallback::Pane(pane) => {
+            match drive(ctx, &["agent", "prompt", pane.as_str(), body.text.as_str()]) {
+                Ok(()) => {
+                    logline!(
+                        "tollgate api: device '{}' prompted session '{}' via herdr text_len={}",
+                        caller.device_for_log(),
+                        sanitize_for_log(id),
+                        body.text.len()
+                    );
+                    Response::serialize(
+                        200,
+                        &SessionDriveOk {
+                            ok: true,
+                            via: "herdr",
+                        },
+                    )
+                }
+                Err(refusal) => refuse(refusal, caller, &pane, "prompt"),
+            }
+        }
+    }
+}
+
+/// `POST /api/v1/sessions/{id}/interrupt` — interrupt the session's mod, else
+/// send `esc` to the herdr pane joined on the session id.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/interrupt",
+    params(
+        ("id" = String, Path, description = "the session id, as `GET /api/v1/sessions` lists it")
+    ),
+    request_body = InterruptBody,
+    responses(
+        (status = 200, description = "the interrupt reached the session's mod, or the herdr pane joined on the session id", body = SessionDriveOk),
+        (status = 400, description = "the body is neither empty nor a JSON object (`bad_request`)", body = ErrorBody),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 404, description = "no live session with that id (`session_not_live`), or the herdr fallback's pane is gone (`pane_not_found`)", body = ErrorBody),
+        (status = 409, description = "two live sessions share that id (`session_ambiguous`)", body = ErrorBody),
+        (status = 502, description = "herdr refused the fallback keys for another reason, recorded in daemon.log (`herdr_refused`)", body = ErrorBody),
+        (status = 503, description = "the herdr fallback's pane list answered, but no herdr server answered the keys (`herdr_unavailable`), or the mod's command queue is full (`session_busy`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["control"]))
+)]
+pub(crate) fn session_interrupt(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    // The documented body is `{}`; an empty body is accepted too (B#26), and
+    // anything that is not a JSON object (a scalar, an array) is refused before
+    // any work (B#12).
+    if !req.body.is_empty()
+        && !serde_json::from_slice::<serde_json::Value>(&req.body)
+            .is_ok_and(|value| value.is_object())
+    {
+        return Response::error(400, "bad_request");
+    }
+    let Some(id) = caller.target else {
+        return Response::error(500, "internal");
+    };
+    #[cfg(unix)]
+    {
+        if let Some(hub) = &ctx.bridge {
+            match hub.deliver(id, json!({ "kind": "interrupt" })) {
+                crate::daemon::bridge::ModDelivery::Delivered => {
+                    logline!(
+                        "tollgate api: device '{}' interrupted session '{}' via mod",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::serialize(
+                        200,
+                        &SessionDriveOk {
+                            ok: true,
+                            via: "mod",
+                        },
+                    );
+                }
+                crate::daemon::bridge::ModDelivery::Ambiguous => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': ambiguous",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS);
+                }
+                crate::daemon::bridge::ModDelivery::Busy => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': busy",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(503, "session_busy", SESSION_BUSY);
+                }
+                crate::daemon::bridge::ModDelivery::NoMod => {}
+            }
+        }
+    }
+    match session_pane(ctx, id) {
+        PaneFallback::None => Response::refused(404, "session_not_live", SESSION_NOT_LIVE),
+        PaneFallback::Ambiguous => {
+            logline!(
+                "tollgate api: device '{}' refused on session '{}': ambiguous",
+                caller.device_for_log(),
+                sanitize_for_log(id)
+            );
+            Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS)
+        }
+        PaneFallback::Pane(pane) => {
+            match drive(ctx, &["pane", "send-keys", pane.as_str(), "esc"]) {
+                Ok(()) => {
+                    logline!(
+                        "tollgate api: device '{}' interrupted session '{}' via herdr",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    Response::serialize(
+                        200,
+                        &SessionDriveOk {
+                            ok: true,
+                            via: "herdr",
+                        },
+                    )
+                }
+                // `agent_blocked` is `agent prompt`'s refusal, not `pane
+                // send-keys`'s (keys are how a blocked agent gets answered), so
+                // here it is a herdr answer this route does not know.
+                Err(Refusal::AgentBlocked(output)) => {
+                    refuse(Refusal::Herdr(output), caller, &pane, "send-keys")
+                }
+                Err(refusal) => refuse(refusal, caller, &pane, "send-keys"),
+            }
+        }
+    }
+}
+
+/// The one `decision` the ask answer takes: `allow` or `deny`, so the served
+/// schema is an enum rather than a free string (B#25).
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum Decision {
+    Allow,
+    Deny,
+}
+
+impl Decision {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// One answer body: exactly one of `decision` (`allow` or `deny`) or `answers`
+/// (an object), never both, never neither.
+#[derive(Deserialize, ToSchema)]
+struct AnswerBody {
+    #[serde(default)]
+    decision: Option<Decision>,
+    #[serde(default)]
+    answers: Option<serde_json::Value>,
+}
+
+/// `POST /api/v1/sessions/{id}/asks/{ask}` — answer a mod-held ask. The first
+/// answer wins and closes the ask, desk or device alike (SB-7, SB-19).
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/asks/{ask}",
+    params(
+        ("id" = String, Path, description = "the session id, as `GET /api/v1/sessions` lists it"),
+        ("ask" = String, Path, description = "the ask id the mod minted and posted with `ask_opened`")
+    ),
+    request_body = AnswerBody,
+    responses(
+        (status = 200, description = "the answer reached the session's live mod and closes the ask", body = AnswerOk),
+        (status = 400, description = "the body names neither, or both, of decision and answers, or a decision other than allow or deny (`bad_request`)", body = ErrorBody),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer tollgate with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 404, description = "no live session with that id (`session_not_live`), or no open ask with that id (`ask_not_found`)", body = ErrorBody),
+        (status = 409, description = "two live sessions share that id (`session_ambiguous`), or the ask is already answered (`ask_closed`)", body = ErrorBody),
+        (status = 503, description = "the mod's command queue is full (`session_busy`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["control"]))
+)]
+pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    let Some(id) = caller.target else {
+        return Response::error(500, "internal");
+    };
+    let Some(ask) = caller.ask else {
+        return Response::error(500, "internal");
+    };
+    let Ok(body) = serde_json::from_slice::<AnswerBody>(&req.body) else {
+        return Response::error(400, "bad_request");
+    };
+    // Exactly one form, and its value the one shape the mod accepts.
+    let (command, audit_tail) = match (body.decision.as_ref(), body.answers) {
+        (Some(decision), None) => (
+            json!({ "kind": "answer", "ask": ask, "decision": decision }),
+            format!("decision={}", decision.as_str()),
+        ),
+        (None, Some(answers)) if answers.is_object() => (
+            json!({ "kind": "answer", "ask": ask, "answers": answers }),
+            format!(
+                "answers={}",
+                answers.as_object().map_or(0, |object| object.len())
+            ),
+        ),
+        _ => return Response::error(400, "bad_request"),
+    };
+    #[cfg(unix)]
+    {
+        if let Some(hub) = &ctx.bridge {
+            match hub.answer(id, ask, command) {
+                crate::daemon::bridge::AskOutcome::Queued => {
+                    logline!(
+                        "tollgate api: device '{}' answered ask '{}' on session '{}' {}",
+                        caller.device_for_log(),
+                        sanitize_for_log(ask),
+                        sanitize_for_log(id),
+                        audit_tail
+                    );
+                    return Response::serialize(200, &AnswerOk { ok: true });
+                }
+                crate::daemon::bridge::AskOutcome::Ambiguous => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': ambiguous",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS);
+                }
+                crate::daemon::bridge::AskOutcome::Busy => {
+                    logline!(
+                        "tollgate api: device '{}' refused on session '{}': busy",
+                        caller.device_for_log(),
+                        sanitize_for_log(id)
+                    );
+                    return Response::refused(503, "session_busy", SESSION_BUSY);
+                }
+                crate::daemon::bridge::AskOutcome::AskClosed => {
+                    return Response::refused(409, "ask_closed", ASK_CLOSED);
+                }
+                crate::daemon::bridge::AskOutcome::AskNotFound => {
+                    return Response::refused(404, "ask_not_found", ASK_NOT_FOUND);
+                }
+                crate::daemon::bridge::AskOutcome::NoSession => {
+                    return Response::refused(404, "session_not_live", ASK_NOT_LIVE);
+                }
+            }
+        }
+    }
+    // Windows has no mod bridge (SB-1/MB-9): the body is still validated, but
+    // the mod-only ask route never holds an ask, so it reads session_not_live.
+    #[cfg(not(unix))]
+    let _ = (&ctx, &id, &command, &audit_tail);
+    Response::refused(404, "session_not_live", ASK_NOT_LIVE)
+}

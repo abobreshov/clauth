@@ -9,7 +9,8 @@ use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, ACCOUNT_IDENTITY_FILE, AccountIdentity, PROFILE_FETCHED_CACHE_FILE,
-    load_profile_cache, remove_profile_cache, write_profile_cache_reported,
+    USAGE_CACHE_FILE, load_profile_cache, remove_profile_cache, write_profile_cache,
+    write_profile_cache_reported,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
@@ -46,28 +47,40 @@ static PROFILE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::
 
 #[cfg(test)]
 pub(crate) fn set_usage_endpoint_override(usage: &str, profile: &str) {
-    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+    {
+        let mut guard = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(usage.to_string());
     }
-    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
-        *guard = Some(profile.to_string());
-    }
+    let mut guard = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(profile.to_string());
 }
 
 #[cfg(test)]
 pub(crate) fn clear_usage_endpoint_override() {
-    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+    {
+        let mut guard = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = None;
     }
-    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
-        *guard = None;
-    }
+    let mut guard = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
 }
 
 fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
-        if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        if let Some(url) = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
             return std::borrow::Cow::Owned(url);
         }
         panic!(
@@ -85,8 +98,8 @@ fn profile_endpoint() -> std::borrow::Cow<'static, str> {
     {
         if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
             .lock()
-            .ok()
-            .and_then(|g| g.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
         {
             return std::borrow::Cow::Owned(url);
         }
@@ -161,14 +174,13 @@ fn reserve_slot(current_slot: u64, now: u64) -> (u64, u64) {
 
 /// Block until this caller's spacing slot for `host`, reserving the following slot
 /// for the next caller on the same host. Distinct hosts hold independent slots, so
-/// requests to different endpoints never serialize against each other. A poisoned
-/// lock skips throttling rather than stalling the fetch.
+/// requests to different endpoints never serialize against each other.
 pub(crate) fn await_request_slot(host: &str) {
     let now = now_ms();
     let wait_ms = {
-        let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() else {
-            return;
-        };
+        let mut slots = NEXT_REQUEST_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = slots.entry(host.to_string()).or_insert(0);
         let (next, wait) = reserve_slot(*slot, now);
         *slot = next;
@@ -185,9 +197,10 @@ pub(crate) fn await_request_slot(host: &str) {
 /// shared-process `cargo test` runner (nextest isolates per process).
 #[cfg(test)]
 pub(crate) fn reset_request_slots() {
-    if let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() {
-        slots.clear();
-    }
+    NEXT_REQUEST_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// The slot currently reserved for `host`, `None` when it holds none. Test-only
@@ -198,8 +211,9 @@ pub(crate) fn reset_request_slots() {
 pub(crate) fn reserved_request_slot(host: &str) -> Option<u64> {
     NEXT_REQUEST_SLOT
         .lock()
-        .ok()
-        .and_then(|slots| slots.get(host).copied())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(host)
+        .copied()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,10 +357,54 @@ impl SpendInfo {
         }
     }
 
-    /// A spend bar is worth showing once the account has a cap enabled or a
-    /// limit set; disabled accounts (the current default) render nothing.
+    /// Whether the account carries a spend row at all: a bar while billing is
+    /// on, or the `billing off` note for a stale limit. A disabled account with
+    /// no limit renders nothing.
     pub(crate) fn is_visible(&self) -> bool {
         self.enabled || self.limit.is_some()
+    }
+
+    /// True iff the pay-as-you-go cap is spent: billing is ON and the amounts
+    /// read past the limit (when both are read), else the wire's own `percent`
+    /// reads 100+. A billing-off account carrying a stale limit (kerry,
+    /// 2026-07-17: enabled false, limit $50, used $31.07) is never capped —
+    /// the flag gates the figures, never the other way round. Nothing read is
+    /// no evidence of a cap.
+    pub(crate) fn is_capped(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match (self.used, self.limit) {
+            (Some(used), Some(limit)) => used >= limit,
+            _ => self.percent.is_some_and(|p| p >= 100.0),
+        }
+    }
+}
+
+impl ExtraUsage {
+    /// True iff the legacy credit block is capped: billing is ON and the
+    /// block's own `utilization` reads 100+, else both amounts read past the
+    /// limit. Nothing read is no evidence of a cap.
+    pub(crate) fn is_capped(&self) -> bool {
+        if !self.is_enabled {
+            return false;
+        }
+        if let Some(utilization) = self.utilization {
+            return utilization >= 100.0;
+        }
+        match (self.used_credits, self.monthly_limit) {
+            (Some(used), Some(limit)) => used >= limit,
+            _ => false,
+        }
+    }
+}
+
+impl UsageInfo {
+    /// Either credit block is capped ([`SpendInfo::is_capped`] /
+    /// [`ExtraUsage::is_capped`]) — the cap verdict the status feed publishes.
+    pub(crate) fn credit_capped(&self) -> bool {
+        self.spend.as_ref().is_some_and(SpendInfo::is_capped)
+            || self.extra_usage.as_ref().is_some_and(ExtraUsage::is_capped)
     }
 }
 
@@ -483,7 +541,29 @@ impl PlanInfo {
     pub(crate) fn is_canceled(&self) -> bool {
         self.subscription_status.as_deref() == Some("canceled")
     }
+
+    /// Whether the usage probe was refused for the organization rather than for
+    /// the token or a canceled plan: an organization on hold or disabled, a key
+    /// whose creator left it, an endpoint closed to its region, or an address
+    /// outside its allowed range. The probe's landing writes
+    /// [`ORG_REFUSED_STATUS`] as the status, as it writes `canceled` for a
+    /// canceled plan, and its next reading lifts it the same way.
+    pub(crate) fn is_org_refused(&self) -> bool {
+        self.subscription_status.as_deref() == Some(ORG_REFUSED_STATUS)
+    }
+
+    /// Whether the account cannot serve at all: its plan canceled, or its
+    /// organization refusing it. The one predicate every walk and recovery
+    /// excludes on; the surfaces then name which.
+    pub(crate) fn refuses_service(&self) -> bool {
+        self.is_canceled() || self.is_org_refused()
+    }
 }
+
+/// The subscription status the usage probe lands for an organization that
+/// refuses the account ([`PlanInfo::is_org_refused`]). tollgate's own word:
+/// `/profile` sends no such status.
+pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
 /// Native Codex credit units: never interpreted as dollars.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -511,6 +591,12 @@ pub(crate) struct UsageInfo {
     pub(crate) five_hour: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) seven_day: Option<UsageWindow>,
+    /// The account-wide MONTHLY inference quota a third-party provider marked
+    /// as such (Alibaba's `30d` bar). A per-account ceiling, never a per-model
+    /// window: it gates like the weekly line when the account has no 7d
+    /// window, and never lands in [`UsageInfo::weekly_scoped`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) monthly: Option<UsageWindow>,
     /// Per-model weekly windows (`weekly_scoped` limits) in `limits[]` order —
     /// grows as the server exposes new models, no per-model field needed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -559,10 +645,16 @@ pub(crate) struct UsageInfo {
 /// built dynamically from the scope name (see [`ScopedWindow`]).
 pub(crate) const LABEL_5H: &str = "5h";
 pub(crate) const LABEL_7D: &str = "7d";
+/// The label of a provider-marked monthly inference-quota window. It is a
+/// WINDOW label here, not a duration claim: an unmarked `30d` bar never
+/// reaches this slot (a stale z.ai cache's MCP web-tools quota is dropped as
+/// unmarked, and a fresh z.ai read labels its month-long bar `mcp tools`).
+pub(crate) const LABEL_30D: &str = "30d";
 
 impl UsageInfo {
-    /// All available windows as `(label, &UsageWindow)` pairs: 5h, 7d, then each
-    /// per-model weekly window in `limits[]` order.
+    /// All available windows as `(label, &UsageWindow)` pairs: 5h, 7d, the
+    /// monthly inference quota when present, then each per-model weekly window
+    /// in `limits[]` order.
     pub(crate) fn windows(&self) -> Vec<(&str, &UsageWindow)> {
         let mut out = Vec::new();
         if let Some(w) = &self.five_hour {
@@ -571,10 +663,30 @@ impl UsageInfo {
         if let Some(w) = &self.seven_day {
             out.push((LABEL_7D, w));
         }
+        if let Some(w) = &self.monthly {
+            out.push((LABEL_30D, w));
+        }
         for s in &self.weekly_scoped {
             out.push((s.label.as_str(), &s.window));
         }
         out
+    }
+
+    /// The account's LONG window and its label — the weekly headroom/line the
+    /// fallback walk judges: the aggregate `seven_day` (`LABEL_7D`) when
+    /// present, else the account-wide monthly inference quota (`LABEL_30D`).
+    /// Precedence is by PRESENCE, not liveness: a caller that needs a live
+    /// window applies liveness (e.g. [`long_window_live`]) to what this
+    /// returned, exactly as it did to the 7d window before, so the list, push,
+    /// overview and chain never pick by different rules. Every site that reads
+    /// the 7d window as the account's weekly headroom or weekly line calls
+    /// this, so a monthly-only account gates and orders exactly like a weekly
+    /// one.
+    pub(crate) fn long_window(&self) -> Option<(&'static str, &UsageWindow)> {
+        self.seven_day
+            .as_ref()
+            .map(|w| (LABEL_7D, w))
+            .or_else(|| self.monthly.as_ref().map(|w| (LABEL_30D, w)))
     }
 
     /// Most representative weekly window: the aggregate `seven_day` when present,
@@ -596,9 +708,9 @@ pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
         Some(7 * 86_400)
     } else {
         // Provider and monitor window labels of the form `<n>h` / `<n>d` (e.g.
-        // z.ai's `5h`/`7d`/`30d` or Antigravity's `1h Gemini Models`) so any
-        // windowed limit gets the same average pace + ideal-pace line as the
-        // OAuth windows.
+        // `5h`, `7d`, a provider-marked `30d`, or Antigravity's `1h Gemini
+        // Models`) so any windowed limit gets the same average pace +
+        // ideal-pace line as the OAuth windows.
         parse_nh_nd_label(label.split_whitespace().next().unwrap_or(label))
     }
 }
@@ -1070,24 +1182,44 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+/// Connect deadline for every call [`AGENT`] makes.
+const USAGE_HTTP_CONNECT_SECS: u64 = 4;
+/// Response-HEADER deadline for the same — the header phase's bound, armed from
+/// the phase's start and stopping once the headers arrive.
+const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
+
+/// The two deadlines a usage-style call carries, added — and the whole call's
+/// bound: [`usage_config`] arms `timeout_global` with this sum, whose upstream
+/// wording is "end-to-end, from DNS lookup to finishing reading the response
+/// body", so the body is held to it too and the sum is a ceiling on such a call
+/// unless the request sets a bound of its own (push does).
+pub(crate) const USAGE_HTTP_DEADLINES: Duration =
+    Duration::from_secs(USAGE_HTTP_CONNECT_SECS + USAGE_HTTP_RECV_HEADERS_SECS);
+
+/// The config a usage-style agent starts from, with `whole` as its end-to-end
+/// bound: the shared shape behind [`usage_agent`], and behind the codex WHAM
+/// agent, whose only delta is `.accept("")`.
+pub(super) fn usage_config(
+    whole: Duration,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(8)))
-        // `timeout_recv_response` is re-armed per header byte and the body has
-        // no bound of its own: without an end-to-end deadline a server that
-        // sends headers and then stalls holds the caller for as long as the
-        // socket lives.
-        .timeout_recv_body(Some(crate::usage::keyed_http::CALL_DEADLINE))
-        .timeout_global(Some(crate::usage::keyed_http::CALL_DEADLINE))
+        .timeout_connect(Some(Duration::from_secs(USAGE_HTTP_CONNECT_SECS)))
+        .timeout_recv_response(Some(Duration::from_secs(USAGE_HTTP_RECV_HEADERS_SECS)))
+        .timeout_global(Some(whole))
         // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`; our callers read
         // the status off the `Ok` response (401 → rotate, 429 → retry-after).
         // Without this flag those branches are unreachable and every HTTP error
         // collapses into `Network`.
         .http_status_as_error(false)
-        .build()
-        .into()
-});
+}
+
+/// A usage-style agent with `whole` as its end-to-end bound — built once for
+/// [`AGENT`], and again at a short bound where a test needs one.
+pub(crate) fn usage_agent(whole: Duration) -> ureq::Agent {
+    usage_config(whole).build().into()
+}
+
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| usage_agent(USAGE_HTTP_DEADLINES));
 
 /// Shared HTTP agent for usage-style GETs (also used by `crate::providers`).
 /// Status codes arrive on the `Ok` response — see the builder comment.
@@ -1188,20 +1320,32 @@ fn get_json(
 /// stamp to be read straight back in as fresh, silently reducing the manual
 /// refresh to a no-op for `/profile`.
 pub(crate) fn expire_profile_ttl(name: &ProfileName) {
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name.as_str());
-    }
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
 
-/// Drop `name`'s in-memory memo while leaving the durable stamp in place — what
-/// a process restart looks like to [`take_profile_fetch`], which is the whole
-/// point of the durable half and can't otherwise be exercised in one process.
+/// Drop `name`'s in-memory memo while leaving the durable stamp in place —
+/// `forget_memory`'s memory-only arm. The durable stamp is `forget_disk(OAuth)`'s
+/// to remove; clearing it here would delete a stamp a refresher just wrote for
+/// the new login.
+pub(crate) fn forget_profile_memo(name: &ProfileName) {
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+}
+
+/// Test seam: drop every in-memory `/profile` memo entry, so a stamp an
+/// earlier test wrote cannot reach the next test. Called from `HomeSandbox::drop`.
 #[cfg(test)]
-fn forget_profile_memo(name: &ProfileName) {
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name.as_str());
-    }
+pub(crate) fn reset_profile_fetched_for_test() {
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// The profile has a usable identity anchor. A blank/whitespace uuid is shape
@@ -1228,13 +1372,15 @@ fn has_identity_anchor(name: &ProfileName) -> bool {
 /// own durable write failed is served for its TTL (so a failing write never
 /// storms), at the cost of not seeing a later removal.
 fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
+    let memo = PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name.as_str())
+        .copied();
     if let Some(ProfileStamp {
         at_ms,
         durable_landed,
-    }) = PROFILE_FETCHED
-        .lock()
-        .ok()
-        .and_then(|m| m.get(name.as_str()).copied())
+    }) = memo
     {
         // A stamp this process wrote (durable_landed) that is now ABSENT was
         // removed by another process: lapsed, whatever the memo says. A stamp
@@ -1253,15 +1399,16 @@ fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
     // Cold map (process start): adopt the durable stamp and memoize it. The lock
     // is taken fresh here — never held across the read above.
     let disk = load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)?;
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.insert(
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
             name.to_string(),
             ProfileStamp {
                 at_ms: disk,
                 durable_landed: true,
             },
         );
-    }
     Some(disk)
 }
 
@@ -1279,28 +1426,71 @@ fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
 /// also re-stamps the bogus clock back to sanity. Saturating the age to `0` here
 /// would instead mute `/profile` until wall-clock caught up, and — now that the
 /// stamp outlives the process — it would stay muted across every restart.
-pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
+/// Decide whether to fetch `/profile` this round, WITHOUT writing anything — the
+/// worker's one-per-run decision, reusable by the rotation retry. Fetches when
+/// `force` is set (a rotation retry holding no plan yet), on first load (no
+/// stamp on disk either), or once the hourly TTL lapses. A manual single-profile
+/// refresh arrives here as a lapsed clock, not a force: it calls
+/// [`expire_profile_ttl`] first. The stamp and memo writes moved to the landing
+/// ([`stamp_profile_fetch`] / [`note_profile_memo`]) so a landing the credential
+/// changed under writes none.
+pub(crate) fn decide_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
     let fresh = last_profile_attempt(name)
         .and_then(|t| now.checked_sub(t))
         .is_some_and(|age| age < PROFILE_TTL_MS);
-    let want = force || !fresh;
-    if want {
-        let durable_landed = crate::profile_cache::write_profile_cache_reported(
-            name,
-            PROFILE_FETCHED_CACHE_FILE,
-            &now,
+    force || !fresh
+}
+
+/// Write the durable `/profile` attempt stamp, returning whether it landed.
+/// Called by section 1 on an identity match (a failing `/profile` on a match
+/// still stamps — the rate cap), and inside the re-anchor's hold after the
+/// anchor write (whose `forget_disk` removed the stamp).
+pub(crate) fn stamp_profile_fetch(name: &ProfileName, now: u64) -> bool {
+    crate::profile_cache::write_profile_cache_reported(name, PROFILE_FETCHED_CACHE_FILE, &now)
+}
+
+/// Write the in-memory `/profile` memo. Called by section 2 on a match, and on a
+/// mismatch or timeout only while the epoch has not moved — the memo is cadence,
+/// so a stale snapshot never re-fetches every tick.
+pub(crate) fn note_profile_memo(name: &ProfileName, now: u64, durable_landed: bool) {
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            name.to_string(),
+            ProfileStamp {
+                at_ms: now,
+                durable_landed,
+            },
         );
-        if let Ok(mut m) = PROFILE_FETCHED.lock() {
-            m.insert(
-                name.to_string(),
-                ProfileStamp {
-                    at_ms: now,
-                    durable_landed,
-                },
-            );
-        }
+}
+
+/// Test-only combined helper: decide, then stamp + memo when elected. Pins the
+/// TTL decision AND both write halves without driving a landing; the production
+/// fetch path calls the split halves so the writes gate on the landing identity.
+#[cfg(test)]
+pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
+    if decide_profile_fetch(name, force, now) {
+        let durable_landed = stamp_profile_fetch(name, now);
+        note_profile_memo(name, now, durable_landed);
+        true
+    } else {
+        false
     }
-    want
+}
+
+/// What the worker's `/profile` leg decided this run, carried to the drain so
+/// the durable stamp and memo gate on the landing's identity rather than the
+/// worker's own writes.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ProfileFetchDecision {
+    /// [`decide_profile_fetch`] elected a `/profile` fetch.
+    pub(crate) wanted: bool,
+    /// The attempt instant the durable stamp + memo record, when `wanted`.
+    pub(crate) attempted_at: Option<u64>,
+    /// The ride-along re-anchored the stored login to another account (A→B): the
+    /// drain forgets the old account's memory after the hold.
+    pub(crate) reanchored: bool,
 }
 
 /// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier + raw
@@ -1315,7 +1505,11 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
             p.account.as_ref().is_some_and(|a| a.has_claude_pro),
             org.and_then(|o| o.rate_limit_tier.as_deref()),
         ),
-        subscription_status: org.and_then(|o| o.subscription_status.clone()),
+        // Verbatim, but never tollgate's own word for an organization's refusal:
+        // only the usage probe's landing may write that.
+        subscription_status: org
+            .and_then(|o| o.subscription_status.clone())
+            .filter(|status| status != ORG_REFUSED_STATUS),
         // The claude leg never reads a codex plan.
         codex_plan: None,
     }
@@ -1329,15 +1523,19 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
 /// surfaces its cancellation.
 /// Never bypasses the hourly cap unless `force_profile` (the rotation retry
 /// holding no plan yet).
-fn fetch_profile_plan(
+pub(crate) fn fetch_profile_plan(
     name: &ProfileName,
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
+    decision: &mut ProfileFetchDecision,
 ) -> Option<PlanInfo> {
-    if !take_profile_fetch(name, force_profile, now_ms()) {
+    let now = now_ms();
+    if !decide_profile_fetch(name, force_profile, now) {
         return None;
     }
+    decision.wanted = true;
+    decision.attempted_at = Some(now);
     // Ask about the STORED login, not the fetcher's in-memory token: after a
     // copy-back the work-list token is stale, and a `/profile` read with it
     // would be refused by the stored-token guard and defer the re-anchor a full
@@ -1358,11 +1556,19 @@ fn fetch_profile_plan(
     let p: RawProfile = serde_json::from_str(&text).ok()?;
     // Both ride-alongs in ONE state-flock hold behind ONE stored-token check:
     // the anchor reconcile and the rate-limit tier stamp share the body's guard.
+    // A re-anchor (A→B) additionally runs the plan's forget order inside the
+    // same hold ([`apply_profile_read_held`]): `forget_disk`, the disk seed of
+    // this body's plan, the anchor write, then the `/profile` stamp re-written
+    // here (its `forget_disk` removed it).
     let ride_along = crate::lock::with_state_lock(|held| {
         if !crate::profile::stored_token_matches(name, &token) {
             return Ok(());
         }
-        apply_profile_read_held(name, &p, held);
+        let (_, _, reanchored) = apply_profile_read_held(name, &p, &token, now, held);
+        if reanchored {
+            stamp_profile_fetch(name, now);
+            decision.reanchored = true;
+        }
         Ok::<(), anyhow::Error>(())
     });
     if let Err(e) = ride_along {
@@ -1393,6 +1599,8 @@ fn assemble_usage(
                 plan,
                 five_hour: windows.five_hour,
                 seven_day: windows.seven_day,
+                // The OAuth wire never carries a monthly inference quota.
+                monthly: None,
                 weekly_scoped: windows.weekly_scoped,
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
@@ -1428,6 +1636,7 @@ pub(crate) fn fetch_raw(
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
+    decision: &mut ProfileFetchDecision,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
         usage_endpoint().as_ref(),
@@ -1437,7 +1646,7 @@ pub(crate) fn fetch_raw(
         AuthClient::Usage,
     );
     assemble_usage(usage, prev_plan, || {
-        fetch_profile_plan(name, access_token, force_profile, activity)
+        fetch_profile_plan(name, access_token, force_profile, activity, decision)
     })
 }
 
@@ -1491,19 +1700,90 @@ fn reconcile_identity_anchor_held(
     ReconcileOutcome::Replaced { previous: current }
 }
 
+/// [`reconcile_identity_anchor_held`] for an account id already read off a
+/// `/profile` answer for the profile's stored login: the caller holds the
+/// state flock and has checked that login is still the one the answer was
+/// for. A blank id writes nothing. The lookup carries no identity details, so
+/// the details file is kept only while it still names the anchored account;
+/// identity values never enter the logs.
+pub(crate) fn reconcile_identity_anchor_to_held(
+    name: &ProfileName,
+    uuid: &str,
+    _held: &crate::lock::StateLockHeld,
+) {
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        return;
+    }
+    let new_uuid = AccountId::from(uuid.to_string());
+    let current = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    if current.as_ref() == Some(&new_uuid) {
+        remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+        return;
+    }
+    // Write the new anchor first (an atomic replace), so a reader never sees
+    // the anchor absent over a still-present login; only a failed write removes
+    // it, leaving the profile unanchored, never on the displaced account.
+    if !write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid) {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
+        logline!("tollgate: {name}: could not write the identity anchor");
+        return;
+    }
+    remove_profile_cache(name, crate::profile_cache::IDENTITY_PENDING_FILE);
+    if !load_profile_cache::<AccountIdentity>(name, ACCOUNT_IDENTITY_FILE)
+        .is_some_and(|identity| identity.account_uuid == new_uuid)
+    {
+        remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
+    }
+    if current.is_some() {
+        logline!("tollgate: {name}: reconciled its identity anchor");
+    }
+}
+
 /// Apply the existing `/profile` ride-alongs under the caller's stored-token
 /// guard, shared by hourly reads and explicit verification. No TTL acquisition.
+///
+/// `token` is the stored login the read was made with (the caller's guard just
+/// checked it). When the body proves the stored login changed identity (an
+/// A→B re-anchor, or an anchor removed under a standing login), the forget
+/// order runs first inside the same hold: `forget_disk(OAuth)`, the old
+/// account's credit refusal when the login moved to another account, the
+/// throughput file when its own identity moved, and the disk seed of this
+/// body's plan; then the anchor write. The third value is whether that order
+/// ran: the hourly caller re-writes its `/profile` stamp (`forget_disk` removed
+/// it) and forgets the old account's memory after the hold.
 fn apply_profile_read_held(
     name: &ProfileName,
     profile: &RawProfile,
+    token: &str,
+    now: u64,
     held: &crate::lock::StateLockHeld,
-) -> (Option<AccountIdentity>, ReconcileOutcome) {
-    let identity = identity_from_raw(profile, now_ms());
-    let reconcile = identity
-        .as_ref()
-        .map_or(ReconcileOutcome::NoUuid, |identity| {
-            reconcile_identity_anchor_held(name, identity, held)
-        });
+) -> (Option<AccountIdentity>, ReconcileOutcome, bool) {
+    let identity = identity_from_raw(profile, now);
+    let mut reanchored = false;
+    let reconcile = match identity.as_ref() {
+        None => ReconcileOutcome::NoUuid,
+        Some(identity) => {
+            let uuid = &identity.account_uuid;
+            crate::profile_cache::forget_credit_refusal_of_another_account(name, uuid, now);
+            let (before, unreadable) = crate::usage::read_oauth_for_compare(name);
+            let after = crate::usage::OAuthIdentity::for_values(Some(uuid), Some(token));
+            if unreadable {
+                // An unreadable stored identity takes the mismatch path: no
+                // forget order AND no anchor write (N7) — a torn store must
+                // read as RETRY, never as "re-anchor from what we could not
+                // compare". Nothing was saved.
+                ReconcileOutcome::WriteFailed
+            } else {
+                if crate::usage::oauth_changed(&before, &after) {
+                    forget_before_reanchor(name, profile, &before, &after);
+                    reanchored = true;
+                }
+                reconcile_identity_anchor_held(name, identity, held)
+            }
+        }
+    };
     if let Some(tier) = raw_rate_limit_tier(profile) {
         match crate::profile::stamp_rate_limit_tier_if_missing_held(name, &tier, held) {
             Ok(true) => {
@@ -1513,7 +1793,48 @@ fn apply_profile_read_held(
             Err(e) => logline!("tollgate: {name}: rate-limit tier backfill failed: {e:#}"),
         }
     }
-    (identity, reconcile)
+    (identity, reconcile, reanchored)
+}
+
+/// The disk half of a `/profile` re-anchor's forget order, run inside the
+/// ride-along's hold before the anchor write ([`apply_profile_read_held`]).
+fn forget_before_reanchor(
+    name: &ProfileName,
+    profile: &RawProfile,
+    before: &crate::usage::OAuthIdentity,
+    after: &crate::usage::OAuthIdentity,
+) {
+    crate::usage::forget_disk(name, crate::usage::Half::OAuth);
+    if crate::usage::names_another_account(crate::usage::last_account(name).as_ref(), after) {
+        crate::usage::forget_account_disk(name);
+    }
+    // The throughput identity of an OAuth-only profile is its anchor digest,
+    // so A→B moves it too: forget the throughput file when its own identity
+    // changed (the change sites' `forget_disk_plan` shape). A hybrid's
+    // endpoint auth keeps one identity, so nothing is forgotten there.
+    let endpoint = crate::profile::stored_endpoint_identity(name);
+    let (base_url, api_key, env_token_owned) = match &endpoint {
+        Some(e) => (
+            e.base_url.as_deref(),
+            e.api_key.as_deref(),
+            crate::profile::inference_env_token(&e.env),
+        ),
+        None => (None, None, None),
+    };
+    let env_token = env_token_owned.as_deref();
+    let throughput_before = crate::usage::throughput_identity(before, base_url, api_key, env_token);
+    let throughput_after = crate::usage::throughput_identity(after, base_url, api_key, env_token);
+    if throughput_before != throughput_after {
+        crate::usage::forget_disk(name, crate::usage::Half::Throughput);
+    }
+    write_profile_cache(
+        name,
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(plan_from_profile(profile)),
+            ..Default::default()
+        },
+    );
 }
 
 /// Read the committed token directly and verify it once, without rotation or
@@ -1568,20 +1889,35 @@ pub(crate) fn verify_login(name: &ProfileName) -> VerifyOutcome {
     if identity_from_raw(&profile, now_ms()).is_none() {
         return VerifyOutcome::Unreadable;
     }
-    crate::lock::with_state_lock(|held| {
+    let landed = crate::lock::with_state_lock(|held| {
         if !crate::profile::stored_token_matches(name, &oauth.access_token) {
-            return Ok(VerifyOutcome::StoreMoved);
+            return Ok((VerifyOutcome::StoreMoved, false));
         }
-        let (identity, reconcile) = apply_profile_read_held(name, &profile, held);
-        Ok::<_, anyhow::Error>(match identity {
-            Some(identity) => VerifyOutcome::Verified {
-                identity,
-                reconcile,
+        let (identity, reconcile, reanchored) =
+            apply_profile_read_held(name, &profile, &oauth.access_token, now_ms(), held);
+        Ok::<_, anyhow::Error>((
+            match identity {
+                Some(identity) => VerifyOutcome::Verified {
+                    identity,
+                    reconcile,
+                },
+                None => VerifyOutcome::Unreadable,
             },
-            None => VerifyOutcome::Unreadable,
-        })
-    })
-    .unwrap_or(VerifyOutcome::Network)
+            reanchored,
+        ))
+    });
+    match landed {
+        Ok((outcome, reanchored)) => {
+            // The re-anchor forgot the disk caches in its hold; the old
+            // account's in-memory readings go at this process's next drain,
+            // the change-site pattern (`note_forget` after the writes land).
+            if reanchored {
+                crate::usage::note_forget(name, crate::usage::Half::OAuth);
+            }
+            outcome
+        }
+        Err(_) => VerifyOutcome::Network,
+    }
 }
 
 /// Test-facing wrapper for [`reconcile_identity_anchor_held`]: take the state
@@ -1614,6 +1950,10 @@ pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
     pub(crate) rate_limit_tier: Option<String>,
     pub(crate) identity: Option<AccountIdentity>,
+    /// The plan the same body carries (its tier) — the seed a login writes
+    /// into `usage_cache.json` so the account's real tier shows at once,
+    /// before the first poll.
+    pub(crate) plan: PlanInfo,
 }
 
 /// The org's raw `rate_limit_tier` off a parsed `/profile` body, trimmed;
@@ -1643,6 +1983,7 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
         org.and_then(|o| o.rate_limit_tier.as_deref()),
     );
     let rate_limit_tier = raw_rate_limit_tier(&p);
+    let plan = plan_from_profile(&p);
     LoginProfile {
         rate_limit_tier,
         subscription_type: match tier {
@@ -1654,6 +1995,9 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
             PlanTier::Unknown => None,
         },
         identity: identity_from_raw(&p, now_ms()),
+        // The one mapping the fetch path uses, so the login seed is the same
+        // plan a `/profile` read would write.
+        plan,
     }
 }
 
@@ -1663,10 +2007,12 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// — a `401` here means the login produced a dud token — (b) stamp the new
 /// profile's tier so it shows the real plan immediately instead of the
 /// unknown-tier "Pro" fallback, (c) stamp the rate-limit tier Claude Code reads
-/// at startup before any save (#78), and (d) seed the identity anchor
-/// ([`seed_login_anchor`]) without a second round trip. Goes through the shared
-/// `/profile` fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the
-/// caller can surface it.
+/// at startup before any save (#78), (d) seed the identity anchor
+/// ([`seed_login_anchor`]) without a second round trip, and (e) carry the body's
+/// plan so the login's install seeds it into `usage_cache.json`
+/// ([`seed_plan_cache`]) at once. Goes through the shared `/profile` fetch
+/// ([`AuthClient::Profile`]). Returns the HTTP error text so the caller can
+/// surface it.
 pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginProfile> {
     let text = get_json(
         profile_endpoint().as_ref(),
@@ -1675,15 +2021,40 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
         &ProfileName::from("login"),
         AuthClient::Profile,
     )
-    .map_err(|e| match e {
-        FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
-        FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
-        FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
-        FetchError::Parse => anyhow::anyhow!("profile response was not readable"),
-    })?;
+    .map_err(profile_fetch_error)?;
     let p: RawProfile = serde_json::from_str(&text)
         .map_err(|_| anyhow::anyhow!("profile response was not JSON"))?;
     Ok(login_profile_from_raw(p))
+}
+
+/// A test's stand-in for another process's compare landing inside the install's
+/// hold, right before the anchor write. Run once for the profile it names.
+#[cfg(test)]
+pub(crate) type CompareHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static COMPARE_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, CompareHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_compare_hook(profile: &str, f: CompareHook) {
+    COMPARE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(profile.to_string(), f);
+}
+
+#[cfg(test)]
+fn run_compare_hook(profile: &str) {
+    let hook = COMPARE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|hooks| hooks.remove(profile));
+    if let Some(f) = hook {
+        f();
+    }
 }
 
 /// Seed a profile's identity anchor from a completed login install — or clear it
@@ -1708,7 +2079,10 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
         remove_profile_cache(name, ACCOUNT_IDENTITY_FILE);
         return;
     };
-    // Atomic replacement: a proven login never passes through a missing anchor.
+    // Atomic replacement: a proven login never passes through a missing anchor
+    // (a compare reading the gap would see a spurious change).
+    #[cfg(test)]
+    run_compare_hook(name.as_str());
     if crate::profile_cache::write_profile_cache_reported(
         name,
         ACCOUNT_ID_CACHE_FILE,
@@ -1786,6 +2160,44 @@ pub(crate) fn prepare_runtime_login_change(
     Ok(())
 }
 
+/// Seed a freshly installed OAuth login's plan into `usage_cache.json` — the
+/// plan the login's `/profile` probe body carried — so every surface shows the
+/// account's real tier at once, before the first poll. Called INSIDE the
+/// install's state-flock hold, after `forget_disk` and before the identity
+/// writes (credentials, `config.toml`, the anchor), so a reloading process that
+/// re-seeds from disk after the writes finds the seed already there, and this
+/// process's `forget_memory` re-seed picks it up once the hold drops. Writes the
+/// profile path DIRECTLY (never `write_profile_cache`): the new-account seed runs
+/// before the roster carries the name, so the off-roster gate would drop it. No
+/// `/profile` stamp and no TTL memo — the plan's next `/profile` stays due right
+/// after the login, and a failed one still keeps the seed.
+///
+/// tollgate's [`PlanInfo`] carries no account pairing (the login's address and
+/// organization live in `account_identity.json`, bound to the anchor), so a plan
+/// has nothing to mismatch and seeds its tier; `_account_uuid` is the proven
+/// account the caller installs, kept so the call sites read as upstream's.
+pub(crate) fn seed_plan_cache(
+    name: &ProfileName,
+    plan: PlanInfo,
+    _account_uuid: Option<&AccountId>,
+) {
+    let info = UsageInfo {
+        plan: Some(plan),
+        ..UsageInfo::default()
+    };
+    let Some(path) =
+        crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return;
+    };
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return;
+    };
+    if let Err(e) = crate::profile::atomic_write_600(&path, json) {
+        logline!("tollgate: {name}: could not save the login's plan: {e}");
+    }
+}
+
 /// Remove a profile's durable `/profile` stamp — the cross-process half of
 /// [`expire_profile_ttl`], used by a `tollgate start` session's copy-back of its
 /// login into the account. The copy-back makes NO network call: it marks the
@@ -1812,6 +2224,12 @@ pub(crate) fn mark_profile_read_stale(store: &std::path::Path) {
 /// iff their uuids match. Best-effort `None` on any failure (network, 401,
 /// shape drift) — callers must treat that as "identity unproven" and refuse.
 pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
+    probe_account_uuid(access_token).ok()
+}
+
+/// [`fetch_account_uuid`] whose failure names its cause, for a caller that
+/// tells the user why an owner lookup failed.
+pub(crate) fn probe_account_uuid(access_token: &str) -> anyhow::Result<AccountId> {
     let text = get_json(
         profile_endpoint().as_ref(),
         access_token,
@@ -1819,16 +2237,41 @@ pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
         &ProfileName::from("identity"),
         AuthClient::Profile,
     )
-    .ok()?;
+    .map_err(profile_fetch_error)?;
     serde_json::from_str::<RawProfile>(&text)
-        .ok()?
-        .account?
-        .uuid
+        .ok()
+        .and_then(|p| p.account?.uuid)
         // A present-but-blank uuid is shape drift, not an identity — two
         // blanks comparing equal must never prove two tokens are the same
         // account (the None contract above).
         .filter(|u| !u.trim().is_empty())
         .map(AccountId::from)
+        .ok_or_else(|| anyhow::anyhow!("profile response was not readable"))
+}
+
+/// `/profile` refused the access token (HTTP 401): it expired or was revoked,
+/// whatever its own `expiresAt` says. Typed, so a caller can ask instead of
+/// retrying a lookup that cannot succeed.
+#[derive(Debug)]
+pub(crate) struct ProfileUnauthorized;
+
+impl std::fmt::Display for ProfileUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("profile endpoint returned HTTP 401")
+    }
+}
+
+impl std::error::Error for ProfileUnauthorized {}
+
+/// The user-facing cause of a failed `/profile` request.
+fn profile_fetch_error(e: FetchError) -> anyhow::Error {
+    match e {
+        FetchError::Status(401) => ProfileUnauthorized.into(),
+        FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
+        FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
+        FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
+        FetchError::Parse => anyhow::anyhow!("profile response was not readable"),
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -1848,12 +2291,12 @@ pub(crate) fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
         .is_some_and(|resets_at| now_secs < resets_at)
 }
 
-/// [`five_hour_live`] for the OVERALL weekly window: live iff it carries a
-/// parseable reset that is still in the future.
-pub(crate) fn seven_day_live(info: &UsageInfo, now_secs: i64) -> bool {
-    info.seven_day
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
+/// [`five_hour_live`] for the account's LONG window (the aggregate 7d, else
+/// the monthly inference quota): live iff it carries a parseable reset that is
+/// still in the future.
+pub(crate) fn long_window_live(info: &UsageInfo, now_secs: i64) -> bool {
+    info.long_window()
+        .and_then(|(_, w)| w.resets_at.as_deref())
         .and_then(iso_to_epoch_secs)
         .is_some_and(|resets_at| now_secs < resets_at)
 }
@@ -1872,8 +2315,9 @@ fn maxed_window_reset_in(live: bool, window: Option<&UsageWindow>, now_secs: i64
     Some(resets_at - now_secs)
 }
 
-/// True iff a request would currently be REFUSED: a live 5h **or** 7d window
-/// pinned at the API's 100% cap. Such a window can't change until it resets, so
+/// True iff a request would currently be REFUSED: a live 5h or long window
+/// (the 7d, else the monthly inference quota) pinned at the API's 100% cap.
+/// Such a window can't change until it resets, so
 /// the opt-out `refresh_spent_accounts` fetch gate may skip the account until
 /// then. Deliberately keyed on the 100% hard cap, NOT the sub-100 fallback
 /// switch threshold: a below-cap window still moves and must keep being polled,
@@ -1886,16 +2330,16 @@ pub(crate) fn windows_maxed(info: &UsageInfo, now_secs: i64) -> bool {
     )
     .is_some()
         || maxed_window_reset_in(
-            seven_day_live(info, now_secs),
-            info.seven_day.as_ref(),
+            long_window_live(info, now_secs),
+            info.long_window().map(|(_, w)| w),
             now_secs,
         )
         .is_some()
 }
 
 /// Seconds until a spent account (`windows_maxed`) resumes polling: the LATEST
-/// reset among its live-maxed 5h/7d windows. It stays blocked until every maxed
-/// window lapses, so a maxed weekly (7d) window dominates a maxed 5h one — the
+/// reset among its live-maxed 5h/long windows. It stays blocked until every
+/// maxed window lapses, so a maxed long window dominates a maxed 5h one — the
 /// caption reads "resets in <weekly>", not the sooner-but-still-blocked 5h.
 /// `None` when the account is not currently maxed.
 pub(crate) fn spent_resume_in_secs(info: &UsageInfo, now_secs: i64) -> Option<i64> {
@@ -1905,8 +2349,8 @@ pub(crate) fn spent_resume_in_secs(info: &UsageInfo, now_secs: i64) -> Option<i6
         now_secs,
     );
     let seven = maxed_window_reset_in(
-        seven_day_live(info, now_secs),
-        info.seven_day.as_ref(),
+        long_window_live(info, now_secs),
+        info.long_window().map(|(_, w)| w),
         now_secs,
     );
     match (five, seven) {
@@ -1996,6 +2440,13 @@ pub(crate) fn epoch_secs_to_iso(secs: i64) -> String {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+00:00")
+}
+
+/// Epoch-ms → ISO-8601 UTC. One helper so the provider and daemon conversions
+/// cannot drift apart. `i128` holds every `i64` and `u64`, so the division runs
+/// before narrowing and a `u64` past `i64::MAX` never wraps negative.
+pub(crate) fn ms_to_iso(ms: impl Into<i128>) -> String {
+    epoch_secs_to_iso((ms.into() / 1000) as i64)
 }
 
 pub(crate) fn now_epoch_secs() -> i64 {

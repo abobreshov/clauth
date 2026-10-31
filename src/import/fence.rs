@@ -150,7 +150,13 @@ impl Fence {
             }
             let file = crate::profile::open_state_file(path).map_err(|_| lock_held(&shown))?;
             let taken = if i == last {
-                crate::lock::lock_file_with_timeout(&file, ITEM_WAIT).is_ok()
+                crate::lock::lock_file_with_timeout(
+                    &file,
+                    ITEM_WAIT,
+                    |waited| anyhow::anyhow!("lock still held after {}s", waited.as_secs()),
+                    "failed to lock an import fence item",
+                )
+                .is_ok()
             } else {
                 try_lock_retrying(&file)
             };

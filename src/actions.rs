@@ -21,16 +21,28 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
-    ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
-    save_profile, save_profile_config,
+    ModelSettings, Profile, ProfileId, ProfileName, StoredEndpointIdentity, load_app_state,
+    load_profile, profile_dir, require_profile_id, save_app_state, save_new_profile, save_profile,
+    save_profile_config,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
+use crate::usage::{
+    ForgetPlan, Half, OAuthIdentity, PlanInfo, SpendMarker, endpoint_identity_plan, forget_disk,
+    forget_disk_plan, names_another_account, note_forget, note_forget_plan, note_rename,
+    oauth_changed, read_before_identities, read_codex_identity, third_party_identity,
+    throughput_for_endpoint, throughput_identity,
+};
 
-/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
-/// account be named after its email; both are path-separator-free so the name
-/// stays a single `profiles/<name>` segment with no traversal. The charset
+/// One character a name may hold: ASCII alphanumeric or `-_.@+`. `@`/`+` let
+/// an account be named after its email; both are path-separator-free so the
+/// name stays a single `profiles/<name>` segment with no traversal.
+pub(crate) fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+')
+}
+
+/// Every char an [`is_name_char`], not leading-dot, not empty. The charset
 /// half of [`validate_profile_name`], standing alone for names that live in a
 /// namespace of their own (the preset store), where neither roster has a say.
 /// Returns the trimmed name the checks ran against.
@@ -39,9 +51,7 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     if trimmed.is_empty() {
         bail!("name cannot be empty");
     }
-    let valid_chars = trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
+    let valid_chars = trimmed.chars().all(is_name_char);
     if !valid_chars || trimmed.starts_with('.') {
         bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
     }
@@ -58,7 +68,7 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
 /// to shadow another harness, which no flow can adopt across.
 pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
     if let Some(foreign) = foreign_roster_holding(name, harness)? {
-        bail!("'{name}' is a {foreign} profile — profile names span every harness, pick another");
+        bail!("'{name}' is a {foreign} profile. Profile names span every harness, so pick another");
     }
     Ok(())
 }
@@ -259,10 +269,25 @@ fn switch_profile_synced(
     let mut guard = config.lock().expect("config mutex poisoned");
     let changed = switch_profile_locked(&mut guard, name)?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status_with(config, before_commit);
     }
     Ok(())
+}
+
+/// issue #17: after a switch that moved the active profile (or switched off),
+/// drop the outgoing account's cached identity so Claude Code re-derives it
+/// from the relinked credentials. Runs AFTER the state flock, gated on `changed`
+/// so only a switch that actually proceeded strips: the strip try-onces the
+/// `.claude.json` sync lock, ranked OUTSIDE `State`, so it must never run under
+/// the flock, and a strip that cannot take the lock is deferred to the next
+/// reconcile rather than failing the switch. A no-op switch (already active)
+/// never reaches this.
+fn strip_stale_identity_after_switch(changed: bool) {
+    if changed {
+        crate::claude_json::strip_home_oauth_account();
+    }
 }
 
 /// [`switch_profile`]'s locked body: the caller holds the config guard and
@@ -343,6 +368,7 @@ pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName
         Ok(true)
     })?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
@@ -360,24 +386,25 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let (changed, outgoing) = with_state_lock(|held| {
+    let (changed, outgoing, oauth_changed) = with_state_lock(|held| {
         let config = &mut *guard;
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok((false, None));
+            return Ok((false, None, false));
         }
         let outgoing = config.state.active_profile.as_ref().cloned();
-        force_snapshot_active_credentials(config)?;
+        let oauth_changed = force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
         finish_switch(config, name, held)?;
-        Ok((true, outgoing))
+        Ok((true, outgoing, oauth_changed))
     })?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         // The reconcile captured a live login that may be a DIFFERENT account:
         // expire the outgoing profile's `/profile` clock (ranked below the flock,
         // so after the hold), the way `overwrite_captured_profile` does.
-        if let Some(out) = outgoing {
+        if oauth_changed && let Some(out) = outgoing {
             crate::usage::expire_profile_ttl(&out);
         }
         crate::daemon::publish_status(config);
@@ -385,11 +412,277 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
     Ok(())
 }
 
+/// macOS, CLI: what a command does with its entry's
+/// [`crate::claude::settle_bare_keychain_item`] before it writes the bare
+/// item. A settled item: say what the settle did on stderr (its carry has
+/// landed), then hand its verdict to the writer guards the command runs
+/// while the returned placement lives. An item the settle cannot place: ask
+/// on a terminal ([`ask_bare_item_choice`]), else refuse with a `tollgate:`
+/// line. A save lands in `config` and the settle runs again; a save whose
+/// owner's store kept a later login lets the write go on over the item.
+#[cfg(target_os = "macos")]
+pub(crate) fn bare_item_placement_for_cli(
+    config: &mut AppConfig,
+    writer: crate::claude::BareItemWriter,
+    settle: crate::claude::BareItemSettle,
+) -> Result<crate::claude::BareItemPlacement> {
+    use crate::claude::{BareItemPlacement, BareItemSettle};
+    use std::io::IsTerminal as _;
+
+    // Guest mode: the bare item is upstream clauth's, so no command places,
+    // saves or replaces it.
+    crate::identity::refuse_in_guest_mode()?;
+    let mut settle = settle;
+    loop {
+        let unplaced = match settle {
+            BareItemSettle::Settled(settled) => {
+                if let Some(notice) = &settled.notice {
+                    crate::out::errln!("tollgate: {notice}");
+                }
+                return Ok(BareItemPlacement::enter(settled.placed));
+            }
+            BareItemSettle::NeedsChoice(unplaced) => unplaced,
+        };
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            crate::out::errln!("{}", bare_item_refusal_line(&unplaced.refusal(writer)));
+            return Err(anyhow::Error::new(crate::FailureReported));
+        }
+        match ask_bare_item_choice(&unplaced, writer)? {
+            BareItemChoice::Save => {
+                if let Some(placed) =
+                    save_bare_keychain_item(config, writer).map_err(report_failed_cli_settle)?
+                {
+                    return Ok(BareItemPlacement::enter(Some(placed)));
+                }
+            }
+            BareItemChoice::Replace => {
+                let placed = crate::claude::read_bare_keychain_item()
+                    .as_ref()
+                    .and_then(crate::claude::bare_item_replacement);
+                return Ok(BareItemPlacement::enter(placed));
+            }
+            BareItemChoice::Cancel => {
+                crate::out::errln!("tollgate: aborted, no changes made");
+                return Err(anyhow::Error::new(crate::FailureReported));
+            }
+        }
+        settle =
+            crate::claude::settle_bare_keychain_item(writer).map_err(report_failed_cli_settle)?;
+    }
+}
+
+/// macOS, CLI: a failed [`crate::claude::settle_bare_keychain_item`] or
+/// prompt save, reported on stderr like the refusal of an item it cannot
+/// place. A failure the prompt already reported passes through unprinted.
+#[cfg(target_os = "macos")]
+pub(crate) fn report_failed_cli_settle(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<crate::FailureReported>() {
+        return e;
+    }
+    crate::out::errln!("{}", bare_item_refusal_line(&e));
+    anyhow::Error::new(crate::FailureReported)
+}
+
+/// The CLI's stderr line for a bare-item settle that refused or failed.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS CLI settles; the line is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_refusal_line(e: &anyhow::Error) -> String {
+    format!("tollgate: {e:#}")
+}
+
+/// What the user chose for a bare-item login no store saved.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareItemChoice {
+    Save,
+    Replace,
+    Cancel,
+}
+
+/// The answer a line typed at [`ask_bare_item_choice`] names, if any.
+#[cfg(target_os = "macos")]
+fn parse_bare_item_choice(line: &str) -> Option<BareItemChoice> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "s" | "save" => Some(BareItemChoice::Save),
+        "p" | "replace" => Some(BareItemChoice::Replace),
+        "c" | "cancel" => Some(BareItemChoice::Cancel),
+        _ => None,
+    }
+}
+
+/// Ask on stderr what to do with the unplaced login, reading one line from
+/// stdin: a miss asks once more, a second miss or a closed stdin cancels.
+#[cfg(target_os = "macos")]
+fn ask_bare_item_choice(
+    unplaced: &crate::claude::BareItemUnplaced,
+    writer: crate::claude::BareItemWriter,
+) -> Result<BareItemChoice> {
+    let action = writer.action();
+    crate::out::errln!("tollgate: {}", unplaced.question());
+    crate::out::errln!(
+        "  s  save     save it as an account (asks for a name if none matches), then {action}"
+    );
+    crate::out::errln!(
+        "  p  replace  {action} anyway; that account will need a browser login again"
+    );
+    crate::out::errln!("  c  cancel   leave everything as it is");
+    if let Some(tip) = unplaced.tip() {
+        crate::out::errln!("  {tip}");
+    }
+    for _ in 0..2 {
+        crate::out::err!("choose [s/p/c]: ");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            break;
+        }
+        if let Some(choice) = parse_bare_item_choice(&line) {
+            return Ok(choice);
+        }
+    }
+    Ok(BareItemChoice::Cancel)
+}
+
+/// The prompt's save: the bare item's unsaved login goes into the profile
+/// already cached with its account (the one the user names, when two are),
+/// else into a new profile named at a second prompt and created like
+/// `tollgate capture`. A name that is neither of the two cancels. The key the
+/// writer may replace the item by when the owner's store kept a later login
+/// ([`crate::claude::save_bare_item_into`]).
+#[cfg(target_os = "macos")]
+fn save_bare_keychain_item(
+    config: &mut AppConfig,
+    writer: crate::claude::BareItemWriter,
+) -> Result<Option<[u8; 32]>> {
+    use crate::claude::BareItemSave;
+
+    crate::identity::refuse_in_guest_mode()?;
+    let Some(item) = crate::claude::read_bare_keychain_item() else {
+        return Ok(None);
+    };
+    match crate::claude::bare_item_save(&item) {
+        BareItemSave::Nothing => Ok(None),
+        BareItemSave::Owner(owner) => {
+            let account = crate::claude::claim_bare_item_owner(&owner)?;
+            crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+        }
+        BareItemSave::Owners(first, second) => {
+            // Claimed before the question: the pick lands only on the account
+            // each name held when it was asked about.
+            let accounts = [
+                crate::claude::claim_bare_item_owner(&first)?,
+                crate::claude::claim_bare_item_owner(&second)?,
+            ];
+            crate::out::err!("save it into which profile? [{first}/{second}]: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            match pick_bare_item_owner(&line, [&first, &second]) {
+                Some(owner) => {
+                    let account = if owner == &first {
+                        &accounts[0]
+                    } else {
+                        &accounts[1]
+                    };
+                    crate::claude::save_bare_item_into(owner, account, &item, writer)
+                }
+                None => {
+                    crate::out::errln!("tollgate: aborted, no changes made");
+                    Err(anyhow::Error::new(crate::FailureReported))
+                }
+            }
+        }
+        BareItemSave::NewProfile { login, account } => {
+            crate::out::err!("name for the new profile: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            save_bare_item_as_profile_fresh(config, &line, login, account).map(|()| None)
+        }
+    }
+}
+
+/// The CLI prompt's [`save_bare_item_as_profile`], on config read after the
+/// name was typed: the caller's config predates its own prompts, and the
+/// save writes profiles.toml from the config it is given, which would revert
+/// a profile another tollgate created or a switch the daemon made meanwhile.
+/// `config` becomes the config the save landed on.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS prompt; pinned on every platform"
+    )
+)]
+pub(crate) fn save_bare_item_as_profile_fresh(
+    config: &mut AppConfig,
+    name: &str,
+    login: ClaudeCredentials,
+    account: Option<crate::profile::AccountId>,
+) -> Result<()> {
+    crate::identity::refuse_in_guest_mode()?;
+    let mut fresh = crate::profile::load_config()?;
+    save_bare_item_as_profile(&mut fresh, name, login, account)?;
+    *config = fresh;
+    Ok(())
+}
+
+/// The one of `owners` a line typed at the prompt's `which profile?` names,
+/// if any.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS prompt; pinned on every platform"
+    )
+)]
+pub(crate) fn pick_bare_item_owner<'a>(
+    line: &str,
+    owners: [&'a ProfileName; 2],
+) -> Option<&'a ProfileName> {
+    let line = line.trim();
+    owners.into_iter().find(|owner| owner.as_str() == line)
+}
+
+/// A bare-item save's [`crate::claude::BareItemSave::NewProfile`]: a new
+/// profile named `name` takes the login, created like `tollgate capture`, and
+/// anchored to the account the lookup proved for it, if any. The CLI prompt
+/// and the TUI modal both create through here.
+pub(crate) fn save_bare_item_as_profile(
+    config: &mut AppConfig,
+    name: &str,
+    login: ClaudeCredentials,
+    account: Option<crate::profile::AccountId>,
+) -> Result<()> {
+    // Guest mode: the bare item's login is upstream clauth's live chain.
+    crate::identity::refuse_in_guest_mode()?;
+    let name = validate_capture_name(config, name)?.to_string();
+    let saving = || format!("saving the macOS Keychain login into {name}");
+    let mut snapshot = snapshot_of_login(Some(login)).with_context(saving)?;
+    // The owner lookup proved the uuid alone: no address or organization.
+    snapshot.anchor = account.map_or(AnchorAction::Unproven, |account_uuid| {
+        AnchorAction::Proven(crate::profile_cache::AccountIdentity {
+            account_uuid,
+            email: None,
+            organization_uuid: None,
+            organization_name: None,
+            organization_type: None,
+            verified_at_ms: crate::usage::now_ms(),
+        })
+    });
+    capture_into_profile(config, name.clone(), ModelSettings::default(), snapshot)
+        .with_context(saving)
+}
+
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
 /// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
 pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> Result<()> {
     // Guest mode refuses before the AUTH-1 gate below can spend a refresh.
     crate::identity::refuse_in_guest_mode()?;
+    #[cfg(target_os = "macos")]
+    let mut config = config;
     let outgoing = config.state.active_profile.as_ref().cloned();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
@@ -399,6 +692,36 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     let reconciled = match outgoing.as_ref() {
         Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
+    };
+
+    // Asked before anything below writes a store, so a no leaves none
+    // changed.
+    if reconciled {
+        let active = outgoing.as_deref().unwrap_or("");
+        out!(
+            "tollgate: '{active}' has a newer login in ~/.claude. save it into '{active}' \
+             and switch to '{canonical}'? [Y/n] "
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if !(answer.is_empty() || answer == "y" || answer == "yes") {
+            outln!("tollgate: aborted, no changes made");
+            return Ok(());
+        }
+    }
+
+    // Above the AUTH-1 gate: when the target owns the item's login, the gate
+    // would refresh the target's consumed predecessor and quarantine it,
+    // while the settle saves the live successor into it first.
+    #[cfg(target_os = "macos")]
+    let _placed = if outgoing.as_deref() == Some(canonical) {
+        None
+    } else {
+        let writer = crate::claude::BareItemWriter::Switch;
+        let settle =
+            crate::claude::settle_bare_keychain_item(writer).map_err(report_failed_cli_settle)?;
+        Some(bare_item_placement_for_cli(&mut config, writer, settle)?)
     };
 
     let config = Arc::new(RankedMutex::new(config));
@@ -412,7 +735,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
     // plain `claude` may be refreshing through the symlink right now — gating
     // it can lose that race and false-quarantine a healthy login.
     if outgoing.as_deref() != Some(canonical) {
-        match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
+        match oauth::ensure_installable(&config, canonical, oauth::refresh_result, None) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(canonical).line()),
             // CLI stderr: name the HTTP status too. This lands on `main.rs`'s
@@ -424,32 +747,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
                     crate::format::refresh_transient_cli(canonical, &e).line()
                 )
             }
+            // Unreachable: the CLI passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => bail!("{}", crate::format::DAEMON_STOPPING),
         }
     }
 
     if reconciled {
-        let active = {
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let cfg = config.lock().expect("config mutex poisoned");
-            cfg.state
-                .active_profile
-                .as_deref()
-                .unwrap_or("")
-                .to_string()
-        };
-        out!(
-            "tollgate: '{active}' has a newer login in ~/.claude. save it into '{active}' \
-             and switch to '{canonical}'? [Y/n] "
-        );
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_ascii_lowercase();
-        if answer.is_empty() || answer == "y" || answer == "yes" {
-            switch_profile_reconciled(&config, canonical)?;
-        } else {
-            outln!("tollgate: aborted, no changes made");
-            return Ok(());
-        }
+        switch_profile_reconciled(&config, canonical)?;
     } else {
         switch_profile(&config, canonical)?;
     }
@@ -478,7 +782,8 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// `None` means no default is set so it errors. A non-diverged link
 /// (`LinkedTo`/`Missing`) always takes the plain [`switch_profile`].
 ///
-/// Returns `(previous_active, new_active)`.
+/// Returns `(previous_active, new_active, notice)`: `notice` says what the
+/// macOS bare-item settle saved before the switch, for the caller's reply.
 ///
 /// Accepted TOCTOU: the divergence classify runs before the locked relink (same
 /// shape as the CLI path); a live change in that gap self-heals on the next switch.
@@ -513,6 +818,9 @@ pub(crate) enum SwitchError {
     Refused(String),
     Deferred(String),
     Failed(anyhow::Error),
+    /// The daemon is stopping: the AUTH-1 gate refused a refresh under the
+    /// rotation lock, so no request went out. Reflected as a 503.
+    Stopping,
 }
 
 impl SwitchError {
@@ -521,7 +829,7 @@ impl SwitchError {
     /// asked of the chain rather than caught at one site.
     pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
         match self {
-            Self::Refused(_) | Self::Deferred(_) => None,
+            Self::Refused(_) | Self::Deferred(_) | Self::Stopping => None,
             Self::Failed(e) => e.downcast_ref(),
         }
     }
@@ -531,7 +839,7 @@ impl SwitchError {
     /// a 409 rather than answering an authored refusal with the 500 literal.
     pub(crate) fn deep_refusal(&self) -> Option<String> {
         match self {
-            Self::Refused(_) | Self::Deferred(_) => None,
+            Self::Refused(_) | Self::Deferred(_) | Self::Stopping => None,
             Self::Failed(e) => e
                 .downcast_ref::<DeepRefusal>()
                 .map(|r| r.0.clone())
@@ -551,6 +859,7 @@ impl std::fmt::Display for SwitchError {
             // anyhow's head-line semantics, so the MCP tool's `reason`
             // payload stays byte-identical for every input.
             Self::Refused(sentence) | Self::Deferred(sentence) => f.write_str(sentence),
+            Self::Stopping => f.write_str(crate::format::DAEMON_STOPPING),
             Self::Failed(e) => {
                 if f.alternate() {
                     write!(f, "{e:#}")
@@ -581,7 +890,8 @@ pub(crate) fn switch_profile_noninteractive(
         &str,
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
-) -> std::result::Result<(Option<String>, String), SwitchError> {
+    spend_marker: SpendMarker<'_>,
+) -> std::result::Result<(Option<String>, String, Option<String>), SwitchError> {
     // Guest mode: an authored refusal, ahead of the AUTH-1 gate's refresh.
     if crate::identity::upstream_active() {
         return Err(SwitchError::Refused(
@@ -610,6 +920,39 @@ pub(crate) fn switch_profile_noninteractive(
         )));
     }
 
+    // Above the AUTH-1 gate, as in `switch_profile_cli`. Nobody can answer a
+    // question here, so an item the settle cannot place refuses. The notice
+    // rides the reply and the event log once its carry has landed.
+    #[cfg(target_os = "macos")]
+    let (_placed, notice) = if previous.as_deref() == Some(target) {
+        (None, None)
+    } else {
+        let writer = crate::claude::BareItemWriter::Switch;
+        let settled = match crate::claude::settle_bare_keychain_item(writer)
+            .map_err(|e| SwitchError::Refused(format!("{e:#}")))?
+        {
+            crate::claude::BareItemSettle::Settled(settled) => settled,
+            crate::claude::BareItemSettle::NeedsChoice(unplaced) => {
+                return Err(SwitchError::Refused(format!(
+                    "{:#}",
+                    unplaced.refusal(writer)
+                )));
+            }
+        };
+        if let Some(notice) = &settled.notice {
+            crate::logline::logline!(
+                "{}: {notice}",
+                crate::logline::role(crate::logline::stamped())
+            );
+        }
+        (
+            Some(crate::claude::BareItemPlacement::enter(settled.placed)),
+            settled.notice,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let notice = None;
+
     // AUTH-1 (Incident C): gate the target before its credentials land in the
     // Keychain — the same gate as the CLI switch, so "a quarantined account is
     // refused as a switch target" holds for EVERY noninteractive entry point
@@ -618,7 +961,7 @@ pub(crate) fn switch_profile_noninteractive(
     // path: nothing new to install, and gating it races a plain `claude`
     // refreshing the symlinked live file (a lost race false-quarantines).
     if previous.as_deref() != Some(target) {
-        match oauth::ensure_installable(config, target, refresher) {
+        match oauth::ensure_installable(config, target, refresher, spend_marker) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => {
                 return Err(SwitchError::Refused(
@@ -635,6 +978,9 @@ pub(crate) fn switch_profile_noninteractive(
                     SwitchError::Refused(sentence)
                 });
             }
+            // The daemon's stop flag refused the spend under the rotation lock:
+            // no request went out, so answer with the typed stopping variant.
+            oauth::AuthGate::Stopping => return Err(SwitchError::Stopping),
         }
     }
 
@@ -662,7 +1008,7 @@ pub(crate) fn switch_profile_noninteractive(
         switch_profile(config, target)?;
     }
 
-    Ok((previous, target.to_string()))
+    Ok((previous, target.to_string(), notice))
 }
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account.
@@ -679,6 +1025,7 @@ pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
     let mut guard = config.lock().expect("config mutex poisoned");
     let changed = switch_off_locked(&mut guard)?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
@@ -697,9 +1044,9 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
         }
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
-        // No active account left to show; issue #17 applies here too — a
-        // stale identity block is just as wrong once creds are cleared.
-        crate::claude_json::strip_home_oauth_account()?;
+        // No active account left to show; issue #17 applies here too — the
+        // stale identity block is stripped by the callers (after the flock) via
+        // `strip_stale_identity_after_switch`.
         config.state.set_active(None, held);
         // Same fresh-state rule as `finish_switch`: only the active marker is
         // this leg's change, so write it onto the current on-disk state rather
@@ -751,10 +1098,10 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     let profile = config.find(name).context("profile not found")?;
     let target_is_oauth = profile.is_oauth();
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
-    // issue #17: drop the outgoing account's cached identity so Claude Code
-    // re-derives it from the just-relinked credentials instead of showing
-    // the wrong account until its next `/login`.
-    crate::claude_json::strip_home_oauth_account()?;
+    // The issue #17 strip runs AFTER this fn, at the caller
+    // (`strip_stale_identity_after_switch`, gated on `changed`), so it takes the
+    // .claude.json sync lock (ranked outside the state flock) rather than
+    // running under the flock here.
     config.state.set_active(Some(name.clone()), held);
     config.state.last_switch_at = Some(crate::usage::now_epoch_secs().max(0) as u64);
     // Fresh state, not the whole in-memory list: a daemon drain may hold a
@@ -799,27 +1146,21 @@ pub(crate) fn edit_profile_endpoint(
     api_key: Option<String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         // A failed save must leave the in-memory profile matching disk: the
         // next write would otherwise persist a change the error said did not
         // happen.
         let snapshot = profile.clone();
-        let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
         // Re-derive the provider — the in-memory config is authoritative until
         // the next disk reload, so a stale value here would keep (or block)
-        // third-party fetches against the wrong endpoint. Also clear when only the
-        // api key changed for the same provider (rotated key — old stats are stale).
+        // third-party fetches against the wrong endpoint.
         let provider = profile
             .base_url
             .as_deref()
             .and_then(crate::providers::Provider::from_base_url);
-        let drop_cache =
-            provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key);
-        if drop_cache {
-            profile.third_party_usage = None;
-        }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
         // session on a profile that no longer talks to Model Studio, and every
@@ -831,25 +1172,23 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
+        let plan = endpoint_identity_plan(
+            &before,
+            &before.oauth,
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
+            before.has_credentials,
+        );
+        forget_disk_plan(name, plan);
         if let Err(e) = save_profile_config(profile) {
             *profile = snapshot;
             return Err(e);
         }
-        if drop_cache {
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory provider-store entry survives
-            // until the profile's next fetch (≤ one interval; until restart
-            // if the edit left it no fetch leg) — no cross-process clear
-            // exists. Only after the save lands: a failed save restores the
-            // in-memory profile, so it must leave the cache as it was too.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
-        }
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -874,20 +1213,42 @@ pub(crate) fn edit_profile_endpoint(
 ///
 /// The stale third-party cache is dropped: it was fetched under the previous
 /// session, and a new login can be a different account entirely.
+///
+/// Lands only while `name` still holds `account`, the [`ProfileId`] claimed
+/// when the login opened, and still points at the console front the session
+/// came from: a session is minted on one front and meaningless on the other,
+/// and the usage fetch keys on the credential's OWN site rather than on
+/// `base_url`, so an endpoint moved between two Model Studio hosts during the
+/// trip would quietly report the other plan's quota under this name.
 pub(crate) fn store_console_login(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     console: ConsoleCredential,
 ) -> Result<()> {
-    with_state_lock(|_held| {
-        let profile = config.find_mut(name).context("profile not found")?;
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        let before = read_before_identities(name);
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if profile.console_login_target().map(|(site, _)| site) != Some(console.site) {
+            bail!("'{name}' no longer points at the console this session came from");
+        }
         profile.console = Some(console);
-        profile.third_party_usage = None;
-        save_profile_config(profile)?;
-        crate::profile_cache::remove_profile_cache(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        let after = third_party_identity(
+            profile.provider,
+            profile.api_key.as_deref(),
+            profile.console.as_ref(),
+            profile.base_url.as_deref(),
         );
+        let plan = ForgetPlan {
+            third_party: before.third_party != after,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
+        save_profile_config(profile)?;
+        note_forget_plan(name, plan);
         Ok(())
     })
 }
@@ -973,6 +1334,7 @@ pub(crate) fn edit_profile_preset(
     env: &BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         profile.base_url = base_url;
         profile.models = models;
@@ -987,23 +1349,21 @@ pub(crate) fn edit_profile_preset(
             .base_url
             .as_deref()
             .and_then(Provider::from_base_url);
-        if provider != profile.provider {
-            profile.third_party_usage = None;
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory provider-store entry
-            // survives until the profile's next fetch (≤ one interval; until
-            // restart if the edit left it no fetch leg) — no cross-process
-            // clear exists.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
-        }
         profile.provider = provider;
+        let plan = endpoint_identity_plan(
+            &before,
+            &before.oauth,
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
+            before.has_credentials,
+        );
+        forget_disk_plan(name, plan);
         save_profile_config(profile)?;
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1011,6 +1371,92 @@ pub(crate) fn edit_profile_preset(
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
         Ok(())
+    })
+}
+
+/// An account re-bind whose rows were already saved to disk before the active
+/// account's live `settings.json` re-apply failed: the saved rows still count
+/// as moved, and the account still counts as failed. The caller downcasts this
+/// to recover both halves instead of losing the applied count with the error.
+#[derive(Debug)]
+pub(crate) struct RebindSavedBeforeFailure {
+    pub(crate) applied: usize,
+    pub(crate) error: anyhow::Error,
+}
+
+impl std::fmt::Display for RebindSavedBeforeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for RebindSavedBeforeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// Apply one account's re-bind moves through the per-account model write path.
+/// Each move lands only where the fresh on-disk row still holds the move's
+/// `old` (still empty for an empty-row offer), so a row a concurrent writer
+/// changed since the offer is skipped, never overwritten. Returns how many
+/// rows moved. Only the offered rows change; base_url, env, keys and every
+/// other model row stay byte-identical. A live-settings re-apply that fails
+/// after the save returns the saved count inside a [`RebindSavedBeforeFailure`].
+pub(crate) fn apply_rebind_account(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    moves: &[crate::presets::RowMove],
+) -> Result<usize> {
+    with_state_lock(|_held| {
+        if !load_app_state()?.profiles.iter().any(|n| n == name) {
+            bail!("profile not found");
+        }
+        let mut fresh = load_profile(name)?;
+        let mut applied = 0usize;
+        for m in moves {
+            if fresh.models.field(m.row).cloned() == m.old {
+                fresh.models.set_field(m.row, m.new.clone());
+                applied += 1;
+            }
+        }
+        if applied == 0 {
+            return Ok(0);
+        }
+        // A failed save must leave the in-memory account unchanged, so the disk
+        // write lands before the in-memory copy moves (`edit_profile_endpoint`'s
+        // snapshot-restore shape).
+        save_profile_config(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.models = fresh.models.clone();
+        }
+        if config.is_active(name) {
+            let Some(profile) = config.find(name) else {
+                return Err(anyhow::Error::new(RebindSavedBeforeFailure {
+                    applied,
+                    error: anyhow::anyhow!("profile not found"),
+                }));
+            };
+            let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+            if let Err(error) = apply_profile_to_claude_settings(profile, &prev_env_keys) {
+                return Err(anyhow::Error::new(RebindSavedBeforeFailure {
+                    applied,
+                    error,
+                }));
+            }
+        }
+        Ok(applied)
+    })
+}
+
+/// Store the built-in bind-table digest the TUI offered, under the state flock:
+/// fresh-state read-modify-write, so a concurrent state writer is never
+/// clobbered. The CLI never reaches this.
+pub(crate) fn store_preset_binds_offered(digest: String) -> Result<()> {
+    with_state_lock(|_held| {
+        let mut state = load_app_state()?;
+        state.preset_binds_offered = Some(digest);
+        save_app_state(&state)
     })
 }
 
@@ -1024,12 +1470,26 @@ pub(crate) fn edit_profile_env(
     env: BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         // Snapshot before overwrite — a removed key is only stripped from live
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
         profile.env = env;
+        let after_throughput = throughput_for_endpoint(
+            &before.oauth,
+            profile.base_url.as_deref(),
+            before.has_credentials,
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
         save_profile_config(profile)?;
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1091,10 +1551,11 @@ pub(crate) fn classify_env_key(
 /// `dir.exists()` branches meaningful.
 ///
 /// Handed to [`delete_profile`] / [`rename_profile`] rather than taken inside
-/// them: the TUI holds the `config` guard across both calls, and ROTATION ranks
-/// outside `Config`, so the acquisition has to happen before the config lock. The
-/// guard parameter makes a caller with no lock a compile error; what makes a
-/// caller who takes it in the wrong ORDER fail is `lockorder`'s assertion.
+/// them: the TUI holds the `config` guard across a rename and takes it inside a
+/// delete, and ROTATION ranks outside `Config`, so the acquisition has to happen
+/// before the config lock. The guard parameter makes a caller with no lock a
+/// compile error; what makes a caller who takes it in the wrong ORDER fail is
+/// `lockorder`'s assertion.
 pub(crate) fn rotation_guard_for_mutation(name: &ProfileName) -> Result<RotationGuard> {
     match RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => Ok(guard),
@@ -1134,7 +1595,7 @@ pub(crate) fn rename_profile(
         config.canonical_name(new).is_none_or(|n| n == old.as_str()),
         "rename target '{new}' already names an account"
     );
-    with_state_lock(|held| {
+    with_state_lock(|_held| {
         // Same gate delete and disable carry, same predicate and copy: a live
         // session's runtime tree, markers and env paths all live under this
         // directory, so moving it out from under the child breaks the session
@@ -1142,6 +1603,22 @@ pub(crate) fn rename_profile(
         if crate::runtime::has_live_session(old) {
             bail!("'{old}' has a live session, close it first");
         }
+        Ok(())
+    })?;
+    // Stop every runtime tree's supervisor before the profile dir moves,
+    // with the flock dropped (a signal or wait never spans it). The rotation
+    // guard the caller holds for `old` keeps an acquire from re-minting a path
+    // during the stop. Rename has no `--force` flag, so a refusal names only
+    // the retry.
+    let old_dir = profile_dir(old)?;
+    crate::runtime::stop_profile_tree_supervisors(
+        old,
+        &old_dir,
+        crate::runtime::SupervisorStopGate::Refused {
+            offers_force: false,
+        },
+    )?;
+    with_state_lock(|held| {
         let old_dir = profile_dir(old)?;
         let new_dir = profile_dir(new)?;
         // The name validation above checked the RECORD; a directory can outlive
@@ -1160,10 +1637,9 @@ pub(crate) fn rename_profile(
         // (`d3` -> `D3`) resolves to ONE directory on a case-insensitive
         // filesystem (the macOS default), so same-inode pairs are exempt.
         if old_dir.exists() && new_dir.exists() {
-            let same_dir = old_dir
-                .canonicalize()
+            let same_dir = crate::canonical::identity(&old_dir)
                 .ok()
-                .zip(new_dir.canonicalize().ok())
+                .zip(crate::canonical::identity(&new_dir).ok())
                 .is_some_and(|(a, b)| a == b);
             if !same_dir {
                 bail!(
@@ -1176,12 +1652,19 @@ pub(crate) fn rename_profile(
         if old_dir.exists() {
             std::fs::rename(&old_dir, &new_dir)
                 .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
+            // The live link pointed into the moved directory: follow the move
+            // before anything below can fail, so a refused relink (an unsaved
+            // Keychain login in the way) never leaves it dangling.
+            repoint_link_into_moved_dir(&old_dir, &new_dir)?;
         }
 
         let was_active = config.is_active(old);
         config.rename_all_occurrences(old, new, held);
 
         save_app_state(&config.state)?;
+        // The dir move carried every disk cache to `new`; note after the record
+        // move lands so a failed rename notes nothing.
+        note_rename(old, new);
 
         // Guest mode: the live slot is upstream's, so nothing of ours is
         // linked there to follow the rename.
@@ -1199,52 +1682,140 @@ pub(crate) fn rename_profile(
     Ok(())
 }
 
-/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
-/// `force` does not waive it: `force` waives the live-session gate below, while
-/// an in-flight rotation is a different hazard that no confirmation makes safe.
+/// Point the live credentials link at the same file under `new_dir` when it
+/// points into `old_dir`, which a rename just moved to `new_dir`. The file it
+/// names is the one it named before, so what Claude Code reads is unchanged
+/// and no Keychain write is involved; any other live slot is left alone.
+/// Guest mode leaves the live slot alone too: it is upstream clauth's.
+pub(crate) fn repoint_link_into_moved_dir(
+    old_dir: &std::path::Path,
+    new_dir: &std::path::Path,
+) -> Result<()> {
+    if crate::identity::upstream_active() {
+        return Ok(());
+    }
+    let link = crate::claude::claude_credentials_path()?;
+    let Ok(target) = std::fs::read_link(&link) else {
+        return Ok(());
+    };
+    let Ok(rest) = target.strip_prefix(old_dir) else {
+        return Ok(());
+    };
+    crate::claude::publish_credential_link(&link, &new_dir.join(rest))
+}
+
+/// The CLI's delete: its live-session, supervisor and unrescued-files refusals
+/// offer `--force`.
 pub(crate) fn delete_profile(
     config: &mut AppConfig,
     name: &ProfileName,
     force: bool,
+    rotation: &RotationGuard,
+) -> Result<()> {
+    delete_profile_offering(config, name, force, true, rotation)
+}
+
+/// `rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: `force` waives the live-session gate, while an
+/// in-flight rotation is a different hazard that no confirmation makes safe.
+/// `offers_force` is false for a caller with no `--force` flag (the TUI), so no
+/// refusal names the flag.
+pub(crate) fn delete_profile_offering(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
+    rotation: &RotationGuard,
+) -> Result<()> {
+    delete_profile_taking_config(move || config, name, force, offers_force, rotation)
+}
+
+/// [`delete_profile_offering`] for a caller that shares its config with other
+/// threads (the TUI's delete worker): `config` is called only for the final
+/// unwire-and-remove hold, so the config lock is never held across the
+/// guards' waits or the rescue's tree-sized IO.
+pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppConfig>>(
+    config: impl FnOnce() -> C,
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
-    with_state_lock(|held| {
+    with_state_lock(|_held| {
         // Refuse to pull an account out from under a running `tollgate start`
         // session (either flavor), checked before any removal so a refused
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
-        // override this; only `force` does.
+        // override this; only `force` does. A Claude Code background job naming
+        // any tree under this profile's dir is a live session for this refusal
+        // too — `has_live_session` unions both sources.
         if !force && crate::runtime::has_live_session(name) {
-            bail!("'{name}' has a live session, pass --force to delete it anyway");
+            if offers_force {
+                bail!("'{name}' has a live session, pass --force to delete it anyway");
+            }
+            bail!("'{name}' has a live session");
         }
-
-        let was_active = config.is_active(name);
-        // An active API profile's base_url + api_key (and model-tier keys) live in
-        // ~/.claude/settings.json, not the credentials link. Capture its custom
-        // env keys before removal so the unwire below can strip those too.
-        let active_env_keys: Vec<String> = if was_active {
-            config
-                .find(name)
-                .map(|p| p.env.keys().cloned().collect())
-                .unwrap_or_default()
+        Ok(())
+    })?;
+    // Stop every runtime tree's supervisor before any unwire or removal,
+    // with the flock dropped (a signal or wait never spans it). A tree whose
+    // supervisor cannot be verified or stopped refuses the delete, naming the
+    // tree; the rotation guard held by the caller keeps an acquire from
+    // re-minting a path during the stop. `--force` still stops every verifiable
+    // supervisor and waives the refusal for any supervisor it cannot stop
+    // (unverifiable, or verified but still alive after SIGTERM): the tree is
+    // removed anyway.
+    let dir = profile_dir(name)?;
+    crate::runtime::stop_profile_tree_supervisors(
+        name,
+        &dir,
+        if force {
+            crate::runtime::SupervisorStopGate::Forced
         } else {
-            Vec::new()
-        };
-
+            crate::runtime::SupervisorStopGate::Refused { offers_force }
+        },
+    )?;
+    // Lift what the profile's dead runtime trees alone hold before the removal
+    // below takes them, with the flock dropped (the rescue is tree-sized IO).
+    // Anything left refuses before the unwire: a refused delete keeps the
+    // record, the credentials link, the settings and the profile dir, while
+    // the supervisors stopped above stay stopped and whatever the rescue
+    // landed stays in `~/.claude`. `force` still rescues first, then deletes
+    // what is left.
+    let unrescued = crate::runtime::rescue_profile_trees(&dir);
+    if !force && let Some(tree) = unrescued {
+        if offers_force {
+            bail!(
+                "'{name}' has unrescued session files in {}, pass --force to delete them anyway",
+                tree.display()
+            );
+        }
+        bail!("'{name}' has unrescued session files in {}", tree.display());
+    }
+    let mut config = config();
+    with_state_lock(|held| {
         // Unwire the active account from the live credentials link + settings.json
-        // BEFORE any irreversible local removal. These are fallible external
-        // writes: running them first means a failure leaves both the record and
-        // the dir intact and fully retryable, rather than stranding the api key in
-        // plaintext settings.json with the profile record already gone. A blank
-        // profile clears its endpoint/key/model env so the key can't linger and
-        // the next session doesn't route to a dead endpoint.
+        // BEFORE the irreversible removal, and AFTER the supervisor stop above:
+        // a refused stop leaves `settings.json`, the credentials link and the
+        // active marker exactly as they were. These are fallible external
+        // writes; a failure here still leaves both the record and the dir intact
+        // and fully retryable, rather than stranding the api key in plaintext
+        // settings.json with the profile record already gone. A blank profile
+        // clears its endpoint/key/model env so the key can't linger and the next
+        // session doesn't route to a dead endpoint.
         // Guest mode wired nothing into the live slot or `settings.json`
         // (both upstream's), so there is nothing to unwire.
-        if was_active && !crate::identity::upstream_active() {
+        if config.is_active(name) && !crate::identity::upstream_active() {
+            // An active API profile's base_url + api_key (and model-tier keys)
+            // live in ~/.claude/settings.json, not the credentials link. Capture
+            // its custom env keys before removal so the unwire can strip those too.
+            let active_env_keys: Vec<String> = config
+                .find(name)
+                .map(|p| p.env.keys().cloned().collect())
+                .unwrap_or_default();
             clear_claude_credentials()?;
             let blank = Profile::new(name.to_string(), None, None);
             apply_profile_to_claude_settings(&blank, &active_env_keys)?;
         }
-
         // Dir before state: a failed removal keeps the profile in state so the
         // user can retry; persisting state first would leave an orphan dir.
         let dir = profile_dir(name)?;
@@ -1254,6 +1825,16 @@ pub(crate) fn delete_profile(
         }
         config.remove(name, held);
         save_app_state(&config.state)?;
+        // `remove_dir_all` swept every disk cache; only the memory entries need
+        // noting.
+        note_forget_plan(
+            name,
+            ForgetPlan {
+                oauth: true,
+                third_party: true,
+                ..ForgetPlan::default()
+            },
+        );
         Ok(())
     })?;
     // `remove_dir_all` took the durable stamp with it; the memo would outlive the
@@ -1334,14 +1915,14 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     let store = crate::profile::profile_subpath(&ProfileName::from(name), "auth.json")?;
     if !store.exists() {
         bail!(
-            "'{name}' has no stored codex login, so {} cannot follow it — log it in \
+            "'{name}' has no stored codex login, so {} cannot follow it. Log it in \
              with `tollgate login {name} --codex --browser`",
             slot.display()
         );
     }
     if !adopt_operator_auth_slot(&slot, &store) {
         bail!(
-            "could not repoint {} at '{name}' — the switch was not made",
+            "could not repoint {} at '{name}'. The switch was not made.",
             slot.display()
         );
     }
@@ -1358,6 +1939,23 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// counterpart here. Returns the slot it detached, so the caller can say the
 /// operator's own codex is logged out now.
 ///
+/// The typed live-session refusal [`delete_codex_profile`] raises when the
+/// profile still runs a live session and `force` was not passed. Kept
+/// downcastable so the CLI caller appends its `--force` escape-hatch tail to
+/// THIS refusal alone: a second `has_live_marker` read would re-answer a
+/// question the delete already answered, and tag an unrelated failure (a state
+/// flock timeout) with a flag that cannot fix it.
+#[derive(Debug)]
+pub(crate) struct CodexLiveSession(pub(crate) String);
+
+impl std::fmt::Display for CodexLiveSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' has a live session", self.0)
+    }
+}
+
+impl std::error::Error for CodexLiveSession {}
+
 /// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
 /// `force` does not waive it: a standby rotation racing this removal would
 /// either resurrect an orphan `auth.json` holding the pair it minted, or lose
@@ -1379,8 +1977,12 @@ pub(crate) fn delete_codex_profile(
             bail!("codex profile '{name}' not found");
         }
         let owned = ProfileName::from(name);
-        if !force && crate::runtime::has_live_session(&owned) {
-            bail!("'{name}' has a live session, pass --force to remove it anyway");
+        if !force && crate::runtime::has_live_marker(&owned) {
+            // One sentence source for both harnesses: the CLI caller appends its
+            // `--force` tail, the TUI surfaces this alone (a TUI refusal never
+            // names a CLI flag). Raised as a TYPED error so the CLI matches it,
+            // never re-reads the predicate.
+            return Err(anyhow::Error::new(CodexLiveSession(name.to_string())));
         }
         // Before the dir goes: a slot still linked into it would dangle, and
         // the operator's next `codex login` would revoke through that link
@@ -1403,6 +2005,9 @@ pub(crate) fn delete_codex_profile(
             })?;
         }
         state.remove_profile(name);
+        // The dir removal swept the shared `usage_cache.json` and the auth
+        // store; only the memory entry needs noting.
+        note_forget(&owned, Half::Codex);
         Ok(detached)
     })
 }
@@ -1466,28 +2071,101 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// - a live session on the target profile: re-capture replaces the chain the
 ///   running session holds.
 pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
-    codex_login_capture_at(name, &chrono::Utc::now().to_rfc3339())
+    let outcome = codex_login_capture_at(
+        name,
+        &chrono::Utc::now().to_rfc3339(),
+        CodexLandMode::CreateOrReauth,
+    )?;
+    for line in codex_capture_lines(&outcome) {
+        outln!("{line}");
+    }
+    Ok(())
 }
 
-/// [`codex_login_capture`] with the capture time injected, so the re-stamp is
-/// pinnable.
-pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
+/// The operator-codex capture's outcome, before any surface renders it: what
+/// moved and where. The CLI prints [`codex_capture_lines`]; the TUI reads the
+/// flags and toasts, so the capture itself never writes stdout.
+pub(crate) enum CodexCaptureOutcome {
+    /// The chain was written into the profile store — freshly, or re-captured
+    /// over the operator's own chain. `adopted` is false when the operator's
+    /// slot could not be repointed (no symlink support), so it is now a
+    /// separate copy of a single-use rotating chain.
+    Captured {
+        canonical: String,
+        reauth: bool,
+        adopted: bool,
+        auth_path: std::path::PathBuf,
+    },
+    /// The operator's slot already followed THIS profile: nothing moved.
+    AlreadyFollows {
+        canonical: String,
+        auth_path: std::path::PathBuf,
+    },
+}
+
+/// The CLI's capture report, one entry per line, exactly as the operator sees
+/// it. A pure function so a test pins the lines by equality and the TUI never
+/// prints them.
+pub(crate) fn codex_capture_lines(outcome: &CodexCaptureOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    match outcome {
+        CodexCaptureOutcome::AlreadyFollows {
+            canonical,
+            auth_path,
+        } => lines.push(format!(
+            "tollgate: {} already follows codex profile '{canonical}'. Nothing to capture",
+            auth_path.display()
+        )),
+        CodexCaptureOutcome::Captured {
+            canonical,
+            reauth,
+            adopted,
+            auth_path,
+        } => {
+            if *reauth {
+                lines.push(format!(
+                    "tollgate: re-captured the operator codex login into '{canonical}'"
+                ));
+            } else {
+                lines.push(format!(
+                    "tollgate: captured the operator codex login into codex profile '{canonical}'"
+                ));
+            }
+            if *adopted {
+                lines.push(format!(
+                    "tollgate: {} now follows the profile store. Your own codex and tollgate sessions share one chain",
+                    auth_path.display()
+                ));
+                lines.push(format!(
+                    "tollgate: while it does, `codex login` and `codex logout` reach '{canonical}'s chain through that link and revoke it server-side. Remove the link first if you mean to mint a chain for a different account"
+                ));
+            } else {
+                lines.push(format!(
+                    "tollgate: could not repoint {} (no symlink support?). It is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `tollgate start {canonical}` from here on, or `codex login` again for your own use",
+                    auth_path.display()
+                ));
+            }
+        }
+    }
+    lines
+}
+
+/// [`codex_login_capture`] with the capture time and landing mode injected, so
+/// the re-stamp is pinnable and the create-only refusal is testable. `mode`
+/// decides what a name the codex roster already holds means: the CLI re-auths
+/// it ([`CodexLandMode::CreateOrReauth`]); the TUI's `+ new` create refuses it
+/// ([`CodexLandMode::CreateOnly`]).
+pub(crate) fn codex_login_capture_at(
+    name: &str,
+    now_rfc3339: &str,
+    mode: CodexLandMode,
+) -> Result<CodexCaptureOutcome> {
     // Guest mode: the capture adopts `~/.codex/auth.json` (a global file
     // upstream clauth shares), and a copy without the adopt is a second
     // carrier of one chain. `--browser` mints a fresh chain instead.
     crate::identity::refuse_in_guest_mode()?;
     let trimmed = validate_name_chars(name)?.to_string();
-    let operator = codex_operator_home()?;
-    match codex_operator_store_mode(&operator).as_deref() {
-        None | Some("file") => {}
-        Some(mode) => bail!(
-            "the operator codex does not keep its login in auth.json \
-             (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
-             nothing current to capture there — set it to \"file\", run `codex login`, \
-             then re-run this capture",
-            operator.display()
-        ),
-    }
+    let operator = codex_operator_capture_home()?;
     let auth_path = operator.join("auth.json");
 
     // A link into a store tollgate does not own (upstream clauth's codex
@@ -1498,7 +2176,7 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         && tollgate_auth_store_owner(&target).is_none()
     {
         bail!(
-            "{} links to {}, which tollgate does not own — capturing through it would \
+            "{} links to {}, which tollgate does not own. Capturing through it would \
              copy that store's token chain; nothing was captured",
             auth_path.display(),
             target.display()
@@ -1506,15 +2184,19 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     }
 
     // A slot tollgate already adopted: the chain belongs to exactly one profile.
-    if let Ok(target) = std::fs::read_link(&auth_path)
-        && let Some(holder) = tollgate_auth_store_owner(&target)
-    {
+    if let Some(holder) = operator_auth_slot_holder(&auth_path) {
         if holder.eq_ignore_ascii_case(&trimmed) {
-            outln!(
-                "tollgate: {} already follows codex profile '{holder}' — nothing to capture",
-                auth_path.display()
-            );
-            return Ok(());
+            match mode {
+                CodexLandMode::CreateOnly => {
+                    bail!("codex profile '{holder}' already exists. Create it under a new name")
+                }
+                _ => {
+                    return Ok(CodexCaptureOutcome::AlreadyFollows {
+                        canonical: holder.clone(),
+                        auth_path,
+                    });
+                }
+            }
         }
         // NOT "run `codex login`": that slot is a LINK to '{holder}'s store, and
         // codex's login opens with `clear_existing_auth_before_login` ->
@@ -1523,7 +2205,7 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         // obvious next step would therefore kill the already-captured profile
         // server-side, which no re-login of '{trimmed}' can undo.
         bail!(
-            "{slot} is already captured as codex profile '{holder}' — one chain, one \
+            "{slot} is already captured as codex profile '{holder}': one chain, one \
              profile. That slot is a LINK to '{holder}'s store, and `codex login` \
              revokes whatever it finds there before minting, so running it now would \
              kill '{holder}'s chain for good. Remove the link first (`rm {slot}` \
@@ -1533,30 +2215,7 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         );
     }
 
-    let raw = match std::fs::read(&auth_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "no codex login to capture — {} does not exist; run `codex login` first",
-                auth_path.display()
-            )
-        }
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
-    };
-    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
-        format!(
-            "failed to parse {} — codex writes this file in place, so a login caught \
-             mid-write reads half-written; re-run the capture",
-            auth_path.display()
-        )
-    })?;
-    if parsed.refresh_token().is_none() {
-        bail!(
-            "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
-             `codex login` chain can be captured",
-            auth_path.display()
-        );
-    }
+    let parsed = read_codex_operator_auth(&auth_path)?;
     // A capture is a chain event, so it carries the stamp every chain event
     // carries (codex's `persist_tokens` writes it; the browser login stamps it
     // too). Left at the operator's login time, the captured chain would read
@@ -1578,9 +2237,12 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     let _rotation_guard =
         crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
     let (canonical, reauth, adopted) = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match state.canonical_name(&trimmed) {
-            Some(canonical) => (canonical, true),
-            None => {
+        let (canonical, reauth) = match (state.canonical_name(&trimmed), mode) {
+            (Some(canonical), CodexLandMode::CreateOnly) => {
+                bail!("codex profile '{canonical}' already exists. Create it under a new name");
+            }
+            (Some(canonical), CodexLandMode::CreateOrReauth) => (canonical, true),
+            (None, _) => {
                 // Validated UNDER the same lock the roster write lands under —
                 // the pre-IO window rule. (The claude half reads profiles.toml,
                 // which this lock also serializes.)
@@ -1589,12 +2251,12 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
             }
         };
         if canonical != guess {
-            bail!("'{trimmed}' was renamed while the capture prepared — re-run it");
+            bail!("'{trimmed}' was renamed while the capture prepared. Re-run it");
         }
-        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+        if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
             bail!(
                 "'{canonical}' has a live codex session, which holds the chain this \
-                 capture would replace — close it first"
+                 capture would replace. Close it first"
             );
         }
         if reauth {
@@ -1608,32 +2270,94 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         Ok((canonical, reauth, adopted))
     })?;
 
-    if reauth {
-        outln!("tollgate: re-captured the operator codex login into '{canonical}'");
-    } else {
-        outln!("tollgate: captured the operator codex login into codex profile '{canonical}'");
+    Ok(CodexCaptureOutcome::Captured {
+        canonical,
+        reauth,
+        adopted,
+        auth_path,
+    })
+}
+
+/// The capture's first read: the operator home, refused unless its store mode
+/// is the file default (`auth.json`). The read-only half of
+/// [`codex_login_capture_at`]'s refusals, shared with the capturable predicate
+/// so the row's visibility and the capture run on one check.
+fn codex_operator_capture_home() -> Result<std::path::PathBuf> {
+    let operator = codex_operator_home()?;
+    match codex_operator_store_mode(&operator).as_deref() {
+        None | Some("file") => {}
+        Some(mode) => bail!(
+            "the operator codex does not keep its login in auth.json \
+             (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
+             nothing current to capture there. Set it to \"file\", run `codex login`, \
+             then re-run this capture",
+            operator.display()
+        ),
     }
-    if adopted {
-        outln!(
-            "tollgate: {} now follows the profile store — your own codex and tollgate \
-             sessions share one chain",
+    Ok(operator)
+}
+
+/// The tollgate profile whose store the operator's `auth.json` slot already
+/// links into, or `None` for any other shape (a plain file, a foreign link).
+fn operator_auth_slot_holder(auth_path: &std::path::Path) -> Option<String> {
+    std::fs::read_link(auth_path)
+        .ok()
+        .and_then(|target| tollgate_auth_store_owner(&target))
+}
+
+/// Read and parse the operator's `auth.json` into a chain-bearing auth, or the
+/// capture's refusal for an absent, unreadable, unparseable or chainless file.
+fn read_codex_operator_auth(auth_path: &std::path::Path) -> Result<crate::codex_auth::CodexAuth> {
+    let raw = match std::fs::read(auth_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no codex login to capture: {} does not exist. Run `codex login` first",
+                auth_path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
+    };
+    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
+        format!(
+            "failed to parse {}: codex writes this file in place, so a login caught \
+             mid-write reads half-written. Re-run the capture",
+            auth_path.display()
+        )
+    })?;
+    if parsed.refresh_token().is_none() {
+        bail!(
+            "{} holds no ChatGPT token chain (an API-key-only setup?). Only a \
+             `codex login` chain can be captured",
             auth_path.display()
         );
-        outln!(
-            "tollgate: while it does, `codex login` and `codex logout` reach '{canonical}'s \
-             chain through that link and revoke it server-side — remove the link first \
-             if you mean to mint a chain for a different account"
-        );
-    } else {
-        outln!(
-            "tollgate: could not repoint {} (no symlink support?) — it is now a SEPARATE \
-             copy of a single-use rotating chain, and the first refresh on either side \
-             strands the other. Run codex only through `tollgate start {canonical}` from \
-             here on, or `codex login` again for your own use",
-            auth_path.display()
-        );
     }
-    Ok(())
+    Ok(parsed)
+}
+
+/// Whether the operator's own codex login is capturable right now: the
+/// operator home resolves, its store mode is the file default, `auth.json`
+/// exists and parses with a refresh token, and the slot is not already a link
+/// into a tollgate profile store. The read-only half of
+/// [`codex_login_capture_at`]'s refusals, sharing its reads — the row's
+/// visibility and the capture run on one predicate, so the row can never show
+/// where the capture would refuse.
+pub(crate) fn codex_operator_login_capturable() -> bool {
+    // Guest mode refuses the capture ([`codex_login_capture_at`]), so the row
+    // never offers it.
+    if crate::identity::upstream_active() {
+        return false;
+    }
+    let Ok(operator) = codex_operator_capture_home() else {
+        return false;
+    };
+    let auth_path = operator.join("auth.json");
+    // A slot already adopted (a link into a tollgate profile store) is captured,
+    // never capturable.
+    if operator_auth_slot_holder(&auth_path).is_some() {
+        return false;
+    }
+    read_codex_operator_auth(&auth_path).is_ok()
 }
 
 /// Refuse a re-auth that would silently swap the ChatGPT account under a
@@ -1657,7 +2381,7 @@ fn refuse_codex_account_swap(canonical: &str, incoming: Option<&str>) -> Result<
     {
         bail!(
             "'{canonical}' stores ChatGPT account {old}, but this login is account \
-             {new} — log into a new profile, or delete '{canonical}' first"
+             {new}. Log into a new profile, or delete '{canonical}' first"
         );
     }
     Ok(())
@@ -1674,7 +2398,23 @@ fn write_codex_profile_store(
     name: &str,
     raw: &[u8],
 ) -> Result<std::path::PathBuf> {
-    let dir = profile_dir(&ProfileName::from(name))?;
+    let profile_name = ProfileName::from(name);
+    // `refuse_codex_account_swap` blocks a different account on re-auth, so only
+    // a fresh capture moves the codex identity. `before` reads the stored
+    // `auth.json` guard-free, so an unreadable one reads `None` and a
+    // same-account re-capture over it drops the shared cache once; the next poll
+    // refills it.
+    let before = read_codex_identity(&profile_name);
+    let after = crate::codex_auth::CodexAuth::parse(raw)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
+    // Forget-first: the shared cache drops before the `auth.json` write below, so
+    // a failed write leaves the old account's identity on disk with its reading
+    // gone until the next poll — codex has no durable verdict to lose.
+    if before != after {
+        forget_disk(&profile_name, Half::Codex);
+    }
+    let dir = profile_dir(&profile_name)?;
     crate::profile::mkdir_700(&dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
     let store = dir.join("auth.json");
@@ -1685,7 +2425,12 @@ fn write_codex_profile_store(
         crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
-    state.add_profile(name);
+    state.add_profile(name)?;
+    // The account change already dropped the shared cache above, so the re-seed
+    // finds nothing.
+    if before != after {
+        note_forget(&profile_name, Half::Codex);
+    }
     // Seed the last-known-good belt from this fresh, well-formed chain and
     // retire any stale no-replay memo and quarantine verdict: a capture/login
     // is an out-of-band store write, and without this the belt could later
@@ -1700,17 +2445,74 @@ fn write_codex_profile_store(
 
 /// The browser login's pre-browser gate: charset, then refuse ONLY a
 /// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
-/// full check under the lock allows it). Returns the trimmed name. Extracted
-/// so the "own-roster passes, cross-harness refuses" rule is testable without
-/// opening a real browser.
-fn codex_browser_preflight(name: &str) -> Result<String> {
+/// full check under the lock allows it). Returns the name the landing writes
+/// under and, for a profile the codex roster holds, the [`ProfileId`] it
+/// re-auths. Extracted so the "own-roster passes, cross-harness refuses" rule
+/// is testable without opening a real browser; the TUI's `re-login` shares it.
+pub(crate) fn codex_browser_preflight(name: &str) -> Result<(String, Option<ProfileId>)> {
     // Guest mode: the minted chain is an OAuth leg plan §4.0 leaves to
     // upstream clauth, and the standby leg would have to rotate it. Ahead of
     // the browser, so a refusal opens nothing.
     crate::identity::refuse_in_guest_mode()?;
     let trimmed = validate_name_chars(name)?.to_string();
     validate_foreign_harness_free(&trimmed, Harness::Codex)?;
-    Ok(trimmed)
+    crate::codex_profiles::CodexState::update(|state| match state.canonical_name(&trimmed) {
+        Some(canonical) => {
+            let id = state.claim_id(&canonical)?;
+            Ok((canonical, id))
+        }
+        None => Ok((trimmed, None)),
+    })
+}
+
+/// Whether the operator capture may re-auth a name the codex roster already
+/// holds: the CLI's `tollgate login --codex` creates-or-re-auths; the TUI's
+/// `+ new` create only ever creates, so a name either roster holds refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLandMode {
+    /// The CLI: create when the name is free, re-auth when it exists.
+    CreateOrReauth,
+    /// The TUI `+ new` create: the name must not exist in either roster.
+    CreateOnly,
+}
+
+/// The shared landing every browser login calls after the flow minted a chain:
+/// guard the rotation, refuse a live session or account swap, write the store.
+/// `account` is what [`codex_browser_preflight`] found under `name`: `Some`
+/// re-auths that profile only while `name` still holds it, so one deleted,
+/// recreated or renamed during the browser trip receives nothing; `None`
+/// creates `name`, refusing it once either roster holds it.
+pub(crate) fn land_codex_login(
+    name: &str,
+    outcome: &crate::codex_login::CodexLoginOutcome,
+    account: Option<&ProfileId>,
+) -> Result<String> {
+    let _rotation_guard = crate::runtime::RotationGuard::acquire(&ProfileName::from(name))?;
+    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
+    crate::codex_profiles::CodexState::update(|state| {
+        match account {
+            Some(id) if state.id(name) != Some(id) => {
+                bail!("codex profile '{name}' no longer exists");
+            }
+            Some(_) => {}
+            None => {
+                if let Some(canonical) = state.canonical_name(name) {
+                    bail!("codex profile '{canonical}' already exists. Create it under a new name");
+                }
+                validate_profile_name(name, Harness::Codex, None)?;
+            }
+        }
+        if crate::runtime::has_live_marker(&ProfileName::from(name)) {
+            bail!("'{name}' has a live codex session. Close it before re-authenticating");
+        }
+        if account.is_some() {
+            refuse_codex_account_swap(name, account_id.as_deref())?;
+        }
+        write_codex_profile_store(state, name, &outcome.auth_json)?;
+        Ok(name.to_string())
+    })
 }
 
 /// `tollgate login <name> --codex --browser` — mint a FRESH codex chain via
@@ -1718,48 +2520,32 @@ fn codex_browser_preflight(name: &str) -> Result<String> {
 /// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
 /// existing chain — it is a brand-new login tollgate alone holds.
 pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
-    let trimmed = codex_browser_preflight(name)?;
-
-    let outcome = crate::codex_login::login_with(|url| {
-        outln!("tollgate: opening {url}");
-        outln!("tollgate: if the browser did not open, paste that URL into it");
-    })?;
-
-    let guess = crate::codex_profiles::CodexState::load()?
-        .canonical_name(&trimmed)
-        .unwrap_or_else(|| trimmed.clone());
-    let _rotation_guard =
-        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
-    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
-        .ok()
-        .and_then(|a| a.account_id().map(str::to_string));
-    let canonical = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match state.canonical_name(&trimmed) {
-            Some(canonical) => (canonical, true),
-            None => {
-                validate_profile_name(&trimmed, Harness::Codex, None)?;
-                (trimmed.clone(), false)
-            }
-        };
-        if canonical != guess {
-            bail!("'{trimmed}' was renamed while the login ran — re-run it");
-        }
-        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
-            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
-        }
-        if reauth {
-            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
-        }
-        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
-        Ok(canonical)
+    let (canonical, outcome) = codex_browser_login_with(name, || {
+        crate::codex_login::login_with(|url| {
+            outln!("tollgate: opening {url}");
+            outln!("tollgate: if the browser did not open, paste that URL into it");
+        })
     })?;
 
     outln!("tollgate: logged a fresh codex chain into codex profile '{canonical}'");
     if let Some(acc) = outcome.account_id {
         outln!("tollgate: ChatGPT account {acc}");
     }
-    outln!("tollgate: run it with `tollgate start {canonical}` — your own ~/.codex is untouched");
+    outln!("tollgate: run it with `tollgate start {canonical}`. Your own ~/.codex is untouched");
     Ok(())
+}
+
+/// [`codex_login_browser`]'s round trip and landing, with the browser flow
+/// injected: what the preflight found under `name` before `trip` is what the
+/// landing re-auths, or creates when it found nothing.
+pub(crate) fn codex_browser_login_with(
+    name: &str,
+    trip: impl FnOnce() -> Result<crate::codex_login::CodexLoginOutcome>,
+) -> Result<(String, crate::codex_login::CodexLoginOutcome)> {
+    let (canonical, account) = codex_browser_preflight(name)?;
+    let outcome = trip()?;
+    let canonical = land_codex_login(&canonical, &outcome, account.as_ref())?;
+    Ok((canonical, outcome))
 }
 
 /// The home the OPERATOR's codex reads: an explicit non-empty `CODEX_HOME`,
@@ -1772,7 +2558,7 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(dir);
         if crate::runtime::is_codex_home_path(&dir) {
             bail!(
-                "CODEX_HOME points into a tollgate codex session home — run the capture \
+                "CODEX_HOME points into a tollgate codex session home. Run the capture \
                  from a shell outside `tollgate start`, where ~/.codex (or your own \
                  CODEX_HOME) holds the operator's login"
             );
@@ -1783,7 +2569,7 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
 }
 
 /// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
-fn default_codex_operator_home() -> Result<std::path::PathBuf> {
+pub(crate) fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
 }
 
@@ -1925,26 +2711,14 @@ pub(crate) fn create_blank_profile_with(
     env: &BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        validate_profile_name(&name, Harness::Claude, None)?;
         let mut profile = Profile::new(name, base_url, api_key);
         // Part of the same single save as the profile itself — a chained
         // edit-after-create would leave a saved-but-model-less profile behind
         // when the second write fails, reported as a flat "create failed".
-        let clean = |m: Option<String>| {
-            m.as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        };
-        profile.models = ModelSettings {
-            default: clean(models.default),
-            opus: clean(models.opus),
-            sonnet: clean(models.sonnet),
-            haiku: clean(models.haiku),
-            fable: clean(models.fable),
-            subagent: clean(models.subagent),
-        };
+        profile.models = trimmed_models(models);
         profile.env = crate::presets::allowlisted_env(env.clone());
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
         config.add(profile);
         save_app_state(&config.state)
     })
@@ -1971,10 +2745,14 @@ pub(crate) fn duplicate_profile(
     source: &ProfileName,
     name: String,
 ) -> Result<()> {
+    let new_name = ProfileName::from(name.clone());
     with_state_lock(|_held| {
+        let before = read_before_identities(&new_name);
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
         profile.auto_start = src.auto_start;
+        profile.usage_probe = src.usage_probe;
+        profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
         profile.fallback_threshold = src.fallback_threshold;
@@ -1982,9 +2760,26 @@ pub(crate) fn duplicate_profile(
         profile.max_auto_spend = src.max_auto_spend;
         profile.check_weekly = src.check_weekly;
         profile.check_scoped = src.check_scoped;
+        profile.check_credit_cap = src.check_credit_cap;
         profile.bell_threshold = src.bell_threshold;
         profile.disabled = src.disabled;
-        save_profile(&profile)?;
+        // A fresh name holds no login; a reused name (delete-then-recreate)
+        // drops its old reading instead of inheriting it.
+        let after_oauth = OAuthIdentity::for_values(None, None);
+        let plan = endpoint_identity_plan(
+            &before,
+            &after_oauth,
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: None,
+                env: profile.env.clone(),
+            },
+            false,
+        );
+        forget_disk_plan(&new_name, plan);
+        save_new_profile(&profile)?;
+        note_forget_plan(&new_name, plan);
         config.add(profile);
         save_app_state(&config.state)
     })
@@ -1993,21 +2788,37 @@ pub(crate) fn duplicate_profile(
 /// Set a profile's default `model` (the Setup tab's base model row / the
 /// `tollgate login --model` flag), preserving any alias overrides already on it.
 /// An empty (post-trim) value clears the default, matching the Setup tab's ⏎
-/// commit on the model row. Persists via [`edit_profile_model`], so a caller
-/// that runs this before starting a session (`tollgate login`) has the model
-/// routed into that session's runtime settings from the first launch.
+/// commit on the model row. A caller that runs this before starting a session
+/// (`tollgate login`) has the model routed into that session's runtime settings
+/// from the first launch.
+///
+/// Lands only while `name` holds `account`, the [`ProfileId`] the login
+/// claimed, on the profile re-read under the lock (the
+/// [`edit_profile_preferred_days`] shape): its endpoint, key and env go back
+/// to disk as disk has them, never as an earlier read had them.
 pub(crate) fn set_profile_default_model(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     raw_model: &str,
 ) -> Result<()> {
-    let mut models = config
-        .find(name)
-        .map(|p| p.models.clone())
-        .unwrap_or_default();
-    let trimmed = raw_model.trim();
-    models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
-    edit_profile_model(config, name, models)
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        let mut fresh = load_profile(name)?;
+        let trimmed = raw_model.trim();
+        fresh.models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        save_profile_config(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.models = fresh.models.clone();
+        }
+        if config.is_active(name) {
+            // Model-only, as in `edit_profile_model`: the profile's own env
+            // keys as `prev` strip nothing.
+            let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+        }
+        Ok(())
+    })
 }
 
 /// Which profile the CURRENT live login (`~/.claude/.credentials.json`)
@@ -2134,15 +2945,51 @@ pub(crate) struct CaptureSnapshot {
     /// whichever function COMMITS it acts — including the paths that park the
     /// snapshot in a confirm modal first.
     pub(crate) anchor: AnchorAction,
+    /// The login probe body's plan, when the snapshot came from an interactive
+    /// OAuth login whose probe ran. Rides the snapshot so a confirm-gated
+    /// re-login still seeds it at commit time. `None` for every non-login
+    /// capture (a live read, an api re-key) and a failed probe.
+    pub(crate) plan: Option<PlanInfo>,
 }
 
+/// The login Claude Code uses now, as a snapshot. On macOS CC reads the
+/// Keychain first, so a login there that no store saved is the one to
+/// capture; otherwise the credentials file's. A `security` read on macOS, so
+/// a TUI caller runs it on a worker. Only a capture of "the login in use"
+/// reads it: a divergence resolves the diverged file
+/// ([`capture_live_file_snapshot`]).
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
-    // Guest mode: whatever the live slot holds is upstream clauth's.
+    refuse_foreign_live_login()?;
+    #[cfg(target_os = "macos")]
+    if crate::keychain::enabled()
+        && let Some(login) = crate::claude::read_bare_keychain_item()
+            .as_ref()
+            .and_then(crate::claude::unsaved_bare_item_login)
+    {
+        return snapshot_of_login(Some(login));
+    }
+    capture_live_file_snapshot()
+}
+
+/// The live credentials file's login, never the Keychain item's, as a
+/// snapshot: what a divergence prompt resolves, since the divergence it
+/// names is that file's.
+pub(crate) fn capture_live_file_snapshot() -> Result<CaptureSnapshot> {
+    refuse_foreign_live_login()?;
+    snapshot_of_login(read_claude_credentials()?)
+}
+
+/// The refusals every read of the login in use runs first. Guest mode: whatever
+/// the live slot holds is upstream clauth's. A live slot linked into another
+/// tool's store (upstream clauth's) holds that tool's refresh chain: a capture
+/// copies it into a second carrier.
+fn refuse_foreign_live_login() -> Result<()> {
     crate::identity::refuse_in_guest_mode()?;
-    // A live slot linked into another tool's store (upstream clauth's) holds
-    // that tool's refresh chain: a capture copies it into a second carrier.
-    crate::claude::refuse_foreign_slot_link(&crate::claude::claude_credentials_path()?)?;
-    let credentials = read_claude_credentials()?;
+    crate::claude::refuse_foreign_slot_link(&crate::claude::claude_credentials_path()?)
+}
+
+/// `credentials` beside the live endpoint keys, as a capture snapshot.
+fn snapshot_of_login(credentials: Option<ClaudeCredentials>) -> Result<CaptureSnapshot> {
     let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
     Ok(CaptureSnapshot {
         credentials,
@@ -2150,7 +2997,27 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
         api_key,
         // Read off disk, not from a login — this snapshot proves no identity.
         anchor: AnchorAction::Unproven,
+        plan: None,
     })
+}
+
+/// The snapshot the one OAuth login carrier builds: the minted credentials plus
+/// the probe's account uuid (as the anchor) and its plan (as the seed). Shared
+/// by the CLI's `run_oauth` and the TUI's `apply_login` so neither can drop the
+/// plan.
+pub(crate) fn capture_snapshot_from_outcome(
+    outcome: crate::oauth_login::LoginOutcome,
+) -> CaptureSnapshot {
+    CaptureSnapshot {
+        credentials: Some(outcome.credentials),
+        base_url: None,
+        api_key: None,
+        anchor: outcome
+            .identity
+            .map(AnchorAction::Proven)
+            .unwrap_or(AnchorAction::Unproven),
+        plan: outcome.plan,
+    }
 }
 
 /// An all-empty snapshot (no OAuth login, no endpoint, no key) holds nothing a
@@ -2173,13 +3040,7 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     // Guest mode: the live login is upstream clauth's refresh chain, and a
     // capture would make a second carrier of it. Only an import may take it.
     crate::identity::refuse_in_guest_mode()?;
-    let name = name.trim();
-    if let Some(existing) = config.canonical_name(name) {
-        bail!(
-            "a profile named '{existing}' already exists; re-authenticate it with:  tollgate login {existing}"
-        );
-    }
-    validate_profile_name(name, Harness::Claude, None)?;
+    let name = validate_capture_name(config, name)?;
     let snapshot = capture_snapshot()?;
     if snapshot_is_empty(&snapshot) {
         bail!("no live login found to capture");
@@ -2192,29 +3053,10 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
         );
     }
     let becomes_active = config.state.active_profile.is_none();
-    capture_into_profile(config, name.to_string(), None, snapshot)?;
+    capture_into_profile(config, name.to_string(), ModelSettings::default(), snapshot)?;
     Ok(becomes_active)
 }
 
-/// `model` rides along the same way [`create_profile_from_login`]'s does: the
-/// Setup `+ new` form's typed default model. Every capture-from-a-name-prompt
-/// caller passes `None`.
-pub(crate) trait IntoProfileModels {
-    fn into_models(self) -> ModelSettings;
-}
-impl IntoProfileModels for Option<String> {
-    fn into_models(self) -> ModelSettings {
-        ModelSettings {
-            default: self,
-            ..Default::default()
-        }
-    }
-}
-impl IntoProfileModels for ModelSettings {
-    fn into_models(self) -> ModelSettings {
-        self
-    }
-}
 fn trimmed_models(models: ModelSettings) -> ModelSettings {
     let trim = |m: Option<String>| m.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     ModelSettings {
@@ -2227,10 +3069,95 @@ fn trimmed_models(models: ModelSettings) -> ModelSettings {
     }
 }
 
+/// The name a capture saves into, trimmed: refused when a profile already
+/// holds it or it is no valid profile name.
+fn validate_capture_name<'a>(config: &AppConfig, name: &'a str) -> Result<&'a str> {
+    let name = name.trim();
+    if let Some(existing) = config.canonical_name(name) {
+        bail!(
+            "a profile named '{existing}' already exists; re-authenticate it with:  tollgate login {existing}"
+        );
+    }
+    validate_profile_name(name, Harness::Claude, None)?;
+    Ok(name)
+}
+
+/// Undo a seed when the install's hold does not return `Ok`: the seed lands
+/// before the hold's fallible steps and bypasses `write_profile_cache`'s
+/// off-roster gate (a new account's directory may not be registered yet), so an
+/// error after it would strand a plan for a profile the roster never registered.
+/// `arm` runs on every seed attempt under the OAuth gate — a refused pairing or
+/// a failed write included — and `release` disarms it once every step inside
+/// the hold succeeded, so an unreleased drop (any error return) removes the
+/// seeded file, best-effort.
+struct SeedCleanupGuard {
+    name: Option<ProfileName>,
+}
+
+impl SeedCleanupGuard {
+    fn new() -> Self {
+        Self { name: None }
+    }
+
+    fn arm(&mut self, name: &ProfileName) {
+        self.name = Some(name.clone());
+    }
+
+    fn release(&mut self) {
+        self.name = None;
+    }
+}
+
+impl Drop for SeedCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(name) = &self.name {
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+            );
+        }
+    }
+}
+
+/// A test's stand-in for observing the seed's on-disk order inside an install's
+/// hold: called right after the seed block and before the first identity write
+/// at each install site, so a test can assert the seeded `usage_cache.json` is
+/// already on disk while the new credentials and `config.toml` are not yet
+/// written. Registered per profile name, run once, like the anchor compare hook.
+#[cfg(test)]
+pub(crate) type SeedOrderHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static SEED_ORDER_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, SeedOrderHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_seed_order_hook(profile: &str, f: SeedOrderHook) {
+    if let Ok(mut hooks) = SEED_ORDER_HOOK.lock() {
+        hooks
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(profile.to_string(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_seed_order_hook(profile: &str) {
+    let hook = SEED_ORDER_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(profile)));
+    if let Some(f) = hook {
+        f(profile);
+    }
+}
+
+/// `models` rides along the same way [`create_profile_from_login`]'s does: the
+/// Setup `+ new` form's model block. Every capture-from-a-name-prompt caller
+/// passes an empty one.
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
-    models: impl IntoProfileModels,
+    models: ModelSettings,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -2238,11 +3165,61 @@ pub(crate) fn capture_into_profile(
         base_url,
         api_key,
         anchor,
+        plan: seed_plan,
     } = snapshot;
     let name = ProfileName::from(name);
     let seed_name = name.clone();
-    let models = trimmed_models(models.into_models());
+    let models = trimmed_models(models);
     with_state_lock(|held| {
+        // Under the hold the roster write lands under: a name taken while a
+        // login ran is another account, never this create's.
+        validate_profile_name(&name, Harness::Claude, None)?;
+        let before = read_before_identities(&name);
+        // The name may hold a stale anchor, cache or reading (a crash before
+        // the record landed, a delete-then-recreate): every half whose identity
+        // moves forgets.
+        let after_anchor = match &anchor {
+            AnchorAction::Proven(identity) => Some(&identity.account_uuid),
+            _ => None,
+        };
+        let after_token = credentials.as_ref().and_then(|c| c.access_token());
+        let after_oauth = OAuthIdentity::for_values(after_anchor, after_token);
+        let provider = base_url.as_deref().and_then(Provider::from_base_url);
+        let after_third_party =
+            third_party_identity(provider, api_key.as_deref(), None, base_url.as_deref());
+        let after_throughput =
+            throughput_identity(&after_oauth, base_url.as_deref(), api_key.as_deref(), None);
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(&name, plan);
+        // The seed lands after the forget and before the identity writes: a
+        // reloading process re-seeds from disk and finds it, and this process's
+        // `forget_memory` re-seed picks it up once the hold drops. Only when the
+        // forget plan dropped the OAuth half — a proven same-account re-login
+        // forgets nothing, so it must keep the account's live windows instead of
+        // replacing them with a plan-only body.
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(
+                &name,
+                seed,
+                match &anchor {
+                    AnchorAction::Proven(identity) => Some(&identity.account_uuid),
+                    _ => None,
+                },
+            );
+            seed_guard.arm(&name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
+
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.models = models;
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
@@ -2251,7 +3228,8 @@ pub(crate) fn capture_into_profile(
         crate::profile_cache::begin_login_install(&name)?;
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
+        note_forget_plan(&name, plan);
         config.add(profile);
         // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
         // for this name (e.g. a delete-then-relogin of a revoked account).
@@ -2276,15 +3254,22 @@ pub(crate) fn capture_into_profile(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)?;
-        crate::usage::seed_login_identity(
-            &seed_name,
-            match &anchor {
-                AnchorAction::Proven(identity) => Some(identity),
-                _ => None,
-            },
-        );
-        Ok(())
+        let saved = save_app_state(&config.state);
+        // The login and its identity commit together inside the hold, after the
+        // state write registered the profile (the anchor write requires it), so
+        // a re-login in another process never reads a displaced anchor over the
+        // new login. A failed state write registered nothing to anchor.
+        if saved.is_ok() {
+            crate::usage::seed_login_identity(
+                &seed_name,
+                match &anchor {
+                    AnchorAction::Proven(identity) => Some(identity),
+                    _ => None,
+                },
+            );
+            seed_guard.release();
+        }
+        saved
     })?;
     // The login and identity were committed together inside the hold; only
     // the user-facing warning remains outside it.
@@ -2302,14 +3287,40 @@ pub(crate) fn capture_into_profile(
 pub(crate) fn create_profile_from_login(
     config: &mut AppConfig,
     name: String,
-    models: impl IntoProfileModels,
+    models: ModelSettings,
     credentials: ClaudeCredentials,
     identity: Option<crate::profile_cache::AccountIdentity>,
+    seed_plan: Option<PlanInfo>,
 ) -> Result<()> {
     let name = ProfileName::from(name);
     let seed_name = name.clone();
-    let models = trimmed_models(models.into_models());
+    let models = trimmed_models(models);
+    let account_uuid = identity.as_ref().map(|i| i.account_uuid.clone());
     with_state_lock(|held| {
+        let before = read_before_identities(&name);
+        let after_token = credentials.access_token();
+        let after_oauth = OAuthIdentity::for_values(account_uuid.as_ref(), after_token);
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
+            third_party: before.third_party.is_some(),
+            throughput: before.throughput != throughput_identity(&after_oauth, None, None, None),
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(&name, plan);
+        // After the forget and before the identity writes, like every install;
+        // only when the forget plan dropped the OAuth half (a same-account
+        // re-login forgets nothing and keeps its live windows).
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(&name, seed, account_uuid.as_ref());
+            seed_guard.arm(&name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
+
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models = models;
         // Same orphan-dir guard as `capture_into_profile`: mark the install
@@ -2317,7 +3328,8 @@ pub(crate) fn create_profile_from_login(
         crate::profile_cache::begin_login_install(&name)?;
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
-        save_profile(&profile)?;
+        save_new_profile(&profile)?;
+        note_forget_plan(&name, plan);
         config.add(profile);
 
         // Guest mode never auto-activates: activating links the live slot and
@@ -2337,9 +3349,14 @@ pub(crate) fn create_profile_from_login(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)?;
-        crate::usage::seed_login_identity(&seed_name, identity.as_ref());
-        Ok(())
+        let saved = save_app_state(&config.state);
+        // The draft parked the login's identity until `create account` fixed
+        // the name; it commits with the login, inside the hold.
+        if saved.is_ok() {
+            crate::usage::seed_login_identity(&seed_name, identity.as_ref());
+            seed_guard.release();
+        }
+        saved
     })?;
     // The draft parked the login's uuid until `create account` fixed the name;
     // this is that name, so the anchor lands here rather than at the call site.
@@ -2402,40 +3419,76 @@ fn rollback_first_account_create(
 /// and `fallback_chain`, which both index by name already, so the target
 /// simply keeps its chain position, env, model settings, and `auto_start`.
 /// `usage_history.jsonl` is a persisted log, not a cache, and is left alone;
-/// the per-profile fetch caches (`usage_cache.json`, `third_party_cache.json`,
-/// `throughput_cache.json`) are dropped unconditionally, because a swapped
-/// credential set can be a different account entirely and stale numbers under
-/// it are the worse failure. On the preserve path (endpoint + key kept) the
-/// third-party half describes the CURRENT account and is dropped anyway: the
-/// provider bar refills on the next scheduler tick, while the throughput
-/// history only rebuilds from later delegate runs — a real cost, taken over a
-/// wrong-account read on the paths where the credential DID change. The
-/// `/profile` TTL clock describes the old account too and is expired for the
-/// same reason — otherwise the swapped-in account's tier stays unfetched (and,
-/// with `usage_cache.json` just dropped, unrendered) for up to an hour. A
-/// snapshot carrying a proven identity (an interactive login's probe) re-anchors
-/// the profile here, on the commit — the confirm-gated relogin parks the snapshot
-/// in a modal, so the anchor can only be seeded by whoever finally commits it.
+/// each half's fetch caches are dropped only when that half's stored identity
+/// actually changed (a proven same-account re-login forgets nothing), never
+/// unconditionally. The `/profile` TTL clock describes the old account too, so
+/// it is expired only when the OAuth half changed — a proven same-account
+/// re-login keeps the stamp and its memo — otherwise the swapped-in account's
+/// tier stays unfetched (and, with `usage_cache.json` just dropped, unrendered)
+/// for up to an hour. A snapshot carrying a proven identity (an interactive
+/// login's probe) re-anchors the profile here, on the commit — the confirm-gated
+/// relogin parks the snapshot in a modal, so the anchor can only be seeded by
+/// whoever finally commits it. `account` is the [`ProfileId`] claimed when the
+/// login, capture or adopt started; the write lands only while `name` still
+/// holds it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &ProfileName,
+    account: &ProfileId,
     snapshot: CaptureSnapshot,
+) -> Result<()> {
+    overwrite_captured_profile_with(config, name, account, snapshot, false)
+}
+
+/// [`overwrite_captured_profile`], first disowning the active account when
+/// `deactivate` (the divergence capture): the live link detached and the
+/// marker cleared, inside the same hold and after the id check, so a refused
+/// overwrite leaves both as they were.
+pub(crate) fn overwrite_captured_profile_with(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    account: &ProfileId,
+    snapshot: CaptureSnapshot,
+    deactivate: bool,
 ) -> Result<()> {
     let CaptureSnapshot {
         credentials,
         base_url,
         api_key,
         anchor,
+        plan: seed_plan,
     } = snapshot;
-    // An api re-key carries the stored OAuth chain unchanged, so it is not a
+    // An api re-key keeps the stored OAuth chain unchanged, so it is not a
     // login install: the anchor stays exactly as found. Every other overwrite
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
+    let mut oauth_moved = false;
     with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        if deactivate {
+            // Best effort, as the divergence capture always was: the overwrite
+            // below decides the outcome.
+            let _ = crate::claude::detach_credentials_link();
+            config.state.set_active(None, held);
+            let _ = save_app_state(&config.state);
+        }
+        let before = read_before_identities(name);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
-            .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
+            .with_context(|| format!("profile '{name}' not found"))?;
+        // An api re-key keeps the pair the store holds now, read under this
+        // hold: one read before the login's waits could be another account's
+        // (a rename-in) or one a rotation has spent since.
+        let credentials = if installs_login {
+            credentials
+        } else {
+            let stored = crate::profile::read_profile(name)?;
+            if let Some(refusal) = crate::profile::unreadable_store_refusal(&stored) {
+                bail!("{refusal}");
+            }
+            stored.credentials.as_ref().cloned()
+        };
         // An OAuth reauth's snapshot carries the minted tokens and nothing
         // else (`run_oauth`), so a uniform replace strips the profile's
         // endpoint and key — the login was about the chain, and its side effect
@@ -2468,19 +3521,66 @@ pub(crate) fn overwrite_captured_profile(
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         profile.base_url = base_url;
         profile.api_key = api_key;
-        if installs_login {
-            crate::profile_cache::begin_login_install(name)?;
-        }
-        profile.set_credentials(credentials, held);
         profile.provider = provider;
         // Same rule as `edit_profile_endpoint`: a reauth replaces the credential
         // set, and the console session is one of them.
         if provider != Some(Provider::Alibaba) {
             profile.console = None;
         }
-        profile.usage = None;
-        profile.fetch_status = None;
-        profile.third_party_usage = None;
+        // The changed halves, from the values about to be written. The OAuth
+        // identity follows the anchor action: a proven re-login re-anchors the
+        // SAME uuid (so a same-account re-login forgets nothing), an unproven
+        // install removes the anchor while a login stays, and an api re-key
+        // carries the anchor unchanged.
+        let after_anchor = match &anchor {
+            AnchorAction::Proven(identity) => Some(&identity.account_uuid),
+            AnchorAction::Unproven => None,
+            AnchorAction::Unchanged => before.oauth.anchor.as_ref(),
+        };
+        let after_token = credentials.as_ref().and_then(|c| c.access_token());
+        let after_oauth = OAuthIdentity::for_values(after_anchor, after_token);
+        let plan = endpoint_identity_plan(
+            &before,
+            &after_oauth,
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
+            credentials.is_some(),
+        );
+        oauth_moved = plan.oauth;
+        forget_disk_plan(name, plan);
+        // After the forget and before the identity writes, like every install;
+        // only when the forget plan dropped the OAuth half (a same-account
+        // re-login forgets nothing and keeps its live windows).
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(
+                name,
+                seed,
+                match &anchor {
+                    AnchorAction::Proven(identity) => Some(&identity.account_uuid),
+                    _ => None,
+                },
+            );
+            seed_guard.arm(name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
+        // Every login install marks the identity pending BEFORE the store
+        // write, inside the same hold that commits the credentials: the
+        // displaced anchor cannot authorize a walk, and a later failure in this
+        // hold (the relink, the settings write) leaves the profile pending,
+        // never vouched for by the account the overwrite just displaced. The
+        // identity commits right after the store write, still in this hold.
+        if installs_login {
+            crate::profile_cache::begin_login_install(name)?;
+        }
+        profile.set_credentials(credentials, held);
         crate::oauth::retire_unreadable_spent_record(&profile.name);
         save_profile(profile)?;
         match &anchor {
@@ -2490,17 +3590,7 @@ pub(crate) fn overwrite_captured_profile(
             AnchorAction::Unproven => crate::usage::seed_login_identity(name, None),
             AnchorAction::Unchanged => {}
         }
-
-        for file in [
-            crate::profile_cache::USAGE_CACHE_FILE,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            // Inert once the credential changes, but this profile may now be a
-            // different account entirely — drop it with the rest.
-            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            crate::throughput::THROUGHPUT_CACHE_FILE,
-        ] {
-            crate::profile_cache::remove_profile_cache(name, file);
-        }
+        note_forget_plan(name, plan);
 
         // A disabled profile's creds are still captured above (the operator
         // asked for that), but it must never become the active account this
@@ -2568,15 +3658,20 @@ pub(crate) fn overwrite_captured_profile(
         // the documented recovery for a revoked login — clear its quarantine.
         // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);
-        save_app_state(&config.state)
+        let saved = save_app_state(&config.state);
+        if saved.is_ok() {
+            seed_guard.release();
+        }
+        saved
     })?;
     // Outside the closure — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
     // `save_profile` leaves the new credentials on disk under the old account's
-    // stamp. Bounded either way — an unexpired stamp lapses within the hour, and a
-    // tick racing the gap between the flock release and this expire spends the
-    // stale stamp once or loses a fresh one and re-pulls once.
-    crate::usage::expire_profile_ttl(name);
+    // stamp. Only when the OAuth half actually changed: a proven same-account
+    // re-login keeps the stamp and its memo.
+    if oauth_moved {
+        crate::usage::expire_profile_ttl(name);
+    }
     // The identity committed with the login inside the hold. Unproven
     // installs stay walk-blocked until the normal profile read resolves them.
     if matches!(anchor, AnchorAction::Proven(_)) {
@@ -2592,34 +3687,47 @@ pub(crate) fn overwrite_captured_profile(
 /// profile can't be meaningfully active, and the honest state is "no active".
 pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|held| {
+        let before = read_before_identities(name);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' not found"))?;
+        // The OAuth half forgets; the provider half is this profile's own and
+        // stays (a hybrid's OAuth log out keeps the provider reading). The
+        // throughput record survives when the delegates still run on the key.
+        // The setup-token sidecar stays too, so a profile that held no pair
+        // keeps its identity and its reading.
+        let after_oauth = crate::usage::pairless_identity(name);
+        let after_throughput = throughput_identity(
+            &after_oauth,
+            before.base_url.as_deref(),
+            before.api_key.as_deref(),
+            before.env_token.as_deref(),
+        );
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            oauth_account: names_another_account(before.last_account.as_ref(), &after_oauth),
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
         profile.set_credentials(None, held);
-        profile.usage = None;
-        profile.fetch_status = None;
-        profile.third_party_usage = None;
         crate::oauth::retire_unreadable_spent_record(name);
+        forget_disk_plan(name, plan);
         save_profile(profile)?;
         // Drop any legacy `.pending` rotation sidecar too: with credentials.json gone,
         // `recover_pending_credentials` would treat the sidecar as a failed commit
         // and resurrect the just-deleted login on next load.
         crate::profile::clear_staged_credentials(name);
-
+        // The anchor, its identity details and a pending-install marker all
+        // describe the login just dropped.
         for file in [
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             crate::profile_cache::IDENTITY_PENDING_FILE,
             crate::profile_cache::ACCOUNT_IDENTITY_FILE,
-            crate::profile_cache::USAGE_CACHE_FILE,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            // Inert once the credential changes, but this profile may now be a
-            // different account entirely — drop it with the rest.
-            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
             crate::profile_cache::remove_profile_cache(name, file);
         }
+        note_forget_plan(name, plan);
 
         if was_active {
             // Guest mode: the live slot is upstream's; only our marker moves.
@@ -2633,9 +3741,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
     })?;
     // The dropped login's TTL clock is the old account's; a re-login into this
     // shell must pull its own tier now, not an hour from now. Outside the closure
-    // — see `rename_profile` on the rank order. Skipped when the logout fails,
-    // which `clear_claude_credentials` makes imprecise rather than atomic: the
-    // stored credentials are already gone by then, with the stamp left to lapse.
+    // — see `rename_profile` on the rank order. The durable stamp is already
+    // gone (`forget_disk`), so this clears the memo the CLI (which never drains
+    // `forget_memory`) would otherwise leave behind.
     crate::usage::expire_profile_ttl(name);
     Ok(())
 }
@@ -2648,17 +3756,19 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 /// active — so a running `claude` loses the token too. The account stays active:
 /// its base url is still wired, only the key is gone.
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
         edit_profile_endpoint(config, name, base_url, None)?;
-        // The endpoint editor clears the in-memory stats; also drop the on-disk
-        // third-party cache so a stale copy can't resurface on reload (no key left
-        // to refresh it).
-        if let Some(path) = crate::profile_cache::profile_cache_path(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        ) {
-            let _ = std::fs::remove_file(path);
+        if config
+            .find(name)
+            .is_some_and(|p| p.unreadable_credentials_store.is_some())
+        {
+            // Disk first: the flag clears only once the store is gone, so a
+            // failed delete leaves the log-out row up to retry.
+            crate::profile::write_profile_credentials(name, None, held)?;
+            if let Some(profile) = config.find_mut(name) {
+                profile.set_credentials(None, held);
+            }
         }
         Ok(())
     })

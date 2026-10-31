@@ -34,6 +34,167 @@ pub(crate) fn rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `path` canonicalized and spelled as a plain path is shown or handed to
+/// another program to open, derived from dunce's rule rather than by calling
+/// it: on Windows a `\\?\X:\…` verbatim path drops `\\?\` while the whole
+/// verbatim string is at most 260 UTF-16 units; a longer one and a
+/// `\\?\UNC\…` one keep it. (dunce also keeps a path holding a reserved DOS
+/// name; no test builds one.) Elsewhere canonicalize adds no prefix.
+pub(crate) fn plain_path(path: &Path) -> PathBuf {
+    let resolved = crate::canonical::identity(path).expect("canonical");
+    let text = resolved.to_str().expect("utf-8 path");
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with(r"UNC\") && text.encode_utf16().count() <= 260 => {
+            PathBuf::from(rest)
+        }
+        _ => resolved,
+    }
+}
+
+/// `path` canonicalized and spelled as Claude Code keys its project dirs on
+/// Windows: `\\?\` dropped at any length, `\\?\UNC\server\…` as
+/// `\\server\…`. Elsewhere canonicalize adds no prefix.
+pub(crate) fn node_path(path: &Path) -> PathBuf {
+    let resolved = crate::canonical::identity(path).expect("canonical");
+    let text = resolved.to_str().expect("utf-8 path");
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        resolved
+    }
+}
+
+/// Downcast a feed fetch's failure to ureq's own timeout and pin its REASON:
+/// only `Global` is the one end-to-end budget cloudy's 2026-10-21 ruling names.
+/// A `RecvBody` bound or one of ureq's other phases is a different, unruled
+/// budget even when it errors inside the window.
+///
+/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
+/// ureq error is the io error's inner source.
+pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
+    let err = result.as_ref().expect_err("a stalled body is an error");
+    let io = err
+        .downcast_ref::<std::io::Error>()
+        .unwrap_or_else(|| panic!("the body stall surfaces an io error: {err:?}"));
+    let ureq_err = io
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .unwrap_or_else(|| panic!("the io error wraps ureq's timeout: {err:?}"));
+    assert!(
+        matches!(ureq_err, ureq::Error::Timeout(ureq::Timeout::Global)),
+        "the body stall must trip the ONE end-to-end budget: {err:?}"
+    );
+}
+
+/// Read a loopback stub's request head before it answers, as a real server
+/// does. A socket closed with the request still unread sends a RST instead of a
+/// FIN: Windows then fails the client's read with `os error 10053`, and macOS
+/// refuses the client's next `SO_RCVTIMEO` with `EINVAL` (CI run 39758751460).
+/// Returns the bytes read, through `\r\n\r\n` or the read's end.
+pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    head
+}
+
+/// A loopback stub answering one request with a 200 whose `Content-Length`
+/// promises far more than it sends: with `complete` off it writes the head and
+/// then holds the socket open and silent, a stalled body; with it on it sends
+/// [`BODY_STUB_BODY`] whole. The socket is held until the stub drops (or 60 s
+/// pass), so a stalled read never ends on a FIN.
+pub(crate) struct BodyStub {
+    pub(crate) url: String,
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+/// The body a completing [`BodyStub`] serves.
+pub(crate) const BODY_STUB_BODY: &str = r#"{"ok":true}"#;
+
+pub(crate) fn serve_body_stub(complete: bool) -> BodyStub {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let url = format!("http://{}/", listener.local_addr().expect("local addr"));
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        read_request_head(&mut sock);
+        let reply = if complete {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY_STUB_BODY}",
+                BODY_STUB_BODY.len()
+            )
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n".to_owned()
+        };
+        let _ = std::io::Write::write_all(&mut sock, reply.as_bytes());
+        let _ = held.recv_timeout(std::time::Duration::from_secs(60));
+    });
+    BodyStub {
+        url,
+        _release: release,
+    }
+}
+
+/// Drive one GET through `agent` against a stalled body and pin that ureq's ONE
+/// end-to-end budget ends it: `Timeout::Global`, never a phase bound, after at
+/// least three quarters of `bound` and under 1 s. The read runs on its own
+/// thread under a 2 s wait, so an unbounded body reads as a red, never a hung
+/// suite. `bound` stays under 500 ms so the window holds.
+pub(crate) fn assert_stalled_body_fails_at(agent: ureq::Agent, bound: std::time::Duration) {
+    let stub = serve_body_stub(false);
+    let url = stub.url.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let result = agent
+            .get(&url)
+            .call()
+            .and_then(|mut response| response.body_mut().read_to_string());
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("a stalled body must end the call within its whole-call bound");
+    let elapsed = started.elapsed();
+    let err = result.expect_err("a stalled body is an error");
+    assert!(
+        matches!(err, ureq::Error::Timeout(ureq::Timeout::Global)),
+        "a stalled body must trip the one end-to-end budget: {err:?}"
+    );
+    assert!(
+        elapsed >= bound * 3 / 4,
+        "the call waits out its bound, never a shorter one: {elapsed:?} for {bound:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the call ends at its bound, not a longer one: {elapsed:?} for {bound:?}"
+    );
+    drop(stub);
+}
+
+/// Drive one GET through `agent` against a body served whole and pin that it
+/// reads in full under the same whole-call bound.
+pub(crate) fn assert_prompt_body_reads(agent: ureq::Agent) {
+    let stub = serve_body_stub(true);
+    let body = agent
+        .get(&stub.url)
+        .call()
+        .and_then(|mut response| response.body_mut().read_to_string())
+        .expect("a body served at once reads within the bound");
+    assert_eq!(body, BODY_STUB_BODY);
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates
@@ -61,6 +222,22 @@ impl HomeSandbox {
         let guard = crate::profile::HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A prior test that panicked mid-override leaks it into this one: clear
+        // it here (and on drop) so a parallel test never inherits a shortened
+        // lock deadline it did not set. The callback/feed bounds and the
+        // marker-registration pose are the same class of process-global state.
+        crate::lock::set_state_lock_timeout_override(None);
+        set_tui_worker_join_timeout_override(None);
+        crate::oauth_login::set_callback_read_timeout_override(None);
+        crate::oauth_login::set_callback_reader_cap_override(None);
+        crate::codex_login::set_callback_read_timeout_override(None);
+        crate::pricing::set_fetch_timeout_override(None);
+        crate::status::set_fetch_timeout_override(None);
+        crate::mcp::jobs::reset_marker_registration_for_test();
+        crate::claude_json::set_json_sync_lock_timeout_override(None);
+        crate::claude_json::reset_last_synced();
+        crate::claude_json::reset_pending_strip_state();
+        crate::profile::reset_torn_store_notice_for_test();
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
@@ -114,18 +291,43 @@ impl Drop for HomeSandbox {
     )]
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
-        // detached worker still running when `HOME_OVERRIDE` clears resolves
-        // the user's REAL `$HOME` and takes real locks under `~/.tollgate`
-        // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
-        // flock). Doing it here rather than asking each test to call the join
-        // fns covers the tests that never thought about it — which is every
-        // test that will ever be added. Two registries: the TUI's own
-        // `spawn_worker` handles (joinable OS threads) and
-        // [`join_background_tasks`] for detach mechanisms that hand back no
-        // joinable handle at all (e.g. `tokio::task::spawn_blocking`).
-        crate::tui::join_test_workers();
+        // worker still running past the join bound is detached, so its next
+        // home read resolves whichever `HOME_OVERRIDE` is installed then — a
+        // later test's sandbox under one-process `cargo test` — and never the
+        // operator's real `$HOME` (a `cfg(test)` home read with no override
+        // panics inside the worker's own `catch_unwind`). Doing it here rather
+        // than asking each test to call the join fns covers the tests that
+        // never thought about it — which is every test that will ever be
+        // added. Two registries: the TUI's own `spawn_worker` handles
+        // (joinable OS threads) and [`join_background_tasks`] for detach
+        // mechanisms that hand back no joinable handle at all (e.g.
+        // `tokio::task::spawn_blocking`).
+        let stuck = join_tui_workers_bounded();
         join_background_tasks();
+        // Clear the forget queue, its registered-stores flag, the `/profile`
+        // memo and the seed hooks: under `cargo test` the suite is one process,
+        // so a leak or an armed hook would reach the next test.
+        crate::usage::reset_pending_forgets_for_test();
+        crate::usage::reset_profile_fetched_for_test();
+        crate::usage::clear_seed_hooks_for_test();
+        crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();
+        // Clear the process-wide lock-timeout override after the joins above
+        // (a worker's last wait still needs the shortened deadline it was
+        // posed under), so a test that forgot to clear it cannot leak it into
+        // the next one. The callback/feed bounds and the marker-registration
+        // pose leak the same way, so they clear together.
+        crate::lock::set_state_lock_timeout_override(None);
+        set_tui_worker_join_timeout_override(None);
+        crate::oauth_login::set_callback_read_timeout_override(None);
+        crate::oauth_login::set_callback_reader_cap_override(None);
+        crate::codex_login::set_callback_read_timeout_override(None);
+        crate::pricing::set_fetch_timeout_override(None);
+        crate::status::set_fetch_timeout_override(None);
+        crate::mcp::jobs::reset_marker_registration_for_test();
+        crate::claude_json::set_json_sync_lock_timeout_override(None);
+        crate::claude_json::reset_last_synced();
+        crate::claude_json::reset_pending_strip_state();
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
@@ -150,6 +352,12 @@ impl Drop for HomeSandbox {
         match self.prev_claude_pid.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
             None => unsafe { std::env::remove_var("CLAUDE_PID") },
+        }
+        // A non-panicking miss ran the whole teardown above; panic LAST naming
+        // the count and the bound. The unwind then drops the guard (poisoning
+        // `HOME_TEST_LOCK`, which the next sandbox recovers) and the tempdir.
+        if let Some(msg) = stuck {
+            panic!("{msg}");
         }
     }
 }
@@ -267,6 +475,63 @@ pub(crate) fn join_background_tasks_with(timeout: std::time::Duration) {
                 panic!("{msg}");
             }
         }
+    }
+}
+
+/// The bound [`HomeSandbox::drop`] waits for TUI workers: [`BACKGROUND_TASK_JOIN_TIMEOUT`],
+/// or a shorter value a test poses a hung worker under. Production never sets
+/// the override. Reset by `HomeSandbox` (which serializes the whole suite
+/// through `HOME_TEST_LOCK`), so a parallel test never sees a leaked override.
+#[cfg(test)]
+static TUI_WORKER_JOIN_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// The bound [`HomeSandbox::drop`] waits for TUI workers: the test-only
+/// override when set, else [`BACKGROUND_TASK_JOIN_TIMEOUT`].
+#[cfg(test)]
+fn tui_worker_join_timeout() -> std::time::Duration {
+    if let Some(t) = *TUI_WORKER_JOIN_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    BACKGROUND_TASK_JOIN_TIMEOUT
+}
+
+/// Set or clear the test-only TUI-worker join bound. `None` restores
+/// [`BACKGROUND_TASK_JOIN_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_tui_worker_join_timeout_override(timeout: Option<std::time::Duration>) {
+    *TUI_WORKER_JOIN_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
+/// Join every TUI worker bounded, so a worker that never finishes cannot turn a
+/// test's teardown into a hung gate. On a miss the stuck workers are detached,
+/// and a detached worker's next home read resolves whichever `HOME_OVERRIDE` is
+/// installed then — never the operator's real `$HOME`. A panicking miss logs
+/// and returns `None`; a non-panicking miss returns the message for
+/// [`HomeSandbox::drop`] to panic with LAST, after the rest of the teardown.
+#[cfg(test)]
+fn join_tui_workers_bounded() -> Option<String> {
+    let bound = tui_worker_join_timeout();
+    if let Err(n) = crate::tui::join_test_workers_within(bound) {
+        let suffix = if n == 1 { "" } else { "s" };
+        let msg = format!("{n} TUI worker{suffix} still running past the {bound:?} join bound");
+        crate::tui::detach_test_workers();
+        if std::thread::panicking() {
+            crate::out::errln!(
+                "tollgate: {msg}; detached, its next home read may resolve the next \
+                 sandboxed test's home, never the real one"
+            );
+            None
+        } else {
+            Some(msg)
+        }
+    } else {
+        None
     }
 }
 
@@ -460,6 +725,41 @@ pub(crate) fn request_header(raw: &str, name: &str) -> Option<String> {
                 .eq_ignore_ascii_case(name)
                 .then(|| value.trim().to_string())
         })
+}
+
+/// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
+/// stream before the caller writes its response. A close that leaves request
+/// bytes unread sends RST instead of FIN, and an RST can discard the client's
+/// not-yet-read response. A bodyless GET drains in one read, which is why only
+/// the POST-driven servers need this.
+pub(crate) fn drain_http_request(sock: &mut impl std::io::Read) -> Vec<u8> {
+    let mut req = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                req.extend_from_slice(&tmp[..n]);
+                if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl = req[..hlen]
+                        .split(|&b| b == b'\n')
+                        .find_map(|line| {
+                            std::str::from_utf8(line)
+                                .ok()?
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= hlen + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    req
 }
 
 /// The projection under [`serve_endpoints_recording`]: hands back each
@@ -683,6 +983,103 @@ pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     std::fs::create_dir(&path).expect("block the credentials path with a directory");
 }
 
+/// Make `dir` refuse to create or write files for the guard's lifetime, so a
+/// test can drive a save failure without root: on Unix the dir's mode drops to
+/// 0o500 (no write bit), on Windows a deny ACE for Everyone removes add-file /
+/// add-subdir (`(WD,AD)`). The constructor probes a real write so a fault that
+/// never bites fails by name instead of greening the test; `Drop` restores
+/// best-effort and never asserts.
+#[cfg(test)]
+pub(crate) struct UnwritableDir {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl UnwritableDir {
+    pub(crate) fn new(path: &Path) -> Self {
+        let guard = Self {
+            path: path.to_path_buf(),
+        };
+        guard.arm();
+        guard.probe();
+        guard
+    }
+
+    #[cfg(unix)]
+    fn arm(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o500))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "UnwritableDir: chmod 0o500 {} failed: {e}",
+                    self.path.display()
+                )
+            });
+    }
+
+    #[cfg(windows)]
+    fn arm(&self) {
+        let out = Command::new(icacls())
+            .arg(&self.path)
+            .arg("/deny")
+            .arg("*S-1-1-0:(WD,AD)")
+            .output()
+            .unwrap_or_else(|e| panic!("UnwritableDir: spawn icacls failed: {e}"));
+        if !out.status.success() {
+            panic!(
+                "UnwritableDir: icacls /deny {} failed: {}",
+                self.path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn probe(&self) {
+        let probe = self
+            .path
+            .join(format!(".unwritable-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"probe") {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                panic!(
+                    "UnwritableDir({}) accepted a probe write",
+                    self.path.display()
+                );
+            }
+            Err(e) => panic!(
+                "UnwritableDir({}) probe: expected PermissionDenied, got {e}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for UnwritableDir {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new(icacls())
+                .arg(&self.path)
+                .arg("/remove:d")
+                .arg("*S-1-1-0")
+                .output();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn icacls() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    PathBuf::from(root).join("System32").join("icacls.exe")
+}
+
 /// RAII pin redirecting every Anthropic endpoint the rotation legs touch —
 /// `/usage`, the token endpoint, and the `/v1/messages` kick — at one loopback
 /// listener, and clearing them on drop even if the test panics. Also resets the
@@ -832,10 +1229,65 @@ impl Drop for EnvPin<'_> {
 
 /// The body of the fake `claude` the agentgear lifecycle pins stage.
 /// `@VERSION@` is substituted with the crate version at write time so the
-/// entry the shim reports is never stale against the embedded tree.
+/// entry the shim reports is never stale against the embedded tree. When
+/// `CLAUDE_SHIM_FAIL_INSTALL` holds a non-empty value, `plugin install` prints
+/// a prose marker to stderr and exits 7 instead of succeeding; every other
+/// command is unaffected.
 #[cfg(unix)]
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
+printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# Opt-in: a grandchild subshell inherits this child's stderr (the pipe tollgate
+# reads) and stays alive for the named seconds while the child exits at once,
+# so a test can pin that the run finalizes on the child's exit without waiting
+# on the grandchild's pipe.
+if [ -n "${CLAUDE_SHIM_GRANDCHILD_HOLD-}" ]; then
+  ( sleep "$CLAUDE_SHIM_GRANDCHILD_HOLD" ) &
+  exit 0
+fi
+# Opt-in scripted failure: print the named stderr text and exit with the named
+# code, so a test drives a delegate's non-zero-exit path through a real spawn.
+if [ -n "${CLAUDE_SHIM_STDERR-}" ]; then
+  printf '%s\n' "$CLAUDE_SHIM_STDERR" >&2
+  exit "${CLAUDE_SHIM_EXIT-1}"
+fi
+# Opt-in: a delegate's row is registered by the mcp that spawns us and re-keyed
+# onto our pid once we exist. When this var names a file, wait for that re-key
+# (a row under the live-sessions registry whose pid is ours) and copy the row
+# out, so a test can read what the registry holds while this child still runs.
+if [ -n "${CLAUDE_SHIM_ROW_DUMP-}" ]; then
+  i=0
+  while [ "$i" -lt 10 ]; do
+    for row in "$HOME"/.tollgate/live_sessions/*.json; do
+      [ -f "$row" ] || continue
+      if grep -q "\"pid\":$$," "$row" 2>/dev/null; then
+        cp "$row" "$CLAUDE_SHIM_ROW_DUMP"
+        exit 0
+      fi
+    done
+    i=$((i + 1))
+    sleep 1
+  done
+  exit 0
+fi
+# Like the real background launch: the job service takes the session, the
+# launch returns at once, and the job record names the config dir it reads.
+# The record is written through that config dir, as Claude Code writes it.
+# A `/background` prompt stands in for a foreground session moved to the
+# background from its terminal, which leaves the launcher the same record.
+for arg in "$@"; do
+  case "$arg" in
+    --bg|--background|/background)
+      : "${CLAUDE_CONFIG_DIR:?}"
+      job="$CLAUDE_CONFIG_DIR/jobs/fakebg$$"
+      mkdir -p "$job"
+      printf '{"state":"working","respawnFlags":[],"providerEnv":{"CLAUDE_CONFIG_DIR":"%s"},"sessionId":"fakebg%s-0a6e-4b11-883e-fca3a218ae52"}\n' "$CLAUDE_CONFIG_DIR" "$$" > "$job/state.json"
+      mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-cwd"
+      printf '{"type":"user"}\n' > "$CLAUDE_CONFIG_DIR/projects/-fake-cwd/fakebg$$.jsonl"
+      exit 0
+      ;;
+  esac
+done
 case "$1" in
   --version)
     echo "2.1.220 (Claude Code)"
@@ -887,6 +1339,10 @@ case "$1" in
         fi
         ;;
       install)
+        if [ -n "${CLAUDE_SHIM_FAIL_INSTALL-}" ]; then
+          printf 'boom\356\200\200\n' >&2
+          exit 7
+        fi
         : > "$CLAUDE_SHIM_STATE"
         # The registry tollgate's own probe reads: write the user-scope entry so
         # the Plugin tab recompute after the install sees it.
@@ -927,6 +1383,11 @@ pub(crate) struct FakeClaude<'a> {
     prev_state: Option<std::ffi::OsString>,
     prev_mkt_state: Option<std::ffi::OsString>,
     prev_log: Option<std::ffi::OsString>,
+    prev_fail_install: Option<std::ffi::OsString>,
+    prev_row_dump: Option<std::ffi::OsString>,
+    prev_stderr: Option<std::ffi::OsString>,
+    prev_exit: Option<std::ffi::OsString>,
+    prev_grandchild_hold: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -935,21 +1396,34 @@ impl<'a> FakeClaude<'a> {
     /// own PATH.
     pub(crate) fn new(home: &'a HomeSandbox) -> Self {
         let prev_path = std::env::var_os("PATH").expect("PATH is set");
-        Self::stage(home, &prev_path, true)
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM), false)
     }
 
     /// The same pins with a claude-free PATH (empty shim dir + a minimal
     /// tail), so agentgear's claude backend is undetected and the lifecycle
     /// converges to `NoOp` without spawning anything.
     pub(crate) fn new_without_claude(home: &'a HomeSandbox) -> Self {
-        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), false)
+        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), None, false)
+    }
+
+    /// The success pins with `CLAUDE_SHIM_FAIL_INSTALL` set to `1`, so the shim's
+    /// `plugin install` prints the prose marker to stderr and exits 7, and the
+    /// install failure's own error carries the marker into the toast.
+    pub(crate) fn new_failing_install(home: &'a HomeSandbox) -> Self {
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM), true)
     }
 
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    fn stage(home: &'a HomeSandbox, path_tail: &std::ffi::OsStr, with_shim: bool) -> Self {
+    fn stage(
+        home: &'a HomeSandbox,
+        path_tail: &std::ffi::OsStr,
+        shim: Option<&str>,
+        fail_install: bool,
+    ) -> Self {
         let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
         let data = tmp.path().join("data");
         let run = tmp.path().join("run");
@@ -957,17 +1431,19 @@ impl<'a> FakeClaude<'a> {
         for dir in [&data, &run, &tree] {
             std::fs::create_dir_all(dir).expect("create dir");
         }
-        if with_shim {
-            let shim = tmp.path().join("claude");
+        if let Some(shim) = shim {
+            let shim_path = tmp.path().join("claude");
             std::fs::write(
-                &shim,
-                FAKE_CLAUDE_SHIM.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+                &shim_path,
+                shim.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
             )
             .expect("write shim");
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+            let mut perms = std::fs::metadata(&shim_path)
+                .expect("shim meta")
+                .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&shim, perms).expect("chmod shim");
+            std::fs::set_permissions(&shim_path, perms).expect("chmod shim");
         }
 
         let pin = |key: &str, value: &std::path::Path| {
@@ -994,6 +1470,35 @@ impl<'a> FakeClaude<'a> {
         let prev_mkt_state = pin("CLAUDE_SHIM_MKT_STATE", &tmp.path().join("mkt-state"));
         let log = tmp.path().join("log");
         let prev_log = pin("CLAUDE_SHIM_LOG", &log);
+        let prev_fail_install = std::env::var_os("CLAUDE_SHIM_FAIL_INSTALL");
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            if fail_install {
+                std::env::set_var("CLAUDE_SHIM_FAIL_INSTALL", "1");
+            } else {
+                std::env::remove_var("CLAUDE_SHIM_FAIL_INSTALL");
+            }
+        }
+        let prev_row_dump = std::env::var_os("CLAUDE_SHIM_ROW_DUMP");
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the dump branch.
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ROW_DUMP");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the failure branch.
+        let prev_stderr = std::env::var_os("CLAUDE_SHIM_STDERR");
+        let prev_exit = std::env::var_os("CLAUDE_SHIM_EXIT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_STDERR");
+            std::env::remove_var("CLAUDE_SHIM_EXIT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the grandchild branch.
+        let prev_grandchild_hold = std::env::var_os("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1006,11 +1511,69 @@ impl<'a> FakeClaude<'a> {
             prev_state,
             prev_mkt_state,
             prev_log,
+            prev_fail_install,
+            prev_row_dump,
+            prev_stderr,
+            prev_exit,
+            prev_grandchild_hold,
         }
     }
 
     pub(crate) fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Every call the shim answered, as `(CLAUDE_CONFIG_DIR, argv)`, in call
+    /// order; an unset `CLAUDE_CONFIG_DIR` reads as the empty string.
+    pub(crate) fn spawns(&self) -> Vec<(String, String)> {
+        let mut path = self.log.clone().into_os_string();
+        path.push(".spawns");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(dir, argv)| (dir.to_string(), argv.to_string()))
+            .collect()
+    }
+
+    /// Point the shim's opt-in live-row dump at `path`: the shim waits for its
+    /// own row to be re-keyed and copies the row there. Restored on drop like
+    /// every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_row_dump(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_ROW_DUMP", path) };
+    }
+
+    /// Script the shim's failure: the named text printed to stderr and the
+    /// named exit code, so a test drives a delegate's non-zero-exit path
+    /// through a real spawn. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_scripted_failure(&mut self, stderr: &str, exit: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_STDERR", stderr);
+            std::env::set_var("CLAUDE_SHIM_EXIT", exit);
+        }
+    }
+
+    /// Make the shim exit at once while a grandchild subshell inherits stderr
+    /// and stays alive for the named seconds, so a test pins that the run
+    /// finalizes on the child's exit without waiting on the grandchild's pipe.
+    /// Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_grandchild_hold(&mut self, secs: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_GRANDCHILD_HOLD", secs) };
     }
 }
 
@@ -1032,12 +1595,128 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_STATE", &self.prev_state),
                 ("CLAUDE_SHIM_MKT_STATE", &self.prev_mkt_state),
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
+                ("CLAUDE_SHIM_FAIL_INSTALL", &self.prev_fail_install),
+                ("CLAUDE_SHIM_ROW_DUMP", &self.prev_row_dump),
+                ("CLAUDE_SHIM_STDERR", &self.prev_stderr),
+                ("CLAUDE_SHIM_EXIT", &self.prev_exit),
+                ("CLAUDE_SHIM_GRANDCHILD_HOLD", &self.prev_grandchild_hold),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+}
+
+/// Drive a real install through the same host the Services tab calls, then
+/// write the registry files CC writes that the fake CLI does not, in CC's
+/// measured shapes: `known_marketplaces.json` (a directory source at the
+/// agentgear pointer carrying an `installLocation`), the `settings.json`
+/// `enabledPlugins["tollgate@tollgate"] = true` enable bit, and the top-level
+/// `version: 2` the shim's `installed_plugins.json` omits. agentgear's marker
+/// is stamped by the install itself, never written here by hand.
+///
+/// Fails loudly when the process cwd's `.claude/settings{,.local}.json` sets
+/// `enabledPlugins["tollgate@tollgate"]` or does not parse, because the classifier
+/// reads those layers first and the cwd is process-global (named in the
+/// message), so it cannot be sandboxed per test.
+#[cfg(unix)]
+pub(crate) fn healthy_install(config: &Path) {
+    refuse_cwd_settings_layer();
+    assert!(
+        matches!(
+            crate::plugin_host::install().expect("install"),
+            agentgear::Outcome::Installed
+        ),
+        "the fixture install must land"
+    );
+    let pointer = agentgear::current_pointer("tollgate", "claude").expect("pointer");
+    let registered = pointer.to_string_lossy().into_owned();
+    let plugins_dir = config.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    std::fs::write(
+        plugins_dir.join("known_marketplaces.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "tollgate": {
+                "source": {"source": "directory", "path": registered},
+                "installLocation": registered,
+                "lastUpdated": "2026-10-26T00:00:00.000Z"
+            }
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed known_marketplaces.json");
+
+    // The shim writes this on `plugin install` but omits the top-level
+    // `version: 2` the classifier requires; add it in place, keeping the
+    // shim's own row (whose installPath resolves to its live install tree).
+    let installed_path = plugins_dir.join("installed_plugins.json");
+    let mut installed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&installed_path).expect("the shim wrote installed_plugins.json"),
+    )
+    .expect("the shim's registry parses");
+    installed["version"] = serde_json::json!(2);
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed installed_plugins.json");
+
+    // Install flips the enable bit; the shim never writes settings.json.
+    std::fs::write(
+        config.join("settings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "enabledPlugins": {"tollgate@tollgate": true}
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed settings.json");
+}
+
+/// Fail loudly when the process cwd's `.claude/settings{,.local}.json` carries
+/// an `enabledPlugins["tollgate@tollgate"]` entry or does not parse: agentgear's
+/// classifier reads those layers first, so a checkout with a local disable (or
+/// a torn settings file) silently flips every healthy-install verdict. The cwd
+/// is process-global, so it cannot be sandboxed per test — this is the loud
+/// guard, and the message names the residual.
+#[cfg(unix)]
+fn refuse_cwd_settings_layer() {
+    let cwd = std::env::current_dir().expect("process cwd");
+    for name in ["settings.json", "settings.local.json"] {
+        let path = cwd.join(".claude").join(name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!(
+                "{} cannot be read ({e}); a healthy-install fixture reads the \
+                 process cwd's .claude settings layer first, and agentgear reads \
+                 an unreadable layer as needing a heal, so the test cannot be \
+                 hermetic while that file is unreadable",
+                path.display()
+            ),
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(e) => panic!(
+                "{} does not parse as JSON ({e}); a healthy-install fixture reads \
+                 the process cwd's .claude settings layer first, so the test \
+                 cannot be hermetic while that file is torn",
+                path.display()
+            ),
+        };
+        if value
+            .get("enabledPlugins")
+            .and_then(|plugins| plugins.get("tollgate@tollgate"))
+            .is_some()
+        {
+            panic!(
+                "{} sets enabledPlugins[\"tollgate@tollgate\"]; a healthy-install \
+                 fixture reads the process cwd's .claude settings layer first, so \
+                 the test cannot be hermetic while that entry is present",
+                path.display()
+            );
         }
     }
 }
@@ -1102,27 +1781,25 @@ pub(crate) fn seed_broken_plugin_registration() {
     .expect("installed");
 }
 
-/// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
-/// tier for its lifetime, putting the previous pin back on drop (even on panic).
-/// Required for any test asserting on a tier-dependent style, since the tier is
-/// process-global and otherwise auto-detects from the ambient `$COLORTERM`.
+/// RAII tier pin: forces the thread-local color tier for its lifetime, putting
+/// the previous pin back on drop (even on panic). Required for a test asserting
+/// a non-Full tier's style; in test builds the tier is per-thread and defaults
+/// to `Full`, so an unsandboxed Full-tier assertion needs no pin. `!Send` by
+/// construction: a pin is a claim on the thread that installed it, and one
+/// carried to another thread would restore that thread's empty slot and leave
+/// the installing thread pinned.
 pub(crate) struct TierSandbox {
-    // Drop order: this type's `drop` restores under the lock, which the field
-    // then releases.
-    _guard: crate::lockorder::RankedGuard<'static, ()>,
     prev: Option<crate::tui::theme::Tier>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl TierSandbox {
     pub(crate) fn new(tier: crate::tui::theme::Tier) -> Self {
-        let guard = crate::tui::theme::TIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let prev = crate::tui::theme::tier_override();
         crate::tui::theme::set_tier(tier);
         Self {
-            _guard: guard,
             prev,
+            _not_send: std::marker::PhantomData,
         }
     }
 }
@@ -1133,6 +1810,39 @@ impl Drop for TierSandbox {
     }
 }
 
+/// RAII terminal-family pin, the [`TierSandbox`] shape: forces the ghostty bit
+/// for its lifetime and puts the previous value back on drop (even on panic).
+/// `!Send` for the same reason the tier pin is.
+pub(crate) struct GhosttySandbox {
+    prev: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl GhosttySandbox {
+    pub(crate) fn new(on: bool) -> Self {
+        let prev = crate::tui::theme::ghostty_marks();
+        crate::tui::theme::set_ghostty(on);
+        Self {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for GhosttySandbox {
+    fn drop(&mut self) {
+        crate::tui::theme::set_ghostty(self.prev);
+    }
+}
+
+/// A section header's foreground on `Tier::Full` while focus rests in its
+/// section: `TEXT` (Catppuccin Mocha `text`, `#cdd6f4`). Literal, so a theme
+/// edit cannot move the expectation with it.
+pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::Rgb(205, 214, 244);
+/// A section header's foreground on `Tier::Full` at rest: `TEXT_DIM` (Mocha
+/// `subtext0`, `#a6adc8`).
+pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
@@ -1141,6 +1851,8 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: Default::default(),
         models: Default::default(),
         fallback_threshold: None,
@@ -1152,16 +1864,83 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
-        usage_stale: false,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
     }
+}
+
+/// A stored rotating OAuth pair (`credentials.json`'s shape) whose access
+/// token is `access` — a profile holding one holds a login.
+pub(crate) fn oauth_pair(access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// Write a long-lived `session-token.json` sidecar (no refresh token, so
+/// `claude::has_session_token` reads it as a login) into `name`'s profile dir
+/// under the process HOME, which the caller's `HomeSandbox` pins.
+pub(crate) fn write_long_lived_sidecar(name: &crate::profile::ProfileName) {
+    let mut sidecar = oauth_pair(&format!("sk-ant-oat-{name}"));
+    if let Some(token) = sidecar.claude_ai_oauth.as_mut() {
+        token.refresh_token = None;
+    }
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+}
+
+/// Make `p` the account the usage probe reads: the switch on and a long-lived
+/// setup token where a fixture's pair was, in memory and in the committed store
+/// a swap re-checks its target's login against, with the token's digest the
+/// loader records. Runs under the caller's `HomeSandbox`.
+pub(crate) fn make_probed_account(p: &mut crate::profile::Profile) {
+    p.usage_probe = true;
+    p.credentials = None;
+    p.has_long_lived_sidecar = true;
+    crate::profile::save_profile(p).expect("save the probed profile");
+    write_long_lived_sidecar(&p.name);
+    p.setup_token_digest = crate::claude::installed_session_token(&p.name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token);
+}
+
+/// Give `p` a long-lived setup token the server refused: the sidecar a switch
+/// installs, its digest as the loader records it, and the dead-login record
+/// against that digest. A pair `p` holds stays beside the token, and the probe
+/// switch stays as the caller set it. Runs under the caller's `HomeSandbox`
+/// and registers the name there, which the record's path needs; a TUI built
+/// afterwards seeds the verdict off the record.
+pub(crate) fn refuse_setup_token(p: &mut crate::profile::Profile) {
+    register_names(&[p.name.as_str()]);
+    p.has_long_lived_sidecar = true;
+    crate::profile::save_profile(p).expect("save the profile");
+    write_long_lived_sidecar(&p.name);
+    p.setup_token_digest = crate::claude::installed_session_token(&p.name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token);
+    let fp = crate::usage::dead_login_fingerprint(p).expect("the token's fingerprint");
+    crate::profile_cache::write_auth_expired(&p.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&p.name, fp),
+        "the record landed"
+    );
 }
 
 /// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape
@@ -1233,6 +2012,16 @@ pub(crate) fn write_codex_state(body: &str) {
     std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
 }
 
+/// The [`crate::profile::ProfileId`] a login starting on claude profile
+/// `name` claims now, the way every production start claims it. A production
+/// start only ever sees an account the roster holds, so a fixture that kept
+/// its roster in memory alone gets `name` registered on disk first.
+pub(crate) fn profile_id(name: &str) -> crate::profile::ProfileId {
+    register_names(&[name]);
+    crate::profile::claim_profile_id(&crate::profile::ProfileName::from(name))
+        .expect("claim the profile's id")
+}
+
 /// Writes a roster-only `codex-profiles.toml` into the sandboxed `~/.tollgate`.
 pub(crate) fn write_codex_roster(names: &[&str]) {
     let list = names
@@ -1241,6 +2030,33 @@ pub(crate) fn write_codex_roster(names: &[&str]) {
         .collect::<Vec<_>>()
         .join(", ");
     write_codex_state(&format!("profiles = [{list}]\n"));
+}
+
+/// Warm codex `name`'s usage cache in the shape the codex leg writes: the plan
+/// in `codex_plan` (when `plan` is `Some`), never `tier`. The codex roster must
+/// already hold `name` — `warm_usage` would put it on the claude roster instead.
+pub(crate) fn warm_codex_usage(name: &str, plan: Option<&str>, five_h: f64, seven_d: f64) {
+    let usage = crate::usage::UsageInfo {
+        plan: plan.map(|plan| crate::usage::PlanInfo {
+            codex_plan: Some(plan.to_string()),
+            ..crate::usage::PlanInfo::default()
+        }),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: five_h,
+            resets_at: None,
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: seven_d,
+            resets_at: None,
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
 }
 
 /// Another tollgate process inside its state-flock hold: a second open file
@@ -1266,6 +2082,52 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     let holder = crate::profile::open_state_file(&path).expect("open holder handle");
     holder.lock().expect("hold the rotation lock");
     holder
+}
+
+/// An empty scheduler activity store: the per-profile spend counts a test
+/// drives its own claims through.
+pub(crate) fn fresh_activity() -> crate::usage::ActivityStore {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new()))
+}
+
+/// Arm or clear the hook in `slot`. The seam a test orders its own action
+/// against, shared by every thread-local hook slot so the type it fires with
+/// is the only thing that differs. A one-shot slot takes its hook through
+/// [`take_hook`] before firing it; a persistent one keeps it and fires it
+/// borrowed.
+pub(crate) fn set_hook<H>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<H>>>,
+    hook: Option<H>,
+) {
+    slot.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Take the armed hook out of `slot` before firing it, so a hook that re-arms
+/// its own slot does not borrow it twice.
+pub(crate) fn take_hook<H>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<H>>>,
+) -> Option<H> {
+    slot.with(|slot| slot.borrow_mut().take())
+}
+
+/// Arm the gate's park hook and return the thread that raises `flag` and drops
+/// `holder` once a switch reaches its rotation-lock wait. Arms on the calling
+/// thread, where the gate runs: the hook slot is thread-local.
+pub(crate) fn stop_when_parked(
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    holder: std::fs::File,
+) -> std::thread::JoinHandle<()> {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    crate::oauth::set_rotation_park_hook(Some(Box::new(move || {
+        let _ = parked_tx.send(());
+    })));
+    std::thread::spawn(move || {
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gate reaches its rotation-lock wait");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(holder);
+    })
 }
 
 /// Simulate a live `tollgate start` session for `name`: a locked pid file in the
@@ -1297,6 +2159,15 @@ pub(crate) fn register_names(names: &[&str]) {
         }
     }
     crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
+pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
 }
 
 // ── provider-cache fixtures ──────────────────────────────────────────────────
@@ -1343,6 +2214,10 @@ pub(crate) const ALIBABA_NO_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"ro
 /// provider writes. The mixed bar keys are the point — a reader that assumed
 /// every bar carries the same five fields parses this one wrong.
 pub(crate) const THIRD_PARTY_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"12 / 100","kind":"body"},{"label":"web-reader","value":"3 / 100","kind":"body"},{"label":"zread","value":"0 / 50","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"80.1M","kind":"body"},{"label":"GLM-5.2","value":"40.2M","kind":"body"},{"label":"GLM-4.7","value":"3.1M","kind":"body"},{"label":"total","value":"123.4M  (1.2k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":12.5,"resets_at":"2026-08-15T12:00:00Z"},{"label":"7d","pct":48.0,"resets_at":"2026-08-20T00:00:00Z"},{"label":"30d","pct":3.0,"resets_at":"2026-09-01T00:00:00Z","used":123.4,"total":4000.0}],"plan":"pro","best_effort":false}"#;
+/// The cache the Alibaba arm writes for the captured Qwen Cloud monthly
+/// payloads: one `30d` bar the provider marks as the account's inference quota,
+/// the lite tier's 11500 allowance turning the ratio into `used / total`.
+pub(crate) const QWEN_MONTHLY_CACHE: &str = r#"{"is_available":true,"rows":[],"bars":[{"label":"30d","pct":0.0095790974,"resets_at":"2026-11-11T16:00:00+00:00","used":1.101596201,"total":11500.0,"inference_quota":true}],"plan":"lite","best_effort":false}"#;
 
 /// A real two-wallet DeepSeek cache: the empty USD wallet FIRST, the funded
 /// CNY wallet second. Captured 2026-08-28 from the operator's `DS6` profile's
@@ -1472,12 +2347,16 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         start_profile: profile.to_owned(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,
         follows_chain: true,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -1489,7 +2368,21 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         relaunch_capable: false,
         relaunched_from: None,
         intended_at: None,
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+        visited_members: vec![],
     }
+}
+
+/// The platform's own reason for reading `dir` as a file ("Is a directory" on
+/// unix, "Access is denied." on Windows), for a fixture that plants a
+/// directory where the code under test reads one and pins the OS cause.
+pub(crate) fn directory_read_error(dir: &Path) -> String {
+    std::fs::read_to_string(dir)
+        .expect_err("a directory does not read")
+        .to_string()
 }
 
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
@@ -1513,6 +2406,17 @@ pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
         }
     };
     file.set_modified(when).expect("set_modified");
+}
+
+/// Disarm [`crate::jsonsync::set_stamp_error_hook`] when the arming test
+/// returns or panics, so a forced stamp failure cannot leak into a later test's
+/// writer. Both modules that arm the seam share this one guard.
+pub(crate) struct StampErrorHookGuard;
+
+impl Drop for StampErrorHookGuard {
+    fn drop(&mut self) {
+        crate::jsonsync::set_stamp_error_hook(false);
+    }
 }
 
 /// `ERROR_SHARING_VIOLATION`. `std::io::ErrorKind` maps it to `Uncategorized`,
@@ -1554,6 +2458,10 @@ pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
 
 /// Every path under `root` breaking the owner-only invariant tollgate holds over
 /// `~/.tollgate` (0o700 dirs, 0o600 files), rendered as `<mode> <path>` lines.
+/// tollgate's own state writers create 0o600 files; the sweep's owner-exec
+/// carry-over is for the executables Claude Code writes into a runtime tree and
+/// the ones a fake-mode runtime copies in mode-preserved (`copy_file`, at build
+/// and on every mirror tick).
 /// Symlinks are skipped — a link's own mode is meaningless and its target lives
 /// outside the tree.
 #[cfg(unix)]
@@ -1601,6 +2509,108 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .collect()
 }
 
+/// Assert `line` draws its toggle in the contract's split colours for the
+/// current tier: full `─●` track LINE + knob ACCENT, `○─` knob TEXT_DIM +
+/// track LINE; compatible `[on]` brackets TEXT_DIM + word ACCENT, `[off]` all
+/// TEXT_DIM.
+pub(crate) fn assert_split_toggle(line: &ratatui::text::Line<'_>, on: bool) {
+    use crate::tui::theme;
+    let cells: Vec<(char, Option<ratatui::style::Color>)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style.fg)))
+        .collect();
+    let text: String = cells.iter().map(|(c, _)| c).collect();
+    let (glyph, expected) = match (theme::tier(), on) {
+        (theme::Tier::Full, true) => ("─●", vec![theme::line_color(), theme::accent_color()]),
+        (theme::Tier::Full, false) => ("○─", vec![theme::text_dim_color(), theme::line_color()]),
+        (theme::Tier::Compatible, true) => (
+            "[on]",
+            vec![
+                theme::text_dim_color(),
+                theme::accent_color(),
+                theme::accent_color(),
+                theme::text_dim_color(),
+            ],
+        ),
+        (theme::Tier::Compatible, false) => ("[off]", vec![theme::text_dim_color(); 5]),
+    };
+    let byte_at = text
+        .find(glyph)
+        .unwrap_or_else(|| panic!("no {glyph:?} toggle in {text:?}"));
+    let start = text[..byte_at].chars().count();
+    let got: Vec<Option<ratatui::style::Color>> = cells[start..start + expected.len()]
+        .iter()
+        .map(|(_, fg)| *fg)
+        .collect();
+    let want: Vec<Option<ratatui::style::Color>> = expected.into_iter().map(Some).collect();
+    assert_eq!(got, want, "toggle {glyph:?} cell colours in {text:?}");
+}
+
+/// Draw one frame through `draw`: the native caret it placed and the buffer.
+pub(crate) fn draw_caret(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    term.draw(draw).expect("draw a frame");
+    let caret = term.get_cursor_position().expect("read the caret");
+    (caret, term.backend().buffer().clone())
+}
+
+/// The symbol a rendered buffer holds at `(x, y)`.
+pub(crate) fn symbol_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buf[(x, y)].symbol().to_string()
+}
+
+/// The column of the rightmost `│` on row `y`: the pane border a field's
+/// value area ends two cells short of (its right padding between).
+pub(crate) fn right_border(buf: &ratatui::buffer::Buffer, y: u16) -> u16 {
+    (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("the row has a right border")
+}
+
+/// Pins an edit frame against its resting frame when an edited row's block
+/// changes height: every row above `field` matches whole, and the `count`
+/// rows from `below` (the first row under the block at rest) match whole
+/// `delta` rows lower in the edit frame (higher when `delta` is negative).
+pub(crate) fn assert_rows_below_shift(
+    resting: &[String],
+    editing: &[String],
+    field: usize,
+    below: usize,
+    delta: isize,
+    count: usize,
+    case: &str,
+) {
+    let frames = || {
+        format!(
+            "resting:\n{}\nediting:\n{}",
+            resting.join("\n"),
+            editing.join("\n")
+        )
+    };
+    assert_eq!(
+        editing[..field],
+        resting[..field],
+        "[{case}] the rows above the field hold still\n{}",
+        frames()
+    );
+    for k in 0..count {
+        let at = below + k;
+        let moved = at
+            .checked_add_signed(delta)
+            .expect("the shifted row is on the frame");
+        assert_eq!(
+            editing[moved],
+            resting[at],
+            "[{case}] resting row {at} sits at row {moved} while editing\n{}",
+            frames()
+        );
+    }
+}
+
 // A fake `claude` on a PATH prefix whose final-run invocation holds the child
 // alive for a few seconds, so a test can read a session's runtime
 // `settings.json` MID-run: `ProfileRuntime`'s drop removes the tree once the
@@ -1636,6 +2646,61 @@ pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<St
     }
 }
 
+/// Poll the live-session registry until a row matches `stop` (or the deadline
+/// passes), returning every observation in time order, duplicates across
+/// passes kept — so a caller can assert a row was NEVER seen in a given state,
+/// not just what the last pass held. The shared reader the mcp and `tollgate
+/// start` producer pins both call, so each producer's launcher choice is
+/// observed through the registry it actually writes.
+#[cfg(unix)]
+pub(crate) fn live_session_rows_until(
+    dir: &std::path::Path,
+    stop: impl Fn(&crate::live_sessions::LiveSession) -> bool,
+    timeout: std::time::Duration,
+) -> Vec<crate::live_sessions::LiveSession> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(row) = serde_json::from_slice::<crate::live_sessions::LiveSession>(&bytes)
+                else {
+                    continue;
+                };
+                found |= stop(&row);
+                seen.push(row);
+            }
+        }
+        if found || std::time::Instant::now() > deadline {
+            return seen;
+        }
+        // No pause between passes: a pause can skip a row state that lasts only
+        // a moment, and the callers assert a state was never seen.
+        std::thread::yield_now();
+    }
+}
+
+/// The recorded `procStart` spelling the fake supervisor's lock carries: field
+/// 22 of `/proc/<pid>/stat` on linux (clock ticks since boot), and
+/// `asctime(gmtime(pbi_start_tvsec))` on macOS — the same string the runtime's
+/// verify computes, so a seeded lock matches the live pid on either OS.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    Some(rest.split_whitespace().nth(19)?.to_string())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
+    crate::runtime::proc_bsdinfo(pid)
+        .map(|info| crate::runtime::format_proc_start(info.pbi_start_tvsec))
+}
+
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
 /// instantly (the start pre-flight's heal calls them), the session spawn
 /// itself sleeps a bounded five seconds so the poll above can observe the
@@ -1664,7 +2729,7 @@ impl<'a> SlowClaude<'a> {
         let shim = tmp.path().join("claude");
         std::fs::write(
             &shim,
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\nsleep 5\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\necho $$ > \"$HOME/.slow-claude.pid\"\nsleep 5\nexit 0\n",
         )
         .expect("write shim");
         use std::os::unix::fs::PermissionsExt;
@@ -1752,6 +2817,7 @@ pub(crate) fn bar(label: &str, pct: f64) -> crate::providers::UsageBar {
         resets_at: None,
         used: None,
         total: None,
+        inference_quota: false,
     }
 }
 
@@ -1763,10 +2829,101 @@ pub(crate) fn bar_reset_in(
     secs_in_future: i64,
 ) -> crate::providers::UsageBar {
     crate::providers::UsageBar {
-        resets_at: Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + secs_in_future,
-        )),
+        resets_at: Some(reset_in(secs_in_future)),
         ..bar(label, pct)
+    }
+}
+
+/// ISO reset `secs` in the future, exactly — for a fixture whose expectation
+/// depends on the exact instant (elapsed or remaining time).
+pub(crate) fn reset_in(secs: i64) -> String {
+    crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + secs)
+}
+
+/// ISO reset `secs` in the future, nudged 30 s into its minute so a floored
+/// countdown keeps its text when a clock second ticks between the fixture and
+/// the draw. A span under 5 min renders seconds, which no offset stabilises.
+pub(crate) fn countdown_reset_in(secs: i64) -> String {
+    let mid_bucket = if secs >= 300 && secs % 60 == 0 { 30 } else { 0 };
+    reset_in(secs + mid_bucket)
+}
+
+/// The walk fixture reviewer A's r3 probe used: `act` and `ok` are OAuth
+/// accounts (`act` exhausted at 99%, `ok` at 10% fresh or aged), `kl` is a
+/// KEYLESS DeepSeek chain member — an `[env]` inference token (so the walk
+/// keeps it eligible, and `load_profile` keeps its endpoint) but NO api key,
+/// with a `third_party_cache.json` reading `kl_five`% — a display-only name
+/// (third-party-classified, no api key), the exact shape whose cached reading
+/// commit 2b's display superset lets reach the walk. The active's credentials
+/// are linked so startup reconcile is Clean. Runs under the caller's
+/// `HomeSandbox`.
+pub(crate) fn keyless_walk_fixture(chain: &[&str], active: &str, ok_age_secs: u64, kl_five: f64) {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let oauth = |n: &str| {
+        let mut p = blank_profile(&ProfileName::from(n));
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("acc-{n}"),
+                refresh_token: Some(format!("rt-{n}")),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    };
+    let act = oauth("act");
+    let ok = oauth("ok");
+    let mut kl = blank_profile(&ProfileName::from("kl"));
+    kl.base_url = Some("https://api.deepseek.com/anthropic".into());
+    kl.provider = Some(crate::providers::Provider::DeepSeek);
+    kl.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-kl".to_string());
+    for p in [&act, &kl, &ok] {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        active_profile: Some(active.into()),
+        profiles: vec!["act".into(), "kl".into(), "ok".into()],
+        fallback_chain: chain.iter().map(|&n| n.into()).collect(),
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    })
+    .expect("save state");
+    let write_oauth_cache = |name: &str, five: f64, age_secs: u64| {
+        let now = crate::usage::now_epoch_secs();
+        let info = crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: five,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 7200)),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+            ..crate::usage::UsageInfo::default()
+        };
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &info,
+        );
+        let path = crate::profile::profile_dir(&ProfileName::from(name))
+            .unwrap()
+            .join(crate::profile_cache::USAGE_CACHE_FILE);
+        set_mtime(
+            &path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+        );
+    };
+    write_oauth_cache("act", 99.0, 0);
+    write_oauth_cache("ok", 10.0, ok_age_secs);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("kl"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats_with_bars(vec![bar_reset_in("5h", kl_five, 7200), bar("7d", 23.0)]),
+    );
+    if active != "kl" {
+        crate::claude::force_link_profile_credentials(&ProfileName::from(active))
+            .expect("link active");
     }
 }
 
@@ -2121,6 +3278,574 @@ pub(crate) fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("shim chmod");
     path
+}
+
+/// The POSIX-sh `record_start <pid> <file>` function a stub body splices in
+/// to record a pid's start time in exactly the spelling
+/// [`crate::daemon::gateway::process_start_time`] returns for the same pid,
+/// so a [`SleepGuard`]'s drop-time comparison agrees with it on every unix. A
+/// failed record leaves the file empty and never touches the stub's stderr (a
+/// check reads that stderr to its bound), so a missing `/proc` or `ps` reds
+/// nothing.
+#[cfg(all(test, unix, target_os = "linux"))]
+pub(crate) const RECORD_START_SH: &str = r#"record_start() { p=$1; f=$2; sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $20}' > "$f" 2>/dev/null; }"#;
+
+/// macOS and the BSDs: `ps -o lstart=` under `LC_ALL=C TZ=UTC0`, trimmed the
+/// way [`crate::daemon::gateway::process_start_time`] trims its `lstart`.
+#[cfg(all(test, unix, not(target_os = "linux")))]
+pub(crate) const RECORD_START_SH: &str = r#"record_start() { p=$1; f=$2; v=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$p" 2>/dev/null); v=${v#${v%%[![:space:]]*}}; v=${v%${v##*[![:space:]]}}; printf '%s' "$v" > "$f" 2>/dev/null; }"#;
+
+/// A `sleep` a stub left running, its pid in `path` and its start time in the
+/// sibling file named by appending `.start` to `path` (the stub records both
+/// with [`RECORD_START_SH`]: a stub that `exec`s the sleep shares its pid and
+/// `exec` keeps the start time, and one that backgrounds it writes the sleep's
+/// own). Killed when the test unwinds while that pid is still live AND its
+/// [`crate::daemon::gateway::process_start_time`] still equals the recorded
+/// start, so a pid recycled to any other process — a `sleep` included — is
+/// never signalled. Reads the files at drop, so a guard armed before the stub
+/// ran still holds; best-effort, never asserts.
+#[cfg(all(test, unix))]
+pub(crate) struct SleepGuard(pub PathBuf);
+
+#[cfg(all(test, unix))]
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        // A missing or empty record reads as "no verified pid to signal":
+        // skip, never fail-loud — the guard is best-effort and a `Drop` that
+        // asserts aborts the whole test binary.
+        let recorded = match std::fs::read_to_string(start_file(&self.0)) {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+            _ => return,
+        };
+        if crate::daemon::gateway::process_start_time(pid).as_deref() != Some(recorded.as_str()) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// `path` with `.start` appended to its file name — never replacing an
+/// extension — the [`SleepGuard`]'s recorded-start sibling.
+#[cfg(all(test, unix))]
+fn start_file(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".start");
+    PathBuf::from(name)
+}
+
+/// A process the test owns outright, killed and reaped when the test unwinds,
+/// so a red before its own kill leaks nothing. Never asserts (`Drop` runs
+/// while a test unwinds; a panic there aborts the whole binary).
+#[cfg(all(test, unix))]
+pub(crate) struct Owned(pub std::process::Child);
+
+#[cfg(all(test, unix))]
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The libtest path [`FakeSupervisor`] and [`spawn_parked`] re-enter: a
+/// `#[test]` that parks until SIGTERM when the fixture's marker env is present
+/// and returns at once otherwise (the normal suite run). Re-entering the test
+/// binary itself — a linker-signed executable — keeps its environment readable
+/// on macOS, where an Apple platform binary like `/bin/sh` would have it
+/// withheld from the verify read.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARK_TEST: &str = "testutil::fake_supervisor_parks_until_sigterm";
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const READY_ENV: &str = "TOLLGATE_TEST_FAKE_SUPERVISOR_READY";
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const IGNORE_TERM_ENV: &str = "TOLLGATE_TEST_FAKE_SUPERVISOR_IGNORE_TERM";
+
+/// The re-entry target: with the marker env absent this passes instantly (the
+/// normal suite run); with it present the test writes the ready file, then
+/// parks until SIGTERM — installing a no-op SIGTERM handler first when told to
+/// ignore the signal.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn fake_supervisor_parks_until_sigterm() {
+    let Some(ready) = std::env::var_os(READY_ENV) else {
+        return;
+    };
+    if std::env::var_os(IGNORE_TERM_ENV).is_some() {
+        use signal_hook::consts::signal::SIGTERM;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let _ignored = signal_hook::flag::register(SIGTERM, Arc::new(AtomicBool::new(false)))
+            .expect("register the ignore-SIGTERM handler");
+    }
+    std::fs::write(Path::new(&ready), b"").expect("signal readiness");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Spawn a re-entered copy of the test binary that runs only `test`, with
+/// `leading` as the argv words before the `--exact` filter (so argv can pose a
+/// supervisor shape, a daemon shape or a foreign shape) and null stdio.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn reentry_command(test: &str, leading: &[&str]) -> Command {
+    // Linux spawns through `/proc/self/exe`, which execs the running inode even
+    // after the test binary is unlinked or rebuilt mid-run (`current_exe()`
+    // then reads `<path> (deleted)` and every later spawn fails ENOENT); macOS
+    // has no such magic path, so it keeps `current_exe()`.
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    let exe = std::env::current_exe().expect("the test binary");
+    let mut cmd = Command::new(exe);
+    cmd.args(leading)
+        .arg("--exact")
+        .arg(test)
+        .arg("--test-threads=1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
+/// with `leading` as the argv words before the `--exact` filter, `CLAUDE_CONFIG_DIR`
+/// set, and the ready path the park test must write before parking.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command {
+    let mut cmd = reentry_command(PARK_TEST, leading);
+    cmd.env("CLAUDE_CONFIG_DIR", config_dir)
+        .env(READY_ENV, ready);
+    cmd
+}
+
+/// A live re-entered test binary that parks until SIGTERM, with `leading` as
+/// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
+/// while its environment (readable on macOS only for non-platform binaries)
+/// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
+/// owns its reap; the reaped `Owned` kills and waits on drop.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
+    let dir = tempfile::tempdir().expect("parked re-entry dir");
+    let ready = dir.path().join("ready");
+    // The child is owned from the spawn, so a panic during the readiness wait
+    // below still kills and reaps it (the `Owned` Drop) instead of leaking a
+    // forever-parked process.
+    let child = Owned(
+        reenter_parked(config_dir, leading, &ready)
+            .spawn()
+            .expect("spawn the re-entered test binary"),
+    );
+    // Wait for the park test to write the ready file before returning, so the
+    // caller records a pid that is already parked (and the tempdir can drop:
+    // the ready path is no longer needed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked re-entry never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child
+}
+
+/// A fake supervisor for the pid-stop tests: a re-entered copy of the test
+/// binary run with argv `daemon run` under the chosen `CLAUDE_CONFIG_DIR`,
+/// parked until SIGTERM. The test writes `<tree>/daemon.lock` from the
+/// recorded `pid` + `proc_start` (the live pid's real start, via
+/// [`proc_start_of`]). Killed and reaped on drop, best-effort, never asserts;
+/// the test reaps it first to read its exit status.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct FakeSupervisor {
+    _dir: tempfile::TempDir,
+    pub(crate) child: std::process::Child,
+    pub(crate) pid: u32,
+    pub(crate) proc_start: String,
+}
+
+/// Reaps the child it owns when [`FakeSupervisor::spawn`] panics between the
+/// spawn and the `FakeSupervisor` hand-back (the readiness assert or the
+/// start-time read). Drop never asserts — the reaping is best-effort, exactly
+/// like [`FakeSupervisor`]'s own.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct ReapChild(Option<std::process::Child>);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for ReapChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl FakeSupervisor {
+    pub(crate) fn spawn(config_dir: &Path, ignore_term: bool) -> Self {
+        let dir = tempfile::tempdir().expect("fake supervisor ready dir");
+        let ready = dir.path().join("ready");
+        let mut cmd = reenter_parked(config_dir, &["daemon", "run"], &ready);
+        if ignore_term {
+            cmd.env(IGNORE_TERM_ENV, "1");
+        }
+        let child = cmd.spawn().expect("spawn fake supervisor");
+        // The guard is armed before the first fallible step, so a panic below
+        // reaps the child instead of leaking a forever-looping process.
+        let mut guard = ReapChild(Some(child));
+        let pid = guard.0.as_ref().expect("the child is present").id();
+        // Wait for the park test to write the ready file (and, in the ignore
+        // arm, install the no-op SIGTERM handler) before returning: a SIGTERM
+        // that lands first kills the child and turns the ignore arm into the
+        // exit arm.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake supervisor never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let proc_start = proc_start_of(pid).expect("the fake supervisor's start time");
+        let child = guard.0.take().expect("the child is present");
+        Self {
+            _dir: dir,
+            child,
+            pid,
+            proc_start,
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for FakeSupervisor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Write `<tree>/daemon.lock` in the supervisor's content-file shape.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn write_daemon_lock(tree: &Path, pid: u32, start: &str) {
+    std::fs::write(
+        tree.join("daemon.lock"),
+        format!("{{\"pid\":{pid},\"procStart\":\"{start}\"}}"),
+    )
+    .expect("write daemon.lock");
+}
+
+/// Write `<tree>/daemon.status.json` in the supervisor's fallback shape.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
+    std::fs::write(
+        tree.join("daemon.status.json"),
+        format!("{{\"supervisorPid\":{pid},\"supervisorProcStart\":\"{start}\"}}"),
+    )
+    .expect("write daemon.status.json");
+}
+
+/// Wait for a fake supervisor the code under test should have SIGTERMed to
+/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
+/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
+/// the exit status on success, which the caller asserts is SIGTERM.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the fake supervisor was never SIGTERMed within the reap bound");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => panic!("waiting on the fake supervisor failed: {e}"),
+        }
+    }
+}
+
+// ── E2E `serve` stop harness ─────────────────────────────────────────────────
+//
+// Both stop tests re-enter the test binary to run the real `daemon::serve` in a
+// separate process (`SERVE_STOP_CHILD_TEST`), and both hold that child's token
+// spend in a loopback stub until the test signals. The command builder and the
+// stub live here so the two legs share them.
+
+/// The env-gated re-entry target: the child test fn in `daemon_mod.rs` that
+/// runs `daemon::serve`. With the marker env absent (the normal suite run) it
+/// passes instantly.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_CHILD_TEST: &str = "daemon::tests::daemon_serve_child_for_stop_tests";
+
+/// The env var carrying the child's home dir into the re-entered test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_CHILD_HOME_ENV: &str = "TOLLGATE_TEST_SERVE_CHILD_HOME";
+
+/// The env var carrying the loopback stub base into the re-entered test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const SERVE_STOP_TOKEN_BASE_ENV: &str = "TOLLGATE_TEST_TOKEN_BASE";
+
+/// Build the re-entered copy of the test binary that runs only
+/// [`SERVE_STOP_CHILD_TEST`], posing argv `tollgate daemon` (what
+/// `daemon::probe::pid_is_tollgate_daemon` accepts), with the child home and the
+/// token-stub base in the env and nothing inherited that names another home or
+/// reaches the network. `stderr` is the daemon-log file the caller reads back.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_child_command(
+    child_home: &Path,
+    base: &str,
+    stderr: std::fs::File,
+) -> Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut cmd = reentry_command(SERVE_STOP_CHILD_TEST, &["daemon"]);
+    cmd.arg0("tollgate")
+        .env_clear()
+        .env("HOME", child_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TOLLGATE_NO_UPDATE", "1")
+        .env("LC_ALL", "C")
+        .env(crate::usage::TOLLGATE_TEST_RUN_SCHEDULER, "1")
+        .env(SERVE_STOP_CHILD_HOME_ENV, child_home)
+        .env(SERVE_STOP_TOKEN_BASE_ENV, base)
+        .stderr(stderr);
+    cmd
+}
+
+/// A loopback token stub for the E2E `serve` stop tests: records every request
+/// it serves, holds its reply to the FIRST `POST /v1/oauth/token` until
+/// [`TokenStub::release`], and answers every other request at once. The held
+/// reply is the minted pair whose `refresh_token` the test asserts landed in
+/// the profile store; the `answered` marker the stub writes on that POST is the
+/// test's signal that the spend is in flight.
+/// Not [`serve_endpoints`]: its idle grace holds the join 12 s; this stub stops at once.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct TokenStub {
+    pub(crate) base: String,
+    answered: PathBuf,
+    release: std::sync::mpsc::Sender<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl TokenStub {
+    pub(crate) fn new(answered: PathBuf) -> Self {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = std::sync::Arc::clone(&stop);
+        let answered_flag = answered.clone();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut held = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .ok();
+                        let raw = drain_http_request(&mut sock);
+                        let request_line = std::str::from_utf8(&raw)
+                            .unwrap_or_default()
+                            .lines()
+                            .next()
+                            .unwrap_or_default();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or_default();
+                        let path = parts.next().unwrap_or_default();
+                        seen.push(format!("{method} {path}"));
+                        let is_token_post = method == "POST" && path == "/v1/oauth/token" && !held;
+                        if is_token_post {
+                            held = true;
+                            std::fs::write(&answered_flag, b"").ok();
+                            let _ = released.recv_timeout(std::time::Duration::from_secs(45));
+                        }
+                        let body = if is_token_post {
+                            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                        } else {
+                            r#"{}"#
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(reply.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        });
+        Self {
+            base: format!("http://127.0.0.1:{port}"),
+            answered,
+            release,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// The path the stub writes when the token POST arrives.
+    pub(crate) fn answered(&self) -> &Path {
+        &self.answered
+    }
+
+    /// Let the held token POST reply.
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
+
+    /// Stop the listener and return the requests it recorded, in order.
+    pub(crate) fn finish(mut self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .take()
+            .expect("token stub thread")
+            .join()
+            .expect("token stub thread panicked")
+    }
+}
+
+/// The drain's log line for the held `'alpha'` spend, as the daemon writes it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_wait_line() -> String {
+    format!(
+        "tollgate daemon: waiting up to {} s for the token save of 'alpha' before exiting",
+        crate::daemon::SPEND_DRAIN_BOUND.as_secs()
+    )
+}
+
+/// Whether the re-entered `serve` child's daemon log carries the drain's
+/// [`serve_stop_drain_wait_line`].
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_logged(log: &Path) -> bool {
+    let line = serve_stop_drain_wait_line();
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == line))
+}
+
+/// Whether the re-entered `serve` child's drain logged
+/// [`serve_stop_drain_wait_line`], or the child already exited (so the caller's
+/// assertions, not this wait, report the red).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_drain_waiting(log: &Path, child: &mut std::process::Child) -> bool {
+    serve_stop_drain_logged(log) || child.try_wait().ok().flatten().is_some()
+}
+
+/// Drive the re-entered `serve` child through a stop that lands mid token save:
+/// wait for the stub to see the spend, run `stop` on the child's pid, wait out
+/// the drain's log line, hold the save for `hold`, release it, then reap the
+/// child and pin that it died of SIGTERM, saved the minted pair, logged the
+/// drain's wait, and spent exactly once. `stop` gets the child's pid and home
+/// (the home override a stop helper reads its lock through) and returns the
+/// thread whose join is the stop's answer; `signal_red` is the caller's own
+/// diagnosis for a SIGKILL arriving in place of the SIGTERM.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn serve_stop_e2e<T>(
+    stop: impl FnOnce(u32, &Path) -> std::thread::JoinHandle<T>,
+    hold: std::time::Duration,
+    signal_red: &str,
+) -> T {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = TokenStub::new(scratch.path().join("answered"));
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let child = serve_stop_child_command(child_home.path(), &stub.base, stderr)
+        .spawn()
+        .expect("spawn the serve child");
+    let pid = child.id();
+    let mut child = Owned(child);
+
+    // The token POST is the spend in flight; wait for the stub to see it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !stub.answered().exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never reached the token endpoint"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let stopper = stop(pid, child_home.path());
+    // The drain provably reaches its wait before the save is allowed to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !serve_stop_drain_waiting(&log_path, &mut child.0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child neither waited on the spend nor exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Hold the save past the drain's start so an escalation that ignores the
+    // wait lands mid-save and kills the child with SIGKILL.
+    std::thread::sleep(hold);
+    stub.release();
+
+    let stopped = stopper.join().expect("the stopper ran");
+    let status = reap_bounded(&mut child.0);
+    assert_eq!(status.signal(), Some(15), "{signal_red}");
+
+    let stored = std::fs::read_to_string(
+        child_home
+            .path()
+            .join(".tollgate/profiles/alpha/credentials.json"),
+    )
+    .expect("the profile store is written");
+    assert!(
+        stored.contains("rt-new"),
+        "the minted pair saved before the daemon died: {stored}"
+    );
+    assert!(
+        serve_stop_drain_logged(&log_path),
+        "the drain logged its wait: {}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
+
+    // The follow-up fetch after a landed rotation races the exit, so only the
+    // spend itself is pinned.
+    let requests = stub.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.as_str() == "POST /v1/oauth/token")
+            .count(),
+        1,
+        "exactly one token spend: {requests:?}"
+    );
+    stopped
 }
 
 /// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
@@ -3059,6 +4784,86 @@ pub(crate) fn wait_for_lines(dir: &Path, want: usize, timeout: std::time::Durati
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// A Claude Code background job record, in the key set and order a live
+/// `claude --bg` wrote on 2.1.303 (`~/.claude/jobs/<id>/state.json`, captured
+/// 2026-10-19), naming `config_dir` as the job's `providerEnv.CLAUDE_CONFIG_DIR`.
+/// Returns the job dir, which a test removes to pose `claude rm`.
+pub(crate) fn write_claude_job(home: &Path, id: &str, config_dir: &Path) -> PathBuf {
+    write_claude_job_in(home, id, config_dir, "working", None)
+}
+
+/// [`write_claude_job`] with the record's `state` and `firstTerminalAt` set.
+/// Shapes captured on 2.1.304 (2026-10-20): `claude stop` writes `"stopped"`
+/// with `firstTerminalAt` stamped, and `claude attach` on that stopped job
+/// revives it as `"running"` with the stamp kept.
+pub(crate) fn write_claude_job_in(
+    home: &Path,
+    id: &str,
+    config_dir: &Path,
+    state: &str,
+    first_terminal_at: Option<&str>,
+) -> PathBuf {
+    let dir = home.join(".claude").join("jobs").join(id);
+    std::fs::create_dir_all(dir.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "state": state,
+        "detail": "(idle — send a prompt to start)",
+        "tempo": "blocked",
+        "needs": "send a prompt to start",
+        "output": null,
+        "children": null,
+        "linkScanOffset": 0,
+        "template": "bg",
+        "respawnFlags": [],
+        "providerEnv": { "CLAUDE_CONFIG_DIR": config_dir.to_string_lossy() },
+        "intent": "",
+        "sessionId": format!("{id}-0a6e-4b11-883e-fca3a218ae52"),
+        "resumeSessionId": format!("{id}-0a6e-4b11-883e-fca3a218ae52"),
+        "daemonShort": id,
+        "cwd": "/home/dev/proj",
+        "createdAt": "2026-10-19T05:25:39.445Z",
+        "updatedAt": "2026-10-19T05:25:39.445Z",
+        "firstTerminalAt": first_terminal_at,
+        "backend": "daemon",
+    });
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write job");
+    dir
+}
+
+/// [`write_claude_job`] with the record's `respawnFlags` set to `flags`. A
+/// tollgate-launched job carries `["--system-prompt-file", <path>, "--settings",
+/// <spawn-settings file>]` there (captured 2026-10-20, 2.1.304); a test passes
+/// any JSON value to pose a retyped field.
+pub(crate) fn write_claude_job_flags(
+    home: &Path,
+    id: &str,
+    config_dir: &Path,
+    flags: serde_json::Value,
+) -> PathBuf {
+    let dir = write_claude_job(home, id, config_dir);
+    let path = dir.join("state.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read job")).expect("parse job");
+    record["respawnFlags"] = flags;
+    std::fs::write(&path, serde_json::to_vec(&record).expect("encode job")).expect("write job");
+    dir
+}
+
+/// The `respawnFlags` a `tollgate start <p> -- --bg` job carries for `settings`,
+/// in the captured order.
+pub(crate) fn respawn_flags_naming(settings: &Path) -> serde_json::Value {
+    serde_json::json!([
+        "--system-prompt-file",
+        "/home/dev/.claude/system-prompt/cc-sys.md",
+        "--settings",
+        settings.to_string_lossy(),
+    ])
 }
 
 /// The `--seq` value of one recorded report line (the token after the flag).

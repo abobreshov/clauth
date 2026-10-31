@@ -309,6 +309,8 @@ pub(crate) fn prepare(sid: &str, profile: &str, conversation: Option<&str>) -> R
         &target,
         crate::runtime::Isolation::Shared,
         row.follows_chain,
+        // A relaunch resumes a foreground shared session: no background flag.
+        &[],
     ) {
         return Err(refuse(sid, format!("{e:#}")));
     }
@@ -812,6 +814,8 @@ fn validate(taken: &Path) -> Result<(RelaunchRequest, PathBuf), String> {
         &target,
         crate::runtime::Isolation::Shared,
         req.follows_chain,
+        // A relaunch resumes a foreground shared session: no background flag.
+        &[],
     )
     .map_err(|e| format!("{e:#}"))?;
     if !req.cwd.is_dir() {

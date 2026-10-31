@@ -468,7 +468,7 @@ fn g13_env_audit(
         Ok(())
     })?;
     Ok(Some(format!(
-        "tollgate: note — {var} changed outside tollgate; re-attributed"
+        "tollgate: note: {var} changed outside tollgate; re-attributed"
     )))
 }
 
@@ -654,7 +654,7 @@ fn herdr_integration(paths: &HermesPaths) {
         "herdr integration install",
     ) {
         Ok(out) if out.status.success() => {}
-        _ => errln!("tollgate: warning — `{text}` did not succeed; run it by hand"),
+        _ => errln!("tollgate: warning: `{text}` did not succeed; run it by hand"),
     }
 }
 
@@ -948,7 +948,7 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
 const SQLITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The warning the post-session check prints (§4.4 step 6.2).
-pub(crate) const ANTHROPIC_SESSION_WARNING: &str = "tollgate: WARNING — this Hermes session \
+pub(crate) const ANTHROPIC_SESSION_WARNING: &str = "tollgate: WARNING: this Hermes session \
      called Anthropic (the in-session /model picker); it had no Claude credentials to use, but \
      check the session";
 
@@ -965,7 +965,7 @@ pub(crate) fn post_session_state_db_skip_warning(home: &Path) -> Option<String> 
         return None;
     };
     Some(format!(
-        "tollgate: WARNING — skipped Hermes state.db at {} because it is {kind}; Anthropic session evidence is unavailable",
+        "tollgate: WARNING: skipped Hermes state.db at {} because it is {kind}; Anthropic session evidence is unavailable",
         db.display()
     ))
 }

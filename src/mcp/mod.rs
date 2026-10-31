@@ -15,8 +15,7 @@ mod herdr_report;
 pub(crate) mod jobs;
 mod render;
 
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -38,10 +37,10 @@ use sha2::Digest;
 
 use crate::logline::logline;
 use crate::outln;
-use crate::profile::{AppConfig, Profile, ProfileName, load_config};
+use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
 use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, remove_profile_cache,
-    write_auth_expired,
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
+    write_dead_key,
 };
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
@@ -50,6 +49,7 @@ use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{
     UsageInfo, UsageWindow, now_epoch_secs, now_ms, profile_credential_fingerprint,
+    read_third_party_for_compare, third_party_identity,
 };
 use digest::{DigestMode, DigestTracker};
 use render::{ProfileSnapshot, RosterRank};
@@ -123,31 +123,15 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
         .collect()
 }
 
-/// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
-/// cache (no caching across tool calls per the design). The roster's own rank
-/// reads this: it asks for the two figures it sorts on, and consults the
-/// third-party cache itself for an account that has no such window. A window
-/// whose reset has passed reads `None` (#74) — the same liveness the published
-/// `windows` array filters on — so a lapsed 5h at the cap ranks on the next
-/// live figure instead of sorting the account to the bottom of the roster.
-/// The shared cache selector gates the read itself: a retyped profile's
-/// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
-/// so this reader never opens it — the same cache-split `published_windows`
-/// reads by, whose third-party branch derives from the account's own cache —
-/// and the rank falls to the provider's own bars or wallet (#74).
-fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
-    let live = |w: &Option<UsageWindow>| {
-        w.as_ref()
-            .filter(|w| crate::profile_json::window_row_is_live(w))
-            .cloned()
-    };
+/// The cached OAuth usage block for `name`, or `None` when the shared cache
+/// selector says this name's cache is third-party: a retyped profile's leftover
+/// `usage_cache.json` is a fossil from its OAuth life, not headroom, so this
+/// reader never opens it — the same cache-split `published_windows` reads by.
+fn load_usage(name: &ProfileName) -> Option<UsageInfo> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
-        return (None, None);
+        return None;
     }
-    match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
-        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
-        None => (None, None),
-    }
+    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
 }
 
 /// The discriminated headroom payload every MCP surface renders through
@@ -189,6 +173,9 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
             // the roster and the delegate reply render beside the balance,
             // the way they already share `fetched_secs_ago`.
             if let Some(rate) = wallet_rate {
+                // `amount` and `per_day` are one wallet's two figures, so the
+                // runway never divides one wallet's balance by another's burn.
+                payload["wallet_balance"] = serde_json::json!(rate.amount);
                 payload["wallet_burn_per_day"] = serde_json::json!(rate.per_day);
                 payload["wallet_burn_currency"] = serde_json::json!(rate.currency);
             }
@@ -234,20 +221,50 @@ fn quota_payload(name: &ProfileName) -> serde_json::Value {
     dated_windows_payload(&profile_windows_for(name))
 }
 
+/// The `models` payload for a row the CALL NAMED — a `names` filter or the
+/// session scope. The unfiltered roster never carries it, so its rows stay
+/// byte-identical, and only a reply that names the account shows which model
+/// each tier maps to. Only set binds ride: a tier the config leaves unbound —
+/// or holds as an empty string, which is no mapping — is omitted rather than
+/// rendered as an empty `tier -> `.
+fn model_binds_row(p: &Profile) -> Option<serde_json::Value> {
+    let mut binds = serde_json::Map::new();
+    for (tier, id) in [
+        ("default", &p.models.default),
+        ("opus", &p.models.opus),
+        ("sonnet", &p.models.sonnet),
+        ("haiku", &p.models.haiku),
+        ("fable", &p.models.fable),
+        ("subagent", &p.models.subagent),
+    ] {
+        if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+            binds.insert(tier.to_string(), serde_json::json!(id));
+        }
+    }
+    (!binds.is_empty()).then_some(serde_json::Value::Object(binds))
+}
+
 /// One roster row for `p`, the shape both `profiles` scopes render through
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
-fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
+fn profile_row(
+    p: &Profile,
+    config: &AppConfig,
+    now: i64,
+    jobs: &crate::claude_jobs::JobTrees,
+    handed_off: &HashSet<String>,
+) -> serde_json::Value {
     let name = &p.name;
     // One read of this account's own cache, feeding the one carrier its figures
     // ride in. Reading it twice (once to date the row, once for the headline)
     // cost a second parse of the same file on every row of the roster.
+    let windows = profile_windows(p);
     let mut row = serde_json::json!({
         "name": name,
         "active": config.is_active(name),
         "provider": provider_label(p),
         "tier": tier_label(p),
-        "windows": row_windows_payload(&profile_windows(p)),
+        "windows": row_windows_payload(&windows),
     });
     // Host, not the full endpoint: the host is the identifying half, and the path
     // costs tokens on every row without adding to it. For which hosts then read
@@ -264,7 +281,7 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // Both of these are absent unless they say something. Emitted
     // unconditionally they were 39% of a 27-profile response, nearly all of it
     // `false` and rows carrying no warning.
-    if crate::runtime::has_live_session(name) {
+    if crate::runtime::has_live_session_in(name, jobs, handed_off) {
         row["has_live_session"] = serde_json::json!(true);
     }
     let warnings = throughput_warnings(name, now);
@@ -277,6 +294,21 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // predicate — see `preflight_target`.
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
+    }
+    // A credential the provider already refused — a third-party api KEY, or a
+    // setup token its sessions run on — is a delegate target that refuses at
+    // the spawn gate, so this flags it before the picker spends the call. The
+    // predicate is the delegate guard's own — see `preflight_target` — and the
+    // state word splits by `usage::dead_login_is_setup_token`, so the row
+    // names the credential the account actually holds. Read off the durable
+    // per-credential verdict, never the balance cache: a dropped cache leaves
+    // the verdict standing, and a re-captured key retires it.
+    if crate::fallback::third_party_key_rejected(p, name) {
+        if crate::usage::dead_login_is_setup_token(p) {
+            row["token_rejected"] = serde_json::json!(true);
+        } else {
+            row["key_rejected"] = serde_json::json!(true);
+        }
     }
     // Also marked rather than filtered: a silently missing row reads exactly
     // like "that profile is gone", which the unknown-`names` refusal already
@@ -299,36 +331,72 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // asks; re-deriving it off this row's own cache read would save a parse
     // and fork the answer, which is the trade the `list` table already made
     // the other way.
-    if crate::profile_json::is_canceled_cached(name) {
+    // An organization's refusal rides here the same way, named apart: tollgate
+    // refuses no delegate for it, though the organization refuses the account
+    // itself.
+    if crate::profile_json::is_org_refused_cached(name) {
+        row["org_refused"] = serde_json::json!(true);
+    } else if crate::profile_json::is_canceled_cached(name) {
         row["canceled"] = serde_json::json!(true);
+    }
+    // Emitted only when true, beside `canceled`: a spent usage-credit cap. The
+    // flag keys on `credit_capped()` alone — gate on or off — because it is a
+    // state the picker must see; only the roster RANK is gated by
+    // `check_credit_cap` (`roster_rank_for`). An own-endpoint account never
+    // spends its OAuth usage credits, so its row carries no flag: the flag
+    // describes a refusal the pre-flight can make, and that account refuses
+    // nothing. It reads the cap off the windows payload's own OAuth
+    // `UsageInfo`, so the row pays no second cache parse and the flag agrees
+    // with the figures beside it.
+    if let ProfileWindows::Oauth { usage, .. } = &windows
+        && !crate::claude::has_own_inference_endpoint(p)
+        && usage.as_ref().is_some_and(|u| u.credit_capped())
+    {
+        row["credit_capped"] = serde_json::json!(true);
     }
     row
 }
 
-/// The roster's sort key for one profile. A real window first (5h, the pool a
-/// `delegate` actually competes for, then 7d), then a third-party provider's own
-/// cached bars, then the first funded wallet off its cached rows — zero-amount
-/// wallets drop, the same selection the overview balance column makes.
-fn roster_rank(name: &ProfileName) -> RosterRank {
-    let (five_h, seven_d) = load_windows(name);
+/// The roster's sort key for one profile, over a caller-supplied usage so a
+/// caller that already holds the reading pays no second parse. A real window
+/// first (5h, the pool a `delegate` actually competes for, then 7d), then a
+/// third-party provider's own cached bars, then the first funded wallet off its
+/// cached rows — zero-amount wallets drop, the same selection the overview
+/// balance column makes. A window whose reset has passed reads `None` (#74) —
+/// the same liveness the published `windows` array filters on — so a lapsed 5h
+/// at the cap ranks on the next live figure instead of sorting the account to
+/// the bottom of the roster. A `None` usage falls to the provider's own bars or
+/// wallet.
+fn roster_rank_with(name: &ProfileName, usage: Option<&UsageInfo>) -> RosterRank {
+    let live = |w: &Option<UsageWindow>| {
+        w.as_ref()
+            .filter(|w| crate::profile_json::window_row_is_live(w))
+            .cloned()
+    };
+    let (five_h, seven_d) = match usage {
+        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
+        None => (None, None),
+    };
     if let Some(w) = five_h.or(seven_d) {
         return RosterRank::Window(100.0 - w.utilization);
     }
     let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE) else {
         return RosterRank::Unknown;
     };
-    if let Some(bar) = stats
-        .bars
-        .iter()
-        .filter(|b| crate::profile_json::usage_bar_is_live(b))
-        .find(|b| b.label == "5h")
-        .or_else(|| {
-            stats
-                .bars
-                .iter()
-                .filter(|b| crate::profile_json::usage_bar_is_live(b))
-                .find(|b| b.label == "7d")
-        })
+    // Rank the third-party arm off its derived windows — live 5h first (the
+    // pool a `delegate` actually competes for), else its live long window (7d,
+    // else the provider-marked monthly quota), then the wallet — the same
+    // derivation the list's long column reads, so a bar the roster ranks the
+    // account on cannot render as dashes there and vice versa. Each figure is
+    // the first LIVE bar under its label (the shared
+    // [`crate::profile_json::live_bar`]), as base read raw bars: a duplicate
+    // label resolves to its live bar, never the first, possibly lapsed, one.
+    if let Some(bar) = crate::profile_json::live_bar(&stats, crate::usage::LABEL_5H) {
+        return RosterRank::Window(100.0 - bar.pct);
+    }
+    if let Some(info) = stats.windows_info()
+        && let Some((label, _)) = info.long_window()
+        && let Some(bar) = crate::profile_json::live_bar(&stats, label)
     {
         return RosterRank::Window(100.0 - bar.pct);
     }
@@ -339,6 +407,24 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
             currency: w.currency,
             amount: w.amount,
         })
+}
+
+/// [`roster_rank_with`] demoted to [`RosterRank::Capped`] while the profile's credit
+/// gate is on, its cached usage reads the cap as spent, and the account does
+/// not serve its own inference — the ruling that ranks a capped account after
+/// every `Unknown`. The row's own flag shows whenever the cap reads spent,
+/// gate on or off, and only on an account the pre-flight could refuse; the
+/// RANK is what the gate governs. Loads the usage once and hands it to
+/// [`roster_rank_with`], so one rank costs one cache parse, not two.
+fn roster_rank_for(p: &Profile) -> RosterRank {
+    let usage = load_usage(&p.name);
+    if p.check_credit_cap
+        && !crate::claude::has_own_inference_endpoint(p)
+        && usage.as_ref().is_some_and(|u| u.credit_capped())
+    {
+        return RosterRank::Capped;
+    }
+    roster_rank_with(&p.name, usage.as_ref())
 }
 
 /// A `delegate` argument/validation refusal: one `{is_error, result}` envelope
@@ -354,8 +440,14 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 /// leads, then the fix clause. Placement rule 4's corollary makes the refusal
 /// carry the whole lesson, and the clause is a closed set composed on
 /// [`ProfileNotFoundFix`] so the call sites cannot split the server's refusal
-/// vocabulary.
+/// vocabulary. Each name is echoed as its own token: a caller-supplied name can
+/// carry a control character, and a list is never cut mid-name.
 fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
+    let names = names
+        .split(", ")
+        .map(echo_name)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("profile not found: {names}; {}", fix.clause())
 }
 
@@ -479,6 +571,15 @@ fn result_file_path(id: &str) -> std::result::Result<std::path::PathBuf, String>
     Ok(dir.join(format!("{id}.txt")))
 }
 
+/// The sha256 hex of some bytes, lowercase — the figure a result-file reply
+/// carries so the model can check the file it Reads.
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Write one folded envelope to its result file atomically (0o700 dir, 0o600
 /// file) and return its path and sha256 hex.
 fn write_result_file(
@@ -487,13 +588,13 @@ fn write_result_file(
 ) -> std::result::Result<(std::path::PathBuf, String), String> {
     let path = result_file_path(id)?;
     let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
-    let digest = sha2::Sha256::digest(&bytes);
-    let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let hash = sha256_hex(&bytes);
     crate::profile::atomic_write_600(&path, &bytes).map_err(|e| e.to_string())?;
     Ok((path, hash))
 }
 
-/// The short reply a `result: "file"` delegate returns: path, sha256, cost line.
+/// The short reply a `result: "file"` delegate returns: path, sha256, the
+/// result's first line, cost line.
 fn result_file_reply(
     path: &std::path::Path,
     sha256: &str,
@@ -831,9 +932,9 @@ pub(crate) struct DelegateArgs {
     /// raw `--permission-mode` in `args`.
     permission_mode: Option<String>,
     /// Where the result envelope goes. `result: "file"` writes the envelope
-    /// under `~/.tollgate` and returns its path, sha256 and cost line only; the
-    /// model Reads the file for the body. Unset (default): the envelope rides
-    /// the reply inline.
+    /// under `~/.tollgate` and returns its path, sha256, cost line and the
+    /// result's first line; the model Reads the file for the body. Unset
+    /// (default): the envelope rides the reply inline.
     result: Option<String>,
     /// Additional environment variables passed to the delegate session. Values
     /// you set for `CLAUDE_CONFIG_DIR`, `TOLLGATE_MCP_DEPTH` and
@@ -843,9 +944,11 @@ pub(crate) struct DelegateArgs {
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after the `claude -p` tollgate invokes. Your
     /// arguments come last, so they win where a flag repeats (including
-    /// `--model` when `model` is set). `--session-id`, `--resume` and
-    /// `--fork-session` are refused: tollgate pins the session id and exports it
-    /// as `TOLLGATE_DELEGATE_SESSION_ID`; resume through `session_id`.
+    /// `--model` when `model` is set), except a `--settings` before `--`, which
+    /// tollgate merges into its own settings file when it passes one.
+    /// `--session-id`, `--resume`, `--fork-session`, `--from-pr` and
+    /// `--teleport` are refused: tollgate pins the session id and exports it as
+    /// `TOLLGATE_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -892,10 +995,14 @@ impl TollgateServer {
     #[tool(
         description = "List of tollgate accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `no api key` or `subscription canceled`; when `delegate` \
-refuses an account, its refusal names the state and the fix. `subscription canceled` never means \
-a refusal, and `login expired` does not mean one on an account that has its own `host` and api \
-key, which delegates on that key."
+can carry `disabled`, `login expired`, `org refused`, `no api key`, `key rejected`, `token rejected`, `credit cap spent` or \
+`subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
+fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
+account that has its own `host` and api key, which delegates on that key. `org refused` stops no \
+delegate on its own either: the account still answers or refuses each request itself. \
+`credit cap spent` \
+refuses a delegate whose model bills usage credits, and one whose model tollgate cannot tell: none \
+named, one it cannot place, or an agent run with no model named."
     )]
     async fn profiles(
         &self,
@@ -910,7 +1017,8 @@ key, which delegates on that key."
             let payload = serde_json::json!({
                 "ok": false,
                 "reason": format!(
-                    "unrecognized scope \"{raw}\": accepted \"all\" and \"session\""
+                    "unrecognized scope \"{}\": accepted \"all\" and \"session\"",
+                    echo_name(raw)
                 ),
             });
             let prose = render::profiles_prose(&payload);
@@ -969,6 +1077,12 @@ key, which delegates on that key."
             }
         };
 
+        let jobs = crate::claude_jobs::job_trees();
+        let handed_off = crate::runtime::handed_off_live_members(&jobs);
+        // Binds ride only a reply that names its accounts: a `names` filter
+        // renders every row it names, so each carries them; the unfiltered
+        // roster names none and carries none.
+        let named = wanted.is_some();
         let profiles: Vec<serde_json::Value> = config
             .profiles
             .iter()
@@ -977,7 +1091,13 @@ key, which delegates on that key."
                     .as_ref()
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
-            .map(|p| profile_row(p, &config, now))
+            .map(|p| {
+                let mut row = profile_row(p, &config, now, &jobs, &handed_off);
+                if let Some(binds) = named.then(|| model_binds_row(p)).flatten() {
+                    row["models"] = binds;
+                }
+                row
+            })
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
@@ -995,7 +1115,14 @@ key, which delegates on that key."
         if let Some((name, source)) = resolved.as_ref()
             && let Some(p) = config.find(&ProfileName::from(name.clone()))
         {
-            let mut row = profile_row(p, config, now_epoch_secs());
+            let jobs = crate::claude_jobs::job_trees();
+            let handed_off = crate::runtime::handed_off_live_members(&jobs);
+            let mut row = profile_row(p, config, now_epoch_secs(), &jobs, &handed_off);
+            // The session scope names its one account by construction, so its
+            // row carries the binds the way a `names`-filtered row does.
+            if let Some(binds) = model_binds_row(p) {
+                row["models"] = binds;
+            }
             row["source"] = serde_json::json!(source.as_str());
             rows.push(row);
         }
@@ -1116,6 +1243,7 @@ terminal; this tool never relaunches."
                 &ProfileName::from(name.clone()),
                 on_divergence,
                 crate::oauth::refresh_result,
+                None,
             );
             (config, outcome)
         })
@@ -1125,7 +1253,7 @@ terminal; this tool never relaunches."
         let config = config.lock().expect("config mutex poisoned");
 
         match outcome {
-            Ok((previous, active)) => {
+            Ok((previous, active, notice)) => {
                 // The mutation ran: reseed silently (`DigestMode::Reseed`).
                 let payload = fold_active_live_usage(
                     serde_json::json!({
@@ -1137,6 +1265,10 @@ terminal; this tool never relaunches."
                     DigestMode::Reseed(&self.digest),
                 );
                 let mut prose = render::switch_profile_prose(&payload);
+                if let Some(notice) = notice {
+                    prose.push_str("\n\n");
+                    prose.push_str(&notice);
+                }
                 prose.push_str("\n\n");
                 prose.push_str(&session_note);
                 Ok(CallToolResult::success(single_block(prose)))
@@ -1215,11 +1347,13 @@ across accounts."
         };
         if depth >= 1 {
             // The refusal fires before target validation, but the caller's own
-            // spelling is known here: name the targets it asked for. `profiles`
-            // is an optional key, present only when the caller named one.
+            // spelling is known here: name the targets it asked for, each
+            // echoed flat and capped so no name it sent can forge a line in
+            // the payload or run unbounded. `profiles` is an optional key,
+            // present only when the caller named one.
             let payload = match &profiles {
                 Some(names) => serde_json::json!({
-                    "profiles": names,
+                    "profiles": names.iter().map(|n| echo_name(n)).collect::<Vec<_>>(),
                     "is_error": true,
                     "result": "delegation depth exceeded (max 1)",
                 }),
@@ -1231,6 +1365,14 @@ across accounts."
             let prose = render::delegate_refusal_prose(&payload);
             return Ok(CallToolResult::error(single_block(prose)));
         }
+
+        // A delegate mints a job record, and a mint must not stamp an owner
+        // while the startup marker registration is still deciding. The wait
+        // runs HERE, before any reserve or spawn, and yields to the runtime
+        // between polls: the server runs on a single-threaded runtime, so the
+        // blocking wait this replaces stalled every other request (a
+        // `profiles` call, a cancel, a monitor check) for its whole bound.
+        jobs::wait_for_server_marker_async(jobs::marker_wait_deadline()).await;
 
         let Some(raw_prompt) = prompt.as_deref() else {
             return Ok(delegate_refusal(
@@ -1269,17 +1411,21 @@ across accounts."
         // exports it as `TOLLGATE_DELEGATE_SESSION_ID`, which hook exemptions
         // key on. A raw flag landing after the pin (caller `args` run last)
         // would move the child off that id and silently break the equality,
-        // so refuse every spelling that can name or fork a session.
+        // and a resume form tollgate cannot pin would run a session it never
+        // judged. A flag that resumes a session is refused whatever it is.
         if args.as_ref().is_some_and(|a| {
             args_carry_flag(a, "--session-id")
                 || args_carry_flag(a, "--resume")
                 || args_carry_flag(a, "-r")
                 || args_carry_flag(a, "--fork-session")
+                || args_carry_flag(a, "--from-pr")
+                || args_carry_flag(a, "--teleport")
         }) {
             return Ok(delegate_refusal(
-                "`args` cannot carry `--session-id`, `--resume`/`-r` or `--fork-session`: \
-                 tollgate pins the delegate's session id and exports it as \
-                 `TOLLGATE_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
+                "`args` cannot carry `--session-id`, `--resume`/`-r`, `--fork-session`, \
+                 `--from-pr` or `--teleport`: tollgate pins the delegate's session id and \
+                 exports it as `TOLLGATE_DELEGATE_SESSION_ID`; resume through the `session_id` \
+                 argument",
             ));
         }
         // The result mode is a closed set: unset means inline, `"file"` means
@@ -1289,12 +1435,18 @@ across accounts."
             Some("file") => true,
             Some(other) => {
                 return Ok(delegate_refusal(&format!(
-                    "unrecognized result \"{other}\": accepted \"file\""
+                    "unrecognized result \"{}\": accepted \"file\"",
+                    echo_name(other)
                 )));
             }
         };
 
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let isolation = if isolated.unwrap_or(false) {
+            Isolation::Isolated
+        } else {
+            Isolation::Shared
+        };
 
         // Which accounts to spend, in canonical spelling, resolved BEFORE any
         // spawn or read. One name is one target (blocking unless `background`);
@@ -1340,7 +1492,7 @@ across accounts."
                         return Ok(delegate_refusal(&format!(
                             "can't tell which account session '{}' ran on; pass `profiles` \
                              naming the account to spend",
-                            truncate(id, 64)
+                            echo_name(id)
                         )));
                     }
                 },
@@ -1351,7 +1503,44 @@ across accounts."
                 }
             }
         } else {
-            match resolve_fanout(&config, &raw) {
+            // The fan-out pre-flight's demand inputs, read once for the whole
+            // set of members: the outgoing env keys the demand resolves from,
+            // and the credit-billed families each demand is judged against. A
+            // blocking single target never reaches this arm, so it pays no
+            // read it would not use.
+            let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+            let credit_billed = crate::claude_json::credit_billed_families();
+            // A fan-out carrying `session_id` resumes that session on every
+            // member, so its pre-flight judges the resume's own workspace,
+            // exactly as the single-background arm does. Best-effort: an
+            // unresolvable transcript falls back to the caller cwd; the actual
+            // spawn refuses it for itself. The resumed session's agent rides in
+            // as `--agent` (the same fold `delegate_families` makes), so the
+            // demand below sees it without a second resume parameter.
+            let (workspace, resume_agent) =
+                resolve_resume_workspace_off_runtime(session_id.as_deref())
+                    .await
+                    .map(|(ws, agent)| (Some(ws), agent))
+                    .unwrap_or((None, None));
+            let mut demand_args = args.clone().unwrap_or_default();
+            if let Some(agent) = resume_agent
+                && crate::start::parsed_agent_arg(&demand_args).is_none()
+            {
+                demand_args.push("--agent".to_owned());
+                demand_args.push(agent);
+            }
+            match resolve_fanout(
+                &config,
+                &raw,
+                model.as_deref(),
+                subagent_type.as_deref(),
+                isolation,
+                &stale_env_keys,
+                &credit_billed,
+                &demand_args,
+                env.as_ref().unwrap_or(&HashMap::new()),
+                spawn_cwd(workspace, cwd.as_deref()).as_deref(),
+            ) {
                 Ok(names) => Target::Many(names),
                 Err(reason) => return Ok(delegate_refusal(&reason)),
             }
@@ -1371,11 +1560,6 @@ across accounts."
             raw_prompt.to_string().into()
         };
 
-        let isolation = if isolated.unwrap_or(false) {
-            Isolation::Isolated
-        } else {
-            Isolation::Shared
-        };
         let origin = DelegateOrigin::resolve(&config, session_id.as_deref(), cwd.as_deref());
 
         if background.unwrap_or(false) {
@@ -1394,15 +1578,54 @@ across accounts."
                             None,
                         )
                     })?;
-                    if let Err(reason) = preflight_target(target, &config, &name_pn) {
+                    // The single-background arm's pre-flight demand inputs,
+                    // read only here: a blocking target re-reads them inside
+                    // `run_delegate`, so a handler-wide read would parse
+                    // `~/.claude.json` twice for that path.
+                    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+                    let credit_billed = crate::claude_json::credit_billed_families();
+                    let extra_args = args.unwrap_or_default();
+                    let caller_env = env.unwrap_or_default();
+                    // A resume spawns in the transcript's workspace, so the
+                    // demand must read that directory's project settings, not
+                    // the caller's cwd (mirrors `run_delegate`). Best-effort:
+                    // an unresolvable transcript falls back to the caller cwd —
+                    // the spend gates here do not own the resume resolution,
+                    // which the actual spawn refuses for itself. The resumed
+                    // session's own agent is folded into the demand too.
+                    let (workspace, resume_agent) =
+                        resolve_resume_workspace_off_runtime(session_id.as_deref())
+                            .await
+                            .map(|(ws, agent)| (Some(ws), agent))
+                            .unwrap_or((None, None));
+                    let (models, families, agent_without_model, unknown) = delegate_families(
+                        target,
+                        isolation,
+                        model.as_deref(),
+                        subagent_type.as_deref(),
+                        &extra_args,
+                        &caller_env,
+                        &stale_env_keys,
+                        spawn_cwd(workspace, cwd.as_deref()).as_deref(),
+                        resume_agent.as_deref(),
+                    );
+                    if let Err(reason) = preflight_target(
+                        target,
+                        &config,
+                        &name_pn,
+                        &models,
+                        &families,
+                        agent_without_model.as_deref(),
+                        unknown,
+                        &credit_billed,
+                    ) {
                         return Ok(delegate_refusal(&reason));
                     }
-                    let extra_args = args.unwrap_or_default();
                     let opts = BackgroundOpts {
                         prompt,
                         model,
                         cwd,
-                        env: env.unwrap_or_default(),
+                        env: caller_env,
                         extra_args,
                         resume: session_id.clone(),
                         subagent_type: subagent_type.clone(),
@@ -1839,8 +2062,10 @@ across accounts."
     #[tool(
         description = "Check, collect, or stop a background `delegate` by providing `job_ids`. \
 With `job_ids`: a running job reports its account, elapsed time, and its latest output. A \
-finished job also hands back its result. With `job_ids` and `cancel: true`, the named jobs are \
-asked to stop and each hands back whatever it produced.\n\n\
+finished job also hands back its result; a batch over finished jobs writes each envelope to a \
+result file and reports one compact entry per job — status, cost, path, sha256 and the \
+result's first line; Read the file for the body. With `job_ids` and `cancel: true`, the named \
+jobs are asked to stop and each hands back whatever it produced.\n\n\
 Without `job_ids`: lists at most 10 delegates tollgate holds, live runs first. An interrupted \
 blocking `delegate` (its caller walked away mid-run) keeps running as a background job, and that \
 listing is where you find its id."
@@ -1915,6 +2140,12 @@ const DELEGATE_SESSION_ENV: &str = "TOLLGATE_DELEGATE_SESSION_ID";
 
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long the post-exit take waits, in total, for the stdout and stderr
+/// readers' EOF signals: a live child's pipes drain in microseconds, so the
+/// grace only covers reader scheduling, never a grandchild still holding a
+/// pipe open.
+const PIPE_EOF_GRACE: Duration = Duration::from_millis(250);
 
 /// Everything a blocking `delegate` call needs from its own request: the peer
 /// plus the progress token it supplied, and the throttle clock and monotonic
@@ -2694,7 +2925,7 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
             // Eviction is the claim's job, already done: an owned record's
             // file is consumed, a refused one renamed back — either way this
             // render is the one delivery of it.
-            let (blocks, is_error) = render_done_envelope(record, digest);
+            let (blocks, is_error) = render_done_envelope(&job_id, record, digest);
             if is_error {
                 Ok(CallToolResult::error(blocks))
             } else {
@@ -2762,27 +2993,17 @@ async fn monitor_batch(
                 {
                     orphan_reasons.push(reason);
                 }
-                serde_json::json!({ "job_id": id, "status": "unknown" })
+                serde_json::json!({ "job_id": echo_name(&id), "status": "unknown" })
             }
-            WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
+            WaitOutcome::Running(record) => running_payload(&echo_name(&id), &record, now_ms()),
             WaitOutcome::Done(record) => {
                 // An owned record's file is already evicted by its claim; a
                 // refused one (mismatched self-report) was renamed back and
                 // renders without eviction — the stored-id rule.
                 // No per-result digest: one rides the whole reply below.
-                let (mut payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
+                let (payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
                 any_error |= is_error;
-                // The folded envelope is always an object (a non-object
-                // self-report is wrapped under `result` first), so the caller's
-                // per-id markers cannot collide with delegate output.
-                if let serde_json::Value::Object(map) = &mut payload {
-                    map.insert("job_id".to_string(), serde_json::Value::String(id.clone()));
-                    map.insert(
-                        "status".to_string(),
-                        serde_json::Value::String("done".to_string()),
-                    );
-                }
-                payload
+                batch_done_entry(&id, payload, is_error)
             }
         };
         results.push(entry);
@@ -2816,6 +3037,67 @@ async fn monitor_batch(
     } else {
         Ok(CallToolResult::success(blocks))
     }
+}
+
+/// The reply entry a batch carries for one finished job: the folded envelope
+/// goes to the job's result file through the same writer `result: "file"` uses,
+/// and the entry keeps only the compact fields — status, cost, path, sha256 and
+/// the result's first line — because the file is the body's one delivery and a
+/// batch of oversized envelopes must not inline their bodies.
+///
+/// The file is keyed by the id the job was COLLECTED under, never the record's
+/// stored `job_id`: a refused record's stored id names some other job's file,
+/// and a write there would poison that job's result. A crashed tombstone
+/// carries no body worth a Read and a failed or impossible write must never
+/// lose the one — both render the inline envelope entry, unchanged.
+fn batch_done_entry(id: &str, payload: serde_json::Value, is_error: bool) -> serde_json::Value {
+    if !payload
+        .get("crashed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && jobs::is_safe_job_id(id)
+    {
+        match write_result_file(id, &payload) {
+            Ok((path, sha256)) => {
+                let mut entry = serde_json::json!({
+                    "job_id": echo_name(id),
+                    "status": "done",
+                    "is_error": is_error,
+                    "result_file": path.display().to_string(),
+                    "sha256": sha256,
+                    "first_line": render::result_first_line(&payload),
+                });
+                // The compact row carries the cost clause's own two fields;
+                // the full live-usage fold stays in the file with the body.
+                if let Some(cost) = payload.get("total_cost_usd") {
+                    entry["total_cost_usd"] = cost.clone();
+                }
+                if let Some(endpoint) = payload.get("live_usage").and_then(|lu| lu.get("endpoint"))
+                {
+                    entry["live_usage"] = serde_json::json!({ "endpoint": endpoint });
+                }
+                return entry;
+            }
+            Err(reason) => {
+                logline!("tollgate: result file write failed: {reason}; falling back to inline")
+            }
+        }
+    }
+    // The folded envelope is always an object (a non-object self-report is
+    // wrapped under `result` first), so the caller's per-id markers cannot
+    // collide with delegate output.
+    let mut payload = payload;
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(
+            "job_id".to_string(),
+            serde_json::Value::String(echo_name(id)),
+        );
+        map.insert(
+            "status".to_string(),
+            serde_json::Value::String("done".to_string()),
+        );
+    }
+    payload
 }
 
 /// Fold a finished job's envelope the way every delivery path does, returning
@@ -2864,11 +3146,35 @@ fn fold_done_envelope(
 }
 
 /// Render a finished job's envelope into its response blocks and error flag.
+/// A collect of a `result: "file"` job answers with the path the finalize
+/// already wrote — file, sha256, first line — instead of inlining the body a
+/// second time; the file is keyed by the id the job was COLLECTED under, never
+/// the record's stored `job_id`, for the same refused-record reason
+/// [`batch_done_entry`] documents. A missing, unreadable or crash-time
+/// result file falls back to the inline envelope, never losing the body.
 fn render_done_envelope(
+    collected_id: &str,
     record: jobs::JobRecord,
     digest: &DigestTracker,
 ) -> (Vec<ContentBlock>, bool) {
     let (payload, is_error) = fold_done_envelope(&record, DigestMode::Report(digest));
+    if !record.crashed
+        && jobs::is_safe_job_id(collected_id)
+        && let Ok(path) = result_file_path(collected_id)
+        && path.exists()
+        && let Ok(bytes) = std::fs::read(&path)
+    {
+        let hash = sha256_hex(&bytes);
+        let mut prose = render::result_file_prose(&path.display().to_string(), &hash, &payload);
+        // The fold above REPORTED the digest, so the compact reply renders it:
+        // a delta consumed into a reply that never names it is lost for good.
+        let digest = render::digest_prose(&payload["since_your_last_call"]);
+        if !digest.is_empty() {
+            prose.push_str("; ");
+            prose.push_str(&digest);
+        }
+        return (single_block(prose), is_error);
+    }
     let prose = render::monitor_job_prose(&payload);
     (single_block(prose), is_error)
 }
@@ -3506,49 +3812,94 @@ fn cancelled_envelope(
     payload
 }
 
-/// Resolve a `resume` id to the workspace its transcript was recorded under.
-/// Claude Code resolves `--resume <id>` only within `projects/<slug-of-cwd>/`, so
-/// a resume spawned anywhere else is told the conversation does not exist.
+/// Resolve a `resume` id to the workspace its transcript was recorded under,
+/// plus the agent the transcript's last `agent-setting` record names (the agent
+/// a resume runs again). The id must pin a top-level transcript: Claude Code
+/// answers no-match for a nested `agent-<hex>` stem. The workspace is where
+/// tollgate spawns so the resumed conversation keeps the project settings and cwd
+/// it was recorded under; Claude Code itself opens a session id recorded under
+/// another project's cwd (measured on CC 2.1.309: a projB id resumed from projA
+/// ran, exit 0), so the recorded workspace is tollgate's own choice, not a
+/// constraint CC imposes.
 ///
 /// `latest` is refused, though `tollgate resume` takes it: the newest session in
 /// the whole store is usually the operator's own live one, and spending an
 /// account's window continuing that is never what a delegate meant by it.
-fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::PathBuf, String> {
+fn resolve_resume_workspace(
+    session_id: &str,
+) -> std::result::Result<(std::path::PathBuf, Option<String>), String> {
     if session_id == "latest" {
         return Err(
             "resume needs an exact session id; `latest` is a `tollgate resume` shorthand"
                 .to_string(),
         );
     }
-    let no_transcript = || {
-        format!("can't resume '{session_id}': no transcript for it, or none recording a workspace")
-    };
-    let session = crate::sessions::find_session(session_id).ok_or_else(no_transcript)?;
-    let workspace = session.workspace().ok_or_else(no_transcript)?;
-    if !workspace.is_dir() {
-        return Err(format!(
-            "can't resume '{session_id}': workspace '{}' no longer exists",
-            workspace.display()
-        ));
-    }
+    let (session, workspace) = pinned_resume(session_id)?;
     // Guest mode: a shared delegate's `projects/` is tollgate's guest store,
     // never the operator's, so the transcript is copied there for `--resume`
     // to find, as `tollgate resume` does (`runtime::seed_guest_resume`; a
-    // no-op outside guest mode).
+    // no-op outside guest mode). The origin read (`resume_workspace_head`)
+    // spawns nothing and so seeds nothing.
     crate::runtime::seed_guest_resume(&session.path).map_err(|e| {
-        format!("can't resume '{session_id}': seeding the guest transcript store failed: {e:#}")
+        format!(
+            "can't resume '{}': seeding the guest transcript store failed: {e:#}",
+            echo_name(session_id)
+        )
     })?;
-    Ok(workspace)
+    Ok((workspace, session.agent()))
 }
 
-/// Refuse a `cwd` that disagrees with the workspace a `resume` must run in,
-/// rather than spawning where Claude Code will not find the transcript. Both
-/// sides are canonicalized: one spelling of a path is not the same string as
-/// another spelling of it.
+/// The transcript one resume id pins and the workspace it records, or the
+/// refusal naming which dead end stopped it: no top-level transcript, no
+/// recorded workspace in it, or that workspace since removed. One function owns
+/// those checks, shared by the spawn path (which adds the transcript's agent,
+/// [`resolve_resume_workspace`]) and the origin read (which needs only the
+/// workspace, [`resume_workspace_head`]).
+fn pinned_resume(
+    session_id: &str,
+) -> std::result::Result<(crate::sessions::SessionRef, std::path::PathBuf), String> {
+    let no_transcript = || {
+        format!(
+            "can't resume '{}': no transcript for it, or none recording a workspace",
+            echo_name(session_id)
+        )
+    };
+    let session = crate::sessions::find_session_top_level(session_id).ok_or_else(no_transcript)?;
+    let workspace = session.workspace().ok_or_else(no_transcript)?;
+    if !workspace.is_dir() {
+        return Err(format!(
+            "can't resume '{}': workspace '{}' no longer exists",
+            echo_name(session_id),
+            workspace.display()
+        ));
+    }
+    Ok((session, workspace))
+}
+
+/// [`resolve_resume_workspace`] off the runtime thread. The resolution scans the
+/// whole transcript for its last agent record, and the server's single-threaded
+/// runtime must not hold its one thread for that read. Both pre-flight callers
+/// read an unresolved resume as "fall back to the caller's cwd", so a failed
+/// blocking task lands in the same `None`.
+async fn resolve_resume_workspace_off_runtime(
+    session_id: Option<&str>,
+) -> Option<(std::path::PathBuf, Option<String>)> {
+    let id = session_id?.to_owned();
+    tokio::task::spawn_blocking(move || resolve_resume_workspace(&id).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Refuse a `cwd` that disagrees with the workspace a `resume` must run in: the
+/// child runs in the recorded workspace so the resumed conversation keeps its
+/// project settings and cwd, and a caller-named `cwd` would silently move it.
+/// Both sides are canonicalized: one spelling of a path is not the same string
+/// as another spelling of it.
 fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Result<(), String> {
-    let given_real = std::fs::canonicalize(given)
-        .map_err(|e| format!("cwd '{given}' cannot be resolved: {e}"))?;
-    let workspace_real = std::fs::canonicalize(workspace).map_err(|e| {
+    let given_real = crate::canonical::identity(given)
+        .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", echo_path(given)))?;
+    let workspace_real = crate::canonical::identity(workspace).map_err(|e| {
         format!(
             "workspace '{}' cannot be resolved: {e}",
             workspace.display()
@@ -3556,8 +3907,9 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
     })?;
     if given_real != workspace_real {
         return Err(format!(
-            "cwd '{given}' is not the workspace this session was recorded in ('{}'); \
+            "cwd '{}' is not the workspace this session was recorded in ('{}'); \
              drop `cwd` and tollgate uses the recorded one",
+            echo_path(given),
             workspace.display()
         ));
     }
@@ -3649,45 +4001,90 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let target = config
         .find(&profile_name)
         .ok_or_else(|| profile_not_found(opts.profile, ProfileNotFoundFix::CallProfiles))?;
+    // Capture the identities the delegate-end records gate on, from the SAME
+    // `target` the env is built from: a record firing after another process
+    // edited the credential writes nothing. The throughput capture applies the
+    // spawn OAuth identity rule — the disk anchor is adopted only when the
+    // stored token still equals the in-memory token, else the unanchored digest
+    // is carried and the record compares as changed (F1).
+    let spawn_throughput = crate::usage::throughput_identity_for_spawn(&profile_name, target);
+    let spawn_third_party = third_party_identity(
+        target.provider,
+        target.api_key.as_deref(),
+        target.console.as_ref(),
+        target.base_url.as_deref(),
+    );
+    // Strip the outgoing profile's custom env so a delegate for `<target>` does
+    // not inherit whoever was globally active — or, with no marker to read
+    // (`switch_off` clears it without touching the file), the departed
+    // account whose entries are still in the live settings (mirrors
+    // `tollgate start`). Read once here: the pre-flight's demand and the
+    // runtime acquire below both consume it.
+    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+    // A resume must land in the workspace its transcript was recorded under, so
+    // that resolution REPLACES the caller's cwd instead of sitting beside it; a
+    // `cwd` that disagrees is a mistake worth naming, not one to spawn into.
+    // Resolved before the pre-flight so the demand reads the project settings
+    // of the directory the child will actually run in, and the resumed
+    // session's own agent (folded as `--agent` when the call names none).
+    let (workspace, resume_agent) = match opts.resume {
+        Some(id) => {
+            let (workspace, agent) = resolve_resume_workspace(id)?;
+            if let Some(dir) = opts.cwd {
+                check_resume_cwd(dir, &workspace)?;
+            }
+            (Some(workspace), agent)
+        }
+        None => (None, None),
+    };
+    let (models, families, agent_without_model, unknown) = delegate_families(
+        target,
+        opts.isolation,
+        opts.model,
+        opts.subagent_type,
+        &opts.extra_args,
+        &opts.env,
+        &stale_env_keys,
+        spawn_cwd(workspace.clone(), opts.cwd).as_deref(),
+        resume_agent.as_deref(),
+    );
+    let credit_billed = crate::claude_json::credit_billed_families();
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
     // stops opening a brand-new session on one already disabled. Also the
     // backstop for a background job whose target changed after its pre-flight,
     // since the config is re-loaded here. Guard rationale: `preflight_target`.
-    preflight_target(target, &config, &profile_name)?;
+    preflight_target(
+        target,
+        &config,
+        &profile_name,
+        &models,
+        &families,
+        agent_without_model.as_deref(),
+        unknown,
+        &credit_billed,
+    )?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
     {
-        return Err(format!("cwd does not exist or is not a directory: {dir}"));
+        return Err(format!(
+            "cwd does not exist or is not a directory: {}",
+            echo_path(dir)
+        ));
     }
-
-    // A resume must land in the workspace its transcript was recorded under, so
-    // that resolution REPLACES the caller's cwd instead of sitting beside it; a
-    // `cwd` that disagrees is a mistake worth naming, not one to spawn into.
-    let workspace = match opts.resume {
-        Some(id) => {
-            let workspace = resolve_resume_workspace(id)?;
-            if let Some(dir) = opts.cwd {
-                check_resume_cwd(dir, &workspace)?;
-            }
-            Some(workspace)
-        }
-        None => None,
-    };
-
-    // Strip the outgoing profile's custom env so a delegate for `<target>` does
-    // not inherit whoever was globally active — or, with no marker to read
-    // (`switch_off` clears it without touching the file), the departed
-    // account whose entries are still in the live settings (mirrors
-    // `tollgate start`).
-    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
     // A delegate is a one-shot headless run against a named account, so it never
     // follows the chain — moving it mid-prompt would change who answered.
-    let runtime = ProfileRuntime::acquire(target, opts.isolation, &stale_env_keys, false)
-        .map_err(|e| format!("failed to acquire runtime: {e}"))?;
+    let runtime = ProfileRuntime::acquire(
+        target,
+        opts.isolation,
+        &stale_env_keys,
+        false,
+        crate::live_sessions::Launcher::Delegate,
+    )
+    .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     // The acquire above is the longest thing that can happen before a child
     // exists, and the supervision loop that reads this flag does not exist until
@@ -3776,11 +4173,27 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     }
     // If the run's directory is the real `$HOME`, guard against the
     // project-settings leak.
-    if let Some(dir) = spawn_cwd(workspace, opts.cwd).as_deref() {
+    let delegate_cwd = spawn_cwd(workspace, opts.cwd);
+    if let Some(dir) = delegate_cwd.as_deref() {
         command.current_dir(dir);
         crate::runtime::guard_home_project_settings(&mut command, dir);
     }
-    command.args(&opts.extra_args);
+    if let Some(dir) = delegate_cwd.as_deref() {
+        let settings_file =
+            crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
+        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+            &mut command,
+            runtime.config_dir(),
+            dir,
+            &opts.extra_args,
+            &crate::cc_exempt::hook_command(),
+            &settings_file,
+        ) {
+            logline!("{warning}");
+        }
+    } else {
+        command.args(&opts.extra_args);
+    }
 
     let run_start = std::time::SystemTime::now();
 
@@ -3792,10 +4205,20 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // one pid. The herdr pane-tag walk joins rows to processes by pid, and a row
     // keyed on the mcp names a delegate's account for the pane hosting the
     // parent session (the pane the delegate's child runs in). The child IS the
-    // session; its row must say so. Best-effort like the register itself — a
-    // failed update leaves a wrong key, never a dead run.
+    // session; its row must say so. The cwd registered beside the pid is the
+    // server's too, so move it onto the directory the child runs in when there
+    // is one, made absolute since a reader of the row cannot resolve a relative
+    // spelling against this server's cwd; a delegate with no cwd inherits the
+    // server's, which the row already holds. Best-effort like the register
+    // itself — a failed update leaves a wrong key, never a dead run.
     if let Err(e) = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
-        fields.set_pid(child.id())
+        fields.set_pid(child.id());
+        if let Some(dir) = delegate_cwd
+            .as_deref()
+            .and_then(|dir| std::path::absolute(dir).ok())
+        {
+            fields.set_cwd(dir);
+        }
     }) {
         logline!("tollgate: re-keying the delegate session onto its child failed: {e}");
     }
@@ -3815,35 +4238,47 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let capture_slot = std::sync::Arc::new(std::sync::Mutex::new(StreamCapture::default()));
     let stderr_slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let beat_handoff = handoff.clone();
-    let _stdout_reader = child.stdout.take().map(|h| {
+    // Each reader signals EOF once its slot is final: the bytes only mean
+    // something at EOF, and the take below must know whether it is reading a
+    // drained pipe or whatever was in flight.
+    let (stdout_eof_tx, stdout_eof_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_reader_eof = child.stdout.take().map(|h| {
         let capture = std::sync::Arc::clone(&capture_slot);
-        std::thread::spawn(move || match beat_handoff {
-            // A run that owns a job file rewrites it as it reads, so a `monitor`
-            // check sees liveness that would otherwise die with this task.
-            // Best-effort: a failed heartbeat costs one stale check, and must
-            // never end the capture.
-            //
-            // The record is resolved PER BEAT rather than once here, because a
-            // blocking run gets its file mid-run when its caller walks away and
-            // this thread was spawned before it existed. What keeps that record
-            // alive until the first beat lands — or forever, on a pinned
-            // `--output-format` run, which never beats at all — is its
-            // `recorded_at` mint stamp, not this closure.
-            Some(handoff) => {
-                let mut beat = |tail: String, session: Option<String>| {
-                    handoff.heartbeat(now_ms(), &tail, session.as_deref());
-                };
-                read_stdout(h, streaming, &capture, Some(&mut beat))
+        std::thread::spawn(move || {
+            match beat_handoff {
+                // A run that owns a job file rewrites it as it reads, so a
+                // `monitor` check sees liveness that would otherwise die with
+                // this task. Best-effort: a failed heartbeat costs one stale
+                // check, and must never end the capture.
+                //
+                // The record is resolved PER BEAT rather than once here,
+                // because a blocking run gets its file mid-run when its caller
+                // walks away and this thread was spawned before it existed.
+                // What keeps that record alive until the first beat lands — or
+                // forever, on a pinned `--output-format` run, which never
+                // beats at all — is its `recorded_at` mint stamp, not this
+                // closure.
+                Some(handoff) => {
+                    let mut beat = |tail: String, session: Option<String>| {
+                        handoff.heartbeat(now_ms(), &tail, session.as_deref());
+                    };
+                    read_stdout(h, streaming, &capture, Some(&mut beat));
+                }
+                None => read_stdout(h, streaming, &capture, None),
             }
-            None => read_stdout(h, streaming, &capture, None),
-        })
+            let _ = stdout_eof_tx.send(());
+        });
+        stdout_eof_rx
     });
-    let _stderr_reader = child.stderr.take().map(|mut h| {
+    let (stderr_eof_tx, stderr_eof_rx) = std::sync::mpsc::channel::<()>();
+    let stderr_reader_eof = child.stderr.take().map(|mut h| {
         let stderr_slot = std::sync::Arc::clone(&stderr_slot);
         std::thread::spawn(move || {
             let bytes = drain_pipe(&mut h);
             *stderr_slot.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
-        })
+            let _ = stderr_eof_tx.send(());
+        });
+        stderr_eof_rx
     });
 
     // Nothing between the spawn above and the capture take below may return:
@@ -3877,16 +4312,27 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
     };
 
-    // Taken once the child has exited, never joined: a grandchild that
-    // inherited claude's stdout pipe keeps a reader parked in `read` long
-    // after the child is gone, and a join here would wedge the run — and its
-    // liveness record — on the grandchild. What the take costs is any bytes
-    // the readers had not consumed yet; the readers are usually at the pipe's
-    // tail when the child exits, and a grandchild's post-exit writes are not
-    // the delegate's result anyway. The parked threads are bounded so: each
-    // writes nothing after `finalize` (its beats resolve `Finished` and write
-    // nothing, and its capture pushes land in slots nobody reads), holds no
-    // lock while writing, and drops its `Arc`s when it exits.
+    // Both slots are final only at EOF — before it, a slot may still be empty
+    // while the child's words sit in its reader's own buffer — so the take
+    // waits for both readers' EOF signals, sharing one PIPE_EOF_GRACE deadline,
+    // and then proceeds with whatever arrived, letting a failed run's reason
+    // and its throttle/402 scan see what the child actually printed on either
+    // pipe. The wait stays bounded and never joins: a grandchild that
+    // inherited claude's stdout or stderr keeps its reader parked in `read`
+    // long after the child is gone, and an unbounded wait here would wedge the
+    // run — and its liveness record — on the grandchild. What a run past the
+    // grace still costs is any bytes a reader had not stored yet; the parked
+    // threads are bounded so: each writes nothing after this take (its beats
+    // resolve `Finished` and write nothing, and its slot writes land in slots
+    // nobody reads), holds no lock while writing, and drops its `Arc`s when it
+    // exits.
+    let eof_deadline = Instant::now() + PIPE_EOF_GRACE;
+    for rx in [stdout_reader_eof.as_ref(), stderr_reader_eof.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = rx.recv_timeout(eof_deadline.saturating_duration_since(Instant::now()));
+    }
     let capture = capture_slot
         .lock()
         .map(|mut c| std::mem::take(&mut *c))
@@ -3911,6 +4357,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(projects_dir) = projects_dir {
         crate::sessions::stamp_run_sessions(opts.profile, &projects_dir, isolated, run_start);
     }
+    // This rescue must stay ahead of the `classify_run` call below: that
+    // classification resolves the run's transcript through the global store,
+    // and for an isolated run the rescue is what puts it there. Swapping the two
+    // silently drops the hook-refusal split from the receipt.
     if isolated && let Ok(claude_home) = crate::profile::claude_dir() {
         crate::start::rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
@@ -3935,7 +4385,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     };
     let now = now_epoch_secs();
     let dead_key_fp = profile_credential_fingerprint(target);
-    match classify_run(
+    match classify_run_with(
+        opts.isolation,
+        opts.subagent_type,
         status,
         &stderr_bytes,
         &capture,
@@ -3956,19 +4408,20 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                     opts.model,
                     retry_after_s,
                     now,
+                    spawn_throughput,
                 );
             }
             // The dead-key write is the recording half of the clause
             // `classify_run` appended: the run's scan proved the key dead, so
             // the balance marker it advertised goes with it.
             if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                record_dead_key(&profile_name, fp);
+                record_dead_key(&profile_name, fp, spawn_third_party);
             }
             Ok(envelope)
         }
         RunOutcome::Unparseable(envelope, throttle_scan) => {
             if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                record_dead_key(&profile_name, fp);
+                record_dead_key(&profile_name, fp, spawn_third_party);
             }
             Ok(envelope)
         }
@@ -3991,16 +4444,23 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                         opts.model,
                         retry_after_s,
                         now,
+                        spawn_throughput,
                     );
                 }
                 // An in-band 401 rides the same recording the failure arms run
                 // (660): a clean exit with an is_error envelope is still the
                 // provider refusing the key, so the balance marker goes with it.
                 if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                    record_dead_key(&profile_name, fp);
+                    record_dead_key(&profile_name, fp, spawn_third_party);
                 }
             } else {
-                record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
+                record_throughput_from_envelope(
+                    opts.profile,
+                    opts.model,
+                    &envelope,
+                    now,
+                    spawn_throughput,
+                );
             }
             Ok(envelope)
         }
@@ -4040,7 +4500,38 @@ enum RunOutcome {
     Unparseable(serde_json::Value, String),
 }
 
+/// The classifier the inline tests pose directly: a shared run with no
+/// `--agent`, the shape whose failure reason never gains the isolated-agent
+/// clause. The spawn path classifies through [`classify_run_with`]. Unix-only
+/// because every caller builds an `ExitStatus` through
+/// `ExitStatusExt::from_raw`.
+#[cfg(all(test, unix))]
 fn classify_run(
+    status: std::process::ExitStatus,
+    stderr_bytes: &[u8],
+    capture: &StreamCapture,
+    profile: &str,
+    session_id: &str,
+    dead_key_fp: Option<u64>,
+) -> RunOutcome {
+    classify_run_with(
+        Isolation::Shared,
+        None,
+        status,
+        stderr_bytes,
+        capture,
+        profile,
+        session_id,
+        dead_key_fp,
+    )
+}
+
+/// [`classify_run`] carrying the run's own isolation and `--agent` spelling:
+/// the two facts the isolated-agent clause keys on, known only at the spawn.
+#[allow(clippy::too_many_arguments)]
+fn classify_run_with(
+    isolation: Isolation,
+    subagent_type: Option<&str>,
     status: std::process::ExitStatus,
     stderr_bytes: &[u8],
     capture: &StreamCapture,
@@ -4073,17 +4564,22 @@ fn classify_run(
         if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
             reason.push_str(&dead_key_clause(profile));
         }
+        if let Some(clause) = isolated_agent_clause(isolation, subagent_type, &stderr) {
+            reason.push_str(&clause);
+        }
         return RunOutcome::Exited {
             envelope: salvage_envelope(profile, reason, capture, Some(session_id)),
             throttle_scan,
         };
     }
     match parse_delegate_envelope(stdout.trim()) {
-        // The envelope is the delegate's own self-report; the one field tollgate
-        // may add is the id it pinned, when the child's envelope did not carry
-        // one — the same id, so the reply is never without a resume handle.
+        // The envelope is the delegate's own self-report; what tollgate adds is
+        // the id it pinned, when the child's envelope did not carry one — the
+        // same id, so the reply is never without a resume handle — and the
+        // hook-refusal split beside `permission_denials`.
         Ok(mut envelope) => {
             stamp_session_id(&mut envelope, session_id);
+            classify_hook_refusals(&mut envelope);
             RunOutcome::Envelope {
                 envelope,
                 throttle_scan,
@@ -4111,6 +4607,140 @@ fn stamp_session_id(envelope: &mut serde_json::Value, session_id: &str) {
     if envelope.get("session_id").is_none() {
         envelope["session_id"] = serde_json::Value::String(session_id.to_string());
     }
+}
+
+/// Split the envelope's `permission_denials` by layer for the receipt.
+///
+/// Under `--dangerously-skip-permissions` the child still refuses through user
+/// `PreToolUse` hooks and `permissions.deny` rules, and its result JSON lists
+/// both in `permission_denials` with no layer. A hook refusal leaves a
+/// transcript `tool_result` for its own `tool_use_id` — `is_error`, its text
+/// starting `PreToolUse:<tool> hook error:` — which the agent usually retries
+/// past; a deny-rule denial leaves no transcript row at all. This stamps the
+/// hook-refused ids beside the untouched array, so the receipt names the layers
+/// apart from data the run already produced, once, when it finalizes.
+///
+/// The transcript is resolved from the envelope's own `session_id` through the
+/// global store, where an isolated run's teardown rescues it before the run
+/// finalizes, so an isolated run splits when the file is found, exactly as a
+/// shared one does. No transcript, or a read error, leaves the field unstamped
+/// and the receipt on the single `permission denials` clause; the
+/// classification never errors.
+fn classify_hook_refusals(envelope: &mut serde_json::Value) {
+    // The field is tollgate's own: a child envelope carrying a key of that name
+    // must never be trusted unclassified.
+    if let Some(map) = envelope.as_object_mut() {
+        map.remove(render::HOOK_REFUSAL_IDS);
+    }
+    let Some(session_id) = envelope
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let Some(denials) = envelope
+        .get("permission_denials")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let ids: Vec<&str> = denials
+        .iter()
+        .filter_map(|entry| entry.get("tool_use_id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Some(session) = crate::sessions::find_session_top_level(session_id) else {
+        return;
+    };
+    let Ok(file) = std::fs::File::open(&session.path) else {
+        return;
+    };
+    let Some(hook_ids) = scan_hook_refusal_ids(std::io::BufReader::new(file), &ids) else {
+        return;
+    };
+    if !hook_ids.is_empty() {
+        envelope[render::HOOK_REFUSAL_IDS] = serde_json::json!(hook_ids);
+    }
+}
+
+/// Scans a transcript line by line for the denial ids whose `tool_result` block
+/// is an error carrying the hook's own `PreToolUse:<tool> hook error:` lead.
+/// Memory is bounded per line, and only a line that could carry one of the
+/// denied `tool_use_id`s is parsed into JSON.
+///
+/// `None` when a read fails: the scan stops on the first error, so a reader
+/// that keeps failing costs one read attempt, never a spin.
+fn scan_hook_refusal_ids(reader: impl std::io::BufRead, ids: &[&str]) -> Option<Vec<String>> {
+    let mut hook_ids: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        if !line.contains("tool_result")
+            || !line.contains("PreToolUse:")
+            || !ids.iter().any(|id| line.contains(id))
+        {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(blocks) = record
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !ids.contains(&id) || hook_ids.iter().any(|seen| seen == id) {
+                continue;
+            }
+            if block.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+            if !tool_result_text(block).is_some_and(is_hook_refusal_text) {
+                continue;
+            }
+            hook_ids.push(id.to_string());
+        }
+        if ids.iter().all(|id| hook_ids.iter().any(|seen| seen == id)) {
+            break;
+        }
+    }
+    Some(hook_ids)
+}
+
+/// A `tool_result` block's text: its own string, or the first text part of a
+/// content-block array.
+fn tool_result_text(block: &serde_json::Value) -> Option<&str> {
+    match block.get("content")? {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        other => other
+            .as_array()?
+            .iter()
+            .find_map(|part| part.get("text").and_then(serde_json::Value::as_str)),
+    }
+}
+
+/// Whether a `tool_result` text is the child's own wording for a user
+/// `PreToolUse` hook refusal: `PreToolUse:<tool> hook error: <reason>`, where
+/// the ` hook error:` wording follows the tool token directly and the tool is
+/// one whitespace-free name. The tool's own error can quote that text anywhere;
+/// only the exact lead is the refusal.
+fn is_hook_refusal_text(text: &str) -> bool {
+    text.strip_prefix("PreToolUse:")
+        .and_then(|rest| rest.split_once(" hook error:"))
+        .is_some_and(|(tool, _)| !tool.is_empty() && !tool.contains(char::is_whitespace))
 }
 
 /// The live-delegate guard a profile switch runs BEFORE any mutation: a switch
@@ -4156,11 +4786,81 @@ fn live_jobs_guard(now: u64) -> Option<String> {
     ))
 }
 
+/// The demand a delegate run on `profile` may bill, judged by the SAME resolver
+/// [`crate::start::member_launch_demand`] uses for a start: the call's
+/// `extra_args`, its caller `env` model keys, its `model` argument (which the
+/// args outrank), its `subagent_type` (folded in as `--agent`), the resumed
+/// session's own agent (`resume_agent`, folded as `--agent` when the call names
+/// none), and the spawn `cwd`'s project settings. Returns the raw model strings
+/// (for the unplaceable-model refusal), their resolved families, the agent
+/// name the launch named with no model to decide its headline, and whether the
+/// demand is unknown like a no-model-named launch.
+#[allow(clippy::too_many_arguments)]
+fn delegate_families(
+    profile: &Profile,
+    isolation: Isolation,
+    model: Option<&str>,
+    subagent_type: Option<&str>,
+    extra_args: &[String],
+    env: &HashMap<String, String>,
+    stale_env_keys: &[String],
+    cwd: Option<&std::path::Path>,
+    resume_agent: Option<&str>,
+) -> (Vec<String>, Vec<String>, Option<String>, bool) {
+    // Fold `subagent_type` / a resumed session's agent into the args as
+    // `--agent <name>`, the same flag the spawned command carries, so the
+    // resolver's one agent chain sees it. An explicit `subagent_type` or a
+    // non-blank args `--agent` outranks the resumed session's own agent, so the
+    // transcript's record is only folded when neither names one. A blank
+    // `subagent_type` (`""`, `"  "`) is absent, as Claude Code ignores it and
+    // the transcript's agent still runs; the same rule `parsed_agent_arg`
+    // applies to the args.
+    let mut agent_args;
+    let args = match subagent_type.filter(|s| !s.trim().is_empty()) {
+        Some(agent) => {
+            agent_args = Vec::with_capacity(extra_args.len() + 2);
+            agent_args.extend_from_slice(extra_args);
+            agent_args.push("--agent".to_owned());
+            agent_args.push(agent.to_owned());
+            agent_args.as_slice()
+        }
+        None => match resume_agent {
+            Some(agent) if crate::start::parsed_agent_arg(extra_args).is_none() => {
+                agent_args = Vec::with_capacity(extra_args.len() + 2);
+                agent_args.extend_from_slice(extra_args);
+                agent_args.push("--agent".to_owned());
+                agent_args.push(agent.to_owned());
+                agent_args.as_slice()
+            }
+            _ => extra_args,
+        },
+    };
+    let demand = crate::start::member_launch_demand(
+        profile,
+        isolation,
+        stale_env_keys,
+        args,
+        model,
+        crate::start::EnvLeg::Caller,
+        cwd,
+        |key| env.get(key).cloned(),
+    );
+    let families = crate::fallback::demand_from(&demand.models);
+    (
+        demand.models,
+        families,
+        demand.agent_without_model,
+        demand.unknown,
+    )
+}
+
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
 /// operator disabled, a recognised third-party profile whose inference has
 /// nothing to authenticate with (which
-/// would spawn a `claude` that dies on an empty envelope), or a quarantined
-/// one with nothing but that dead chain to authenticate with. The keyless test is
+/// would spawn a `claude` that dies on an empty envelope), an api-key profile
+/// (recognised or generic) whose key the provider already refused, an OAuth
+/// account whose setup token it refused that the account's sessions run on, or
+/// a quarantined one with nothing but that dead chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
@@ -4190,11 +4890,21 @@ fn live_jobs_guard(now: u64) -> Option<String> {
 /// Called from every path that refuses before a spawn: the single-background
 /// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
 /// path's own check plus the backstop for a target that changed after its
-/// pre-flight (the config is re-loaded there).
+/// pre-flight (the config is re-loaded there). `models` is the demand's raw
+/// model strings; `families` its resolved families (empty means none resolved —
+/// the demand is unknown); `agent_without_model` the agent name the launch
+/// named with no model to decide its headline; `credit_billed` the set Claude
+/// Code bills against usage credits, read once by the caller.
+#[allow(clippy::too_many_arguments)]
 fn preflight_target(
     profile: &Profile,
     config: &AppConfig,
     name: &ProfileName,
+    models: &[String],
+    families: &[String],
+    agent_without_model: Option<&str>,
+    unknown: bool,
+    credit_billed: &[String],
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
         return Err(format!(
@@ -4208,6 +4918,16 @@ fn preflight_target(
     // the key missing.
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
         return Err(crate::format::third_party_keyless(name));
+    }
+    // After the keyless arm (a profile with no credential has none to reject)
+    // and before quarantine: its browser-login fix leaves the refused
+    // credential in place, and the sentence names whichever one it is.
+    if crate::fallback::third_party_key_rejected(profile, name) {
+        return Err(if crate::usage::dead_login_is_setup_token(profile) {
+            crate::format::setup_token_rejected(name)
+        } else {
+            crate::format::api_key_rejected(name)
+        });
     }
     // A quarantined target whose own endpoint and credential serve inference
     // is ADMITTED (owner ruling 2026-08-30, "let the delegate run"): the dead
@@ -4243,6 +4963,55 @@ fn preflight_target(
             render::third_party_headline(&stats),
         ));
     }
+    // LAST: a spent usage-credit cap refuses a delegate whose model Claude Code
+    // bills against usage credits. A KNOWN demand (a family resolved) decides
+    // by its own families whatever the gate says; an unknown demand (no model
+    // resolved) is judged credit-billed whatever the gate says too — the gate
+    // steers the chain walk only. Keyed on `credit_capped()`, never a stale
+    // percent or a billing-off limit. An account serving inference from its own
+    // endpoint + token never spends its OAuth usage credits, so its spent cap
+    // refuses nothing.
+    if !crate::claude::has_own_inference_endpoint(profile)
+        && load_usage(name).is_some_and(|u| u.credit_capped())
+    {
+        if let Some(family) = families.iter().find(|f| credit_billed.contains(f)) {
+            return Err(format!(
+                "credit cap spent: {name} cannot run {family}, which Claude Code bills \
+                 against usage credits; name another account or another model"
+            ));
+        }
+        // Any model tollgate cannot place refuses a capped account, even beside
+        // one it can place: the family set may still be non-empty, so this arm
+        // sits outside the unknown-demand block. The caller's own spelling is
+        // echoed through the same flatten-and-cap as an agent name, since a
+        // model string is caller input too.
+        if let Some(model) = models
+            .iter()
+            .find(|m| crate::fallback::demand_from([m.as_str()]).is_empty())
+        {
+            return Err(format!(
+                "credit cap spent: {name} runs {}, which tollgate cannot tell is billed \
+                 against usage credits; name another account or a known model",
+                echo_name(model)
+            ));
+        }
+        // A launch naming an agent and no model gets its own arm, after the
+        // fallback side's known families: tollgate reads no agent def, so the model
+        // the agent runs is unknowable, never "no model named".
+        if let Some(agent) = agent_without_model {
+            return Err(format!(
+                "credit cap spent: {name} runs agent {}, whose model tollgate cannot \
+                 tell; name another account or a model",
+                echo_name(agent)
+            ));
+        }
+        if families.is_empty() || unknown {
+            return Err(format!(
+                "credit cap spent: {name} names no model to run, and its default may \
+                 bill usage credits; name another account or a model"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4250,11 +5019,30 @@ fn preflight_target(
 /// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
 /// single `profile` resolves under), a name resolving to no account, or
 /// anything [`preflight_target`] refuses — a disabled member, a recognised
-/// third-party member with no inference auth source, a quarantined one that
-/// does not serve its own inference, an unfunded one (the provider's own
-/// balance verdict).
+/// third-party member with no inference auth source, an api-key profile
+/// (recognised or generic) whose key the provider already refused, a
+/// quarantined one that does not serve its own inference, an unfunded one
+/// (the provider's own balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
-fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
+/// `model`, `subagent_type`, `isolation`, `stale_env_keys`, `extra_args`,
+/// `env`, `cwd` and `credit_billed` are the demand inputs every member's
+/// credit gate is judged under, read once by the caller. A fan-out carrying a
+/// resume folds that session's agent into `extra_args` as `--agent` (the same
+/// fold [`delegate_families`] makes for the single-background arm), so no
+/// second resume parameter is needed here.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fanout(
+    config: &AppConfig,
+    raw: &[String],
+    model: Option<&str>,
+    subagent_type: Option<&str>,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    credit_billed: &[String],
+    extra_args: &[String],
+    env: &HashMap<String, String>,
+    cwd: Option<&std::path::Path>,
+) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a
     // success-shaped `{"jobs": []}` that spent nothing and spawned nothing.
     if raw.is_empty() {
@@ -4273,7 +5061,8 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
     for name in raw {
         if !seen.insert(name.to_ascii_lowercase()) {
             return Err(format!(
-                "duplicate profile in `profiles`: `{name}` (case-insensitive)"
+                "duplicate profile in `profiles`: `{}` (case-insensitive)",
+                echo_name(name)
             ));
         }
     }
@@ -4300,7 +5089,27 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         let profile = config
             .find(&ProfileName::from(name.clone()))
             .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
-        preflight_target(profile, config, &ProfileName::from(name.clone()))?;
+        let (models, families, agent_without_model, unknown) = delegate_families(
+            profile,
+            isolation,
+            model,
+            subagent_type,
+            extra_args,
+            env,
+            stale_env_keys,
+            cwd,
+            None,
+        );
+        preflight_target(
+            profile,
+            config,
+            &ProfileName::from(name.clone()),
+            &models,
+            &families,
+            agent_without_model.as_deref(),
+            unknown,
+            credit_billed,
+        )?;
     }
     Ok(resolved)
 }
@@ -4331,8 +5140,11 @@ fn prompt_is_path(prompt: &str, cwd: Option<&str>) -> bool {
 fn read_prompt_path(cwd: Option<&str>, raw: &str) -> std::result::Result<String, String> {
     let path = std::path::Path::new(raw);
     if path.is_absolute() {
-        let real = std::fs::canonicalize(path).map_err(|e| {
-            format!("prompt `{raw}` does not resolve: {e}; check the path or pass text")
+        let real = crate::canonical::identity(path).map_err(|e| {
+            format!(
+                "prompt `{}` does not resolve: {e}; check the path or pass text",
+                echo_path(raw)
+            )
         })?;
         return read_resolved_prompt(&real, raw);
     }
@@ -4349,7 +5161,8 @@ fn normalize_join(
 ) -> std::result::Result<std::path::PathBuf, String> {
     if std::path::Path::new(rel).is_absolute() {
         return Err(format!(
-            "prompt `{rel}` refused: absolute path (must be relative to `cwd`)"
+            "prompt `{}` refused: absolute path (must be relative to `cwd`)",
+            echo_path(rel)
         ));
     }
     let mut parts: Vec<std::ffi::OsString> = Vec::new();
@@ -4358,7 +5171,10 @@ fn normalize_join(
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 if parts.pop().is_none() {
-                    return Err(format!("prompt `{rel}` refused: path escapes `cwd`"));
+                    return Err(format!(
+                        "prompt `{}` refused: path escapes `cwd`",
+                        echo_path(rel)
+                    ));
                 }
             }
             std::path::Component::Normal(part) => parts.push(part.to_os_string()),
@@ -4369,7 +5185,8 @@ fn normalize_join(
             // the caller named, so refuse by name.
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(format!(
-                    "prompt `{rel}` refused: absolute path (must be relative to `cwd`)"
+                    "prompt `{}` refused: absolute path (must be relative to `cwd`)",
+                    echo_path(rel)
                 ));
             }
         }
@@ -4391,77 +5208,53 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
         Some(dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir().map_err(|e| format!("cwd cannot be resolved: {e}"))?,
     };
-    let base_real = std::fs::canonicalize(&base)
-        .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", base.display()))?;
+    let base_real = crate::canonical::identity(&base).map_err(|e| {
+        format!(
+            "cwd '{}' cannot be resolved: {e}",
+            echo_path(&base.display().to_string())
+        )
+    })?;
     let candidate = normalize_join(&base_real, rel)?;
     // Re-check immediately before the read: canonicalize resolves any symlink, so
     // a link pointing outside `cwd` fails the starts_with check, and the resolved
     // path is the file opened below. A miss names the path, the cwd and the fix.
-    let real = std::fs::canonicalize(&candidate).map_err(|e| {
+    let real = crate::canonical::identity(&candidate).map_err(|e| {
         format!(
-            "prompt `{rel}` does not resolve under cwd '{}': {e}; check the path, or pass the prompt as text",
-            base_real.display()
+            "prompt `{}` does not resolve under cwd '{}': {e}; check the path, or pass the prompt as text",
+            echo_path(rel),
+            echo_path(&crate::canonical::display(&base_real).display().to_string())
         )
     })?;
     if !real.starts_with(&base_real) {
         return Err(format!(
-            "prompt `{rel}` refused: symlink target resolves outside `cwd`"
+            "prompt `{}` refused: symlink target resolves outside `cwd`",
+            echo_path(rel)
         ));
     }
     read_resolved_prompt(&real, rel)
 }
 
-/// Open, type-check and read an already-canonicalized prompt file. The type
-/// check runs BEFORE the open — `metadata` is a stat and never opens the path,
-/// so a FIFO is refused here instead of freezing the read-only open on the
-/// server's only thread. The same check runs on the opened handle, so a path
-/// swapped between the stat and the open cannot sneak a non-regular file past.
+/// Open, type-check and read an already-canonicalized prompt file. The shared
+/// reader ([`crate::profile::read_capped_file`]) stats before open — so a
+/// FIFO is refused here instead of freezing the read-only open on the server's
+/// only thread — re-checks the opened handle, and bounds the read with a hard
+/// byte ceiling.
 fn read_resolved_prompt(
     real: &std::path::Path,
     label: &str,
 ) -> std::result::Result<String, String> {
-    let meta = std::fs::metadata(real).map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("prompt `{label}` refused: not a regular file"));
-    }
-    let file = std::fs::File::open(real).map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("prompt `{label}` refused: not a regular file"));
-    }
-    let size = meta.len();
-    if size > PROMPT_FILE_CAP {
-        return Err(format!(
-            "prompt `{label}` refused: {size} bytes over the {PROMPT_FILE_CAP} byte cap"
-        ));
-    }
-    read_prompt_handle(file, label)
+    crate::profile::read_capped_file(real, PROMPT_FILE_CAP)
+        .map_err(|detail| format!("prompt `{}` refused: {detail}", echo_path(label)))
 }
 
-/// Read the validated prompt handle with a hard byte ceiling. A file can grow
-/// past the cap between the size check above and the read; `take` bounds the
-/// read to cap + 1, and a read that actually hit the bound is refused by name
-/// instead of silently truncating the prompt. Invalid UTF-8 is refused by name
-/// at the byte offset, never lossily decoded.
+/// Read an already-opened, type-checked prompt handle — the seam the growth and
+/// UTF-8 pins drive directly. The shared handle reader
+/// ([`crate::profile::read_validated_handle`]) bounds the read with a hard
+/// byte ceiling.
+#[cfg(test)]
 fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<String, String> {
-    let mut reader = file.take(PROMPT_FILE_CAP + 1);
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut buf)
-        .map_err(|e| format!("prompt `{rel}` refused: {e}"))?;
-    if buf.len() > PROMPT_FILE_CAP as usize {
-        return Err(format!(
-            "prompt `{rel}` refused: grew past the {PROMPT_FILE_CAP} byte cap during the read"
-        ));
-    }
-    let text = std::str::from_utf8(&buf).map_err(|e| {
-        format!(
-            "prompt `{rel}` refused: invalid UTF-8 at byte offset {}",
-            e.valid_up_to()
-        )
-    })?;
-    Ok(text.to_string())
+    crate::profile::read_validated_handle(file, PROMPT_FILE_CAP)
+        .map_err(|detail| format!("prompt `{}` refused: {detail}", echo_path(rel)))
 }
 
 /// A reserved background job: the spec every later write of it goes through,
@@ -4531,13 +5324,16 @@ impl DelegateOrigin {
     /// Resolved once per call, before any mint. The cwd takes the same
     /// precedence `run_delegate` spawns under ([`spawn_cwd`]), made absolute
     /// against the server's own cwd the way the spawn resolves a relative one;
-    /// a resume whose workspace does not resolve falls through to the caller's
-    /// `cwd`, since `run_delegate` refuses that run anyway. The account is whichever profile
-    /// owns this server's session credentials (`which::resolve_active`, the
-    /// `which` tool's own answer). The host is the process that spawned this
-    /// server and the conversation it is in at this call ([`host_session`]).
+    /// a resume's workspace comes from the transcript HEAD alone
+    /// ([`resume_workspace_head`]), never the whole-file agent scan the
+    /// pre-flight pays, and one that does not resolve falls through to the
+    /// caller's `cwd`, since `run_delegate` refuses that run anyway. The account
+    /// is whichever profile owns this server's session credentials
+    /// (`which::resolve_active`, the `which` tool's own answer). The host is the
+    /// process that spawned this server and the conversation it is in at this
+    /// call ([`host_session`]).
     fn resolve(config: &AppConfig, resume: Option<&str>, cwd: Option<&str>) -> Self {
-        let workspace = resume.and_then(|id| resolve_resume_workspace(id).ok());
+        let workspace = resume.and_then(resume_workspace_head);
         Self {
             cwd: spawn_cwd(workspace, cwd)
                 .and_then(|dir| std::path::absolute(dir).ok())
@@ -4547,6 +5343,17 @@ impl DelegateOrigin {
             host_pid: host_pid(),
         }
     }
+}
+
+/// The workspace a resume id was recorded under: the origin cwd needs no
+/// whole-transcript read, and the pre-flight it runs beside already pays the
+/// one agent scan this call would repeat. The dead ends are
+/// [`pinned_resume`]'s, so the origin falls back exactly where the resume
+/// refuses.
+fn resume_workspace_head(session_id: &str) -> Option<std::path::PathBuf> {
+    pinned_resume(session_id)
+        .ok()
+        .map(|(_session, workspace)| workspace)
 }
 
 /// The conversation the host process `pid` is in now: its Claude Code session
@@ -4562,29 +5369,10 @@ fn host_session(pid: u32) -> Option<String> {
     let sessions = crate::which::session_config_dir_or_global().map(|dir| dir.join("sessions"));
     Some(
         sessions
-            .and_then(|dir| session_record_id(&dir, pid))
+            .and_then(|dir| crate::session_record::session_record(&dir, pid))
+            .map(|record| record.session_id)
             .unwrap_or(started_under),
     )
-}
-
-/// The `sessionId` the Claude Code session record `<pid>.json` in `dir`
-/// carries, when that record names `pid` itself and a non-empty id.
-fn session_record_id(dir: &std::path::Path, pid: u32) -> Option<String> {
-    let path = dir.join(format!("{pid}.json"));
-    // Claude Code rewrites the record in place, so one read can land mid-write
-    // and the stamp is never re-taken: a second read decides.
-    let record = (0..2)
-        .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
-    (record.pid == pid && !record.session_id.is_empty()).then_some(record.session_id)
-}
-
-/// The fields of a Claude Code session record (`<config dir>/sessions/<pid>.json`)
-/// tollgate reads.
-#[derive(serde::Deserialize)]
-struct SessionRecord {
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    pid: u32,
 }
 
 /// The `claude` process hosting this server, resolved once ([`serve`] primes
@@ -4631,7 +5419,9 @@ fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| std::fs::read(e.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<SessionRecord>(&bytes).ok())
+        .filter_map(|bytes| {
+            serde_json::from_slice::<crate::session_record::SessionRecord>(&bytes).ok()
+        })
         .filter(|r| r.session_id == session_id)
         .filter(|r| {
             r.pid != 0
@@ -4690,6 +5480,10 @@ fn reserve_background_job(
 /// ceiling anymore, and `0`/`None` is also the shape a record an older server
 /// wrote parses into, so the serde fields stay load-bearing for those.
 fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
+    // No marker wait here: a mint must not stamp an owner while the startup
+    // registration is still deciding. The ONE wait lives at the single entry
+    // point every mint is reached from — `delegate_with`, async, before any
+    // reserve or spawn — so a mint is always reached after it.
     jobs::RunningSpec {
         job_id: jobs::new_job_id(mint.started_at),
         profile: mint.profile.clone(),
@@ -5379,6 +6173,7 @@ fn record_throughput_from_envelope(
     model: Option<&str>,
     envelope: &serde_json::Value,
     now: i64,
+    captured: Option<u64>,
 ) {
     let output_tokens = envelope
         .get("usage")
@@ -5396,6 +6191,7 @@ fn record_throughput_from_envelope(
         output_tokens,
         duration_ms,
         now,
+        captured,
     );
 }
 
@@ -5506,15 +6302,65 @@ fn dead_key_clause(name: &str) -> String {
     )
 }
 
+/// The reply clause for an isolated delegate whose `--agent` Claude Code
+/// refused at startup. Keyed on the run's own isolation flag and the agent
+/// spelling the spawn carried, never on a roster or built-in agent list
+/// (those differ per box), so a shared run, an agentless run, or any other
+/// failure keeps the bare reason.
+fn isolated_agent_clause(
+    isolation: Isolation,
+    subagent_type: Option<&str>,
+    stderr: &str,
+) -> Option<String> {
+    let name = subagent_type?;
+    if isolation != Isolation::Isolated || !stderr.contains(&format!("--agent '{name}' not found"))
+    {
+        return None;
+    }
+    Some(format!(
+        " an `isolated: true` delegate loads no plugin or user agents: drop `isolated` to \
+         run `{name}`"
+    ))
+}
+
 /// The write half of the dead-key arm: drop the balance marker `profiles`
-/// reads and record the fingerprint-bound verdict the daemon feed and the
-/// refusal splitter demote the row with. Both are best-effort cache IO, no
-/// lock taken. The marker self-heals: the next successful fetch re-writes the
-/// cache and clears the verdict, and a re-login changes the fingerprint so a
-/// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
-fn record_dead_key(name: &ProfileName, fp: u64) {
-    remove_profile_cache(name, THIRD_PARTY_CACHE_FILE);
-    write_auth_expired(name, fp);
+/// reads, record the dead-key record the delegate guard and the chain walks
+/// refuse the key on, and — where the usage fetch authenticates with that same
+/// key — the usage-credential verdict the daemon feed reads. All best-effort
+/// cache IO, no lock taken. `fp` is the run's credential fingerprint
+/// ([`profile_credential_fingerprint`]); the dead-key record is keyed on the
+/// stored key alone, written only while the stored credential is still `fp`'s.
+/// Only a live body from a fetch that sent the key clears the records, and a
+/// re-captured key leaves them inert (`profile_cache.rs`'s contract).
+fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64>) {
+    // Gate on the third-party identity the delegate was launched with: a dead
+    // key fired for the OLD key must not drop a NEW key's cache. An identity
+    // file that exists but will not read writes nothing.
+    let (disk, unreadable) = read_third_party_for_compare(name);
+    if unreadable || disk != captured_third_party {
+        return;
+    }
+    // The balance-marker drop is `forget_disk`'s third-party arm; the
+    // fingerprint-bound verdict writes stay here (a fetch-landing concern).
+    crate::usage::forget_disk(name, crate::usage::Half::ThirdParty);
+    let stored = crate::profile::read_profile(name).ok();
+    // Alibaba's usage fetch reads the console session, never the key, so the
+    // key's death says nothing about its usage credential.
+    if stored
+        .as_ref()
+        .is_none_or(|p| p.provider != Some(crate::providers::Provider::Alibaba))
+    {
+        write_auth_expired(name, fp);
+    }
+    // The identity gate above reads only the console on Alibaba; the credential
+    // fingerprint covers the key on every provider, so a key edited since the
+    // spawn is never the one recorded.
+    if let Some(key) = stored
+        .filter(|p| profile_credential_fingerprint(p) == Some(fp))
+        .and_then(|p| crate::usage::profile_key_fingerprint(&p))
+    {
+        write_dead_key(name, key);
+    }
 }
 
 /// The mid-run 402 arm: a 402 is the provider's word at ONE instant — a
@@ -5591,7 +6437,9 @@ fn drain_pipe<R: std::io::Read>(reader: &mut R) -> Vec<u8> {
 }
 
 /// Truncate a string to `max` bytes (on a char boundary) for an error payload,
-/// appending an ellipsis when clipped.
+/// appending an ellipsis when clipped. Kept byte-based and literal for the
+/// 2000-byte child-output reasons: those are JSON strings, where a newline
+/// forges nothing and a stack trace reads better as written.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -5746,6 +6594,61 @@ fn usage_tool_result(args: &UsageArgs) -> CallToolResult {
     }
 }
 
+/// Whether `c` breaks or reorders a line in prose a caller reads: a control
+/// character (C0, DEL and C1, NEL included), the Unicode line and paragraph
+/// separators, or a bidi control. These and only these: a combining mark, a
+/// joiner, a zero-width space, a no-break space, a soft hyphen and a BOM sit
+/// mid-line and reorder nothing, so they are ordinary text.
+fn line_breaker(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Echo a caller-supplied path in a refusal. A path is returned exactly as
+/// written — an ordinary path, a Windows `\`, a literal backslash-`n` pair —
+/// unless it holds a character that breaks or reorders a line (a control
+/// character, U+2028, U+2029, a bidi control) or a `"`; one that does is
+/// returned quoted, with every special character escaped and every backslash
+/// doubled. A raw echo can then never contain `"`, so it can never read the
+/// same as a quoted one, and an embedded newline cannot forge a second line in
+/// the payload. The path keeps its full length — a path cut at 64 characters
+/// names nothing — and the OS bounds it already.
+fn echo_path(s: &str) -> String {
+    if s.contains('"') || s.chars().any(line_breaker) {
+        format!("{s:?}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Echo a caller-supplied name (an agent name, a session id, a profile name as
+/// the caller spelled it) in a refusal: every character that breaks or reorders
+/// a line is flattened to a space, so an embedded newline cannot forge a second
+/// line, then the echo is capped at 64 CHARACTERS (never bytes), appending an
+/// ellipsis when cut. Every other character — an accent, a joiner, a no-break
+/// space — is kept as written. A name is not a path — it names nothing on disk
+/// — so it takes the flat form rather than [`echo_path`]'s quoted one.
+fn echo_name(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| if line_breaker(c) { ' ' } else { c })
+        .collect();
+    if clean.chars().count() <= 64 {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(64).collect();
+    cut.push('…');
+    cut
+}
+
 /// How long a client may treat `server/discover` and `tools/list` as fresh. Both
 /// are fixed for the process — the tool set is compile-time and the instructions
 /// block is built once at startup — so a cached copy is never staler than the
@@ -5813,8 +6716,14 @@ impl ServerHandler for TollgateServer {
 /// Build the init-time `instructions` block once from the on-demand config and
 /// usage disk cache. Best-effort: a config load failure degrades to a prose-only
 /// block rather than failing the handshake.
+///
+/// Loads through [`load_config_without_rewrite`]: this answers `initialize` and
+/// `server/discover`, and the handshake never waits on the state flock — the
+/// rewrite path would for a profile whose `config.toml` does not round-trip,
+/// and a legacy `.pending` sidecar adoption would too, so the no-rewrite read
+/// answers lock-free and writes nothing.
 fn build_instructions() -> String {
-    let Ok(config) = load_config() else {
+    let Ok(config) = load_config_without_rewrite() else {
         return "tollgate manages multiple Claude Code accounts (\"profiles\"). \
             Call `profiles` for live usage figures."
             .to_string();
@@ -5828,7 +6737,7 @@ fn build_instructions() -> String {
             provider: provider_label(p),
             base_url: p.base_url.clone(),
             sub_type: tier_label(p),
-            rank: roster_rank(&p.name),
+            rank: roster_rank_for(p),
         })
         .collect();
 
@@ -5885,8 +6794,9 @@ fn startup() -> Option<std::fs::File> {
     }
     jobs::gc(now_ms());
     // Converge a broken plugin registration without ever blocking the stdio
-    // handshake: the gate is two registry reads inline, and a needed heal runs
-    // on its own thread (throttled inside `heal_detached`), never on stdout.
+    // handshake: the gate is agentgear's spawn-free pre-check (file reads, no
+    // `claude` spawn), and a needed heal runs on its own thread (throttled
+    // inside `heal_detached`), never on stdout.
     //
     // Not under the Plugin tab's boot probe, which spawns a real `tollgate mcp`
     // and kills it within seconds: a heal started there is a mutating lifecycle
@@ -5910,25 +6820,64 @@ fn startup() -> Option<std::fs::File> {
 }
 
 pub(crate) fn serve() -> Result<()> {
-    let _bare_marker = startup();
-    // Held across `block_on` exactly like the bare marker: the flock drops with
-    // the process however it dies, so every record this server mints carries an
-    // owner a later server reads alive exactly as long as this one is. A failed
-    // registration is logged and stepped over — records then mint ownerless,
-    // and the silence window is their only corpse rule.
-    let _server_marker = match jobs::hold_server_marker() {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            logline!("tollgate: server marker not registered: {e:#}");
-            None
-        }
-    };
+    // The startup sweep and the server-marker registration run on their own
+    // thread, started before serving and never awaited by the handshake. The
+    // marker is registered FIRST so a delegate mint waits only for the (quick)
+    // flock, never for the slow sweep behind it. Both guards live for the
+    // process: the thread parks holding them, so their flocks drop with the
+    // process however it dies. Each leg runs under its own `catch_unwind`: a
+    // panic in the marker registration settles it and still lets `startup()`
+    // run, and a panic in the sweep still leaves the guards held. A refused
+    // spawn settles the registration and serves without it, never aborts the
+    // boot.
+    jobs::mark_server_registration_in_flight();
+    if let Err(e) = std::thread::Builder::new()
+        .name("tollgate-startup".to_string())
+        .spawn(move || {
+            let _server_marker = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                jobs::hold_server_marker,
+            )) {
+                Ok(Ok(guard)) => Some(guard),
+                Ok(Err(e)) => {
+                    logline!("tollgate: server marker not registered: {e:#}");
+                    None
+                }
+                Err(_) => {
+                    logline!(
+                        "tollgate: server marker registration panicked; the server keeps serving and its records mint ownerless"
+                    );
+                    None
+                }
+            };
+            let _bare_marker =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(startup)) {
+                    Ok(marker) => marker,
+                    Err(_) => {
+                        logline!(
+                            "tollgate: startup sweep panicked; the server keeps serving and its markers stay held"
+                        );
+                        None
+                    }
+                };
+            loop {
+                std::thread::park();
+            }
+        })
+    {
+        logline!(
+            "tollgate: startup thread not spawned: {e}; serving without the sweep or the server marker"
+        );
+        jobs::settle_marker_registration();
+    }
+    // `host_pid` is a plain read (a `OnceLock` init), so it stays inline: it
+    // cannot block the handshake.
     let _ = host_pid();
-    // The delegate-dot knob, read once at startup from the on-demand config.
-    // A missing or unreadable profiles.toml answers the default (dot on), so
-    // the knob can never fail the server.
-    let delegate_dot = load_config()
-        .map(|config| config.state.herdr.delegate_dot)
+    // The delegate-dot knob is a plain field of `profiles.toml`, read without
+    // the per-profile load that can take the state flock for a `config.toml`
+    // rewrite. A missing or unreadable profiles.toml answers the default (dot
+    // on), so the knob can never fail the server.
+    let delegate_dot = crate::profile::load_app_state()
+        .map(|state| state.herdr.delegate_dot)
         .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_dot);
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the first reply. `enable_all`
@@ -5984,19 +6933,28 @@ pub(crate) fn await_job() -> ! {
             render::envelope_prose(envelope)
         );
     }
-    if delivered.is_empty() {
-        std::process::exit(0); // every id already gone: nothing was delivered
+    let (exit_code, reminder) = await_job_verdict(!delivered.is_empty(), &pending);
+    if let Some(reminder) = reminder {
+        outln!("{reminder}");
+    }
+    std::process::exit(exit_code);
+}
+
+/// Choose the hook's exit code and reminder after the wait returns.
+fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String>) {
+    if !delivered && pending.is_empty() {
+        return (0, None); // every id already gone: nothing was delivered
     }
     if pending.is_empty() {
-        std::process::exit(2); // wake the model with the result(s)
+        return (2, None); // wake the model with the result(s)
     }
     let noun = if pending.len() == 1 { "job" } else { "jobs" };
-    outln!(
+    let reminder = format!(
         "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
         pending.join("`, `"),
         if pending.len() == 1 { "it" } else { "them" }
     );
-    std::process::exit(2);
+    (2, Some(reminder))
 }
 
 /// Poll every id in `job_ids` until each is `done` or gone, or `deadline`

@@ -21,8 +21,11 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::daemon::api::devices::Tier;
+use crate::daemon::api::panes::{HerdrOut, HerdrProbeOut, PaneProbe};
 use crate::daemon::api::routes::ApiContext;
+use crate::daemon::bridge::{Hub, Instance, PeerResolver};
 use crate::profile::{AppConfig, AppState};
+use crate::push::Trigger;
 use crate::testutil::HomeSandbox;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1789,8 +1792,10 @@ fn a_start_that_loses_its_port_imports_nothing() {
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
+        crate::usage::MemoryStores::empty_for_test(),
     )
-    .expect_err("the port is taken");
+    .err()
+    .expect("the port is taken");
     assert!(
         format!("{err:#}").contains("failed to bind the REST API"),
         "{err:#}"
@@ -1836,6 +1841,7 @@ fn a_start_that_serves_imports_the_legacy_token() {
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
+        crate::usage::MemoryStores::empty_for_test(),
     )
     .expect("the listener serves");
     drop(capture);
@@ -2526,5 +2532,141 @@ fn a_client_close_on_a_stream_is_not_a_write_failure() {
             &std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")
         ),
         "a non-close error on a stream keeps the failure wording"
+    );
+}
+
+// The pane follower's extracted function: `on_pane_blocked` maps a blocked pane
+// to its agent session through one probe, skips the push when the hub holds a
+// live mod instance on that session, and pushes as the pane's own otherwise
+// (WP-8). These pins drive the production wiring.
+
+fn s_one_instance() -> Instance {
+    Instance {
+        session_id: "s-one".to_string(),
+        proc_start: "1".to_string(),
+    }
+}
+
+fn s_one_hub() -> std::sync::Arc<Hub> {
+    let resolver: PeerResolver = Box::new(|_| Some(s_one_instance()));
+    Hub::new(true, resolver)
+}
+
+fn setup(
+    account: &str,
+) -> (
+    std::sync::Arc<Hub>,
+    crate::push::Queue,
+    std::sync::mpsc::Receiver<Trigger>,
+) {
+    let mut row = crate::testutil::live_row("100-0", account);
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+    let hub = s_one_hub();
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue.clone());
+    (hub, queue, rx)
+}
+
+fn bridge_event(hub: &Hub, body: serde_json::Value) {
+    let (status, answer) = hub.event(100, body.to_string().as_bytes());
+    assert_eq!(status, 200, "{answer}");
+}
+
+/// The pane-list fixture for one pane `p1` whose agent session is `session`,
+/// carrying the status the caller names.
+fn p1_pane_list(session: &str, status: &str) -> Vec<u8> {
+    serde_json::json!({
+        "id": "cli:pane:list",
+        "result": {"panes": [{
+            "agent": "claude",
+            "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": session},
+            "agent_status": status,
+            "cwd": "/w/app",
+            "focused": false,
+            "foreground_cwd": "/w/app",
+            "pane_id": "p1",
+            "revision": 1,
+            "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 57},
+            "tab_id": "w1:t1",
+            "terminal_id": "term",
+            "terminal_title": "",
+            "terminal_title_stripped": "",
+            "tokens": {"tollgate": "alpha"},
+            "workspace_id": "w1"
+        }]}
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A probe answering `pane list` with pane `p1` → session `session`.
+fn p1_probe(session: &'static str) -> PaneProbe {
+    Box::new(move |args, _| {
+        if args == ["pane", "list"] {
+            HerdrProbeOut::Ran(Some(HerdrOut {
+                success: true,
+                stdout: p1_pane_list(session, "blocked"),
+                stderr: Vec::new(),
+            }))
+        } else {
+            HerdrProbeOut::Ran(None)
+        }
+    })
+}
+
+/// A probe that cannot read `pane list` (herdr absent): the follower treats the
+/// pane as mod-less and pushes.
+fn failing_probe() -> PaneProbe {
+    Box::new(|_args, _| HerdrProbeOut::Ran(None))
+}
+
+/// A pane blocked in a session with a live mod instance pushes nothing: the mod
+/// is the only `blocked` push source for its session (WP-8).
+#[test]
+fn a_pane_in_a_session_with_a_live_mod_pushes_nothing() {
+    let _home = HomeSandbox::new();
+    let (hub, queue, rx) = setup("alpha");
+    bridge_event(
+        &hub,
+        serde_json::json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true}),
+    );
+    let probe = p1_probe("s-one");
+    super::on_pane_blocked(Some(&hub), &probe, &queue, "p1".to_string());
+    assert!(
+        rx.try_recv().is_err(),
+        "the follower pushed for a session the mod owns"
+    );
+}
+
+/// A pane blocked in a session without a mod pushes once, as the pane's own
+/// (base 47dde4f9's behavior).
+#[test]
+fn a_pane_in_a_session_without_a_mod_pushes_once() {
+    let _home = HomeSandbox::new();
+    let (hub, queue, rx) = setup("alpha");
+    let probe = p1_probe("s-one");
+    super::on_pane_blocked(Some(&hub), &probe, &queue, "p1".to_string());
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Ok(Trigger::Blocked {
+            pane_id: "p1".to_string()
+        })
+    );
+}
+
+/// A follower probe failure pushes as base did: the pane is treated as mod-less
+/// (WP-8).
+#[test]
+fn a_follower_probe_failure_pushes_as_base_did() {
+    let _home = HomeSandbox::new();
+    let (hub, queue, rx) = setup("alpha");
+    let probe = failing_probe();
+    super::on_pane_blocked(Some(&hub), &probe, &queue, "p1".to_string());
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Ok(Trigger::Blocked {
+            pane_id: "p1".to_string()
+        })
     );
 }

@@ -117,6 +117,7 @@ fn wallet_stats() -> ThirdPartyStats {
         label: label.to_string(),
         value: value.to_string(),
         kind: StatRowKind::Body,
+        raw: None,
     };
     ThirdPartyStats {
         is_available: true,

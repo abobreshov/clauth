@@ -34,6 +34,7 @@ pub(crate) mod gateway;
 pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
+pub(crate) mod push;
 pub(crate) mod routes;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
@@ -51,6 +52,75 @@ use crate::logline::logline;
 use crate::profile::ConfigHandle;
 
 use routes::ApiContext;
+
+/// How often the push follower retries a herdr that is absent or dropped:
+/// each retry re-resolves the socket through one bounded herdr call.
+const PUSH_FOLLOW_RETRY: Duration = Duration::from_secs(15);
+
+/// Start Web Push for the daemon's life: the sending thread, the herdr
+/// follower turning a pane's move into `blocked` into a push, and the wiring
+/// that hands the bridge hub the sender's inbox. `None` when the sender cannot
+/// start: the API serves on, and nothing is pushed.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn start_push(ctx: &ApiContext) -> Option<crate::push::Queue> {
+    let queue = match crate::push::spawn(panes::real_probe()) {
+        Ok(queue) => queue,
+        Err(e) => {
+            logline!("tollgate daemon: {e:#}; no push is sent");
+            return None;
+        }
+    };
+    #[cfg(unix)]
+    if let Some(bridge) = &ctx.bridge {
+        bridge.wire_push(queue.clone());
+    }
+    let follower = queue.clone();
+    #[cfg(unix)]
+    let bridge = ctx.bridge.clone();
+    #[cfg(unix)]
+    let probe = std::sync::Arc::new(panes::real_probe());
+    let spawned = std::thread::Builder::new()
+        .name("tollgate-push-herdr".to_string())
+        .spawn(move || {
+            let resolve = events::production_herdr_resolver();
+            events::follow_blocked(resolve.as_ref(), PUSH_FOLLOW_RETRY, None, &mut |pane_id| {
+                #[cfg(unix)]
+                on_pane_blocked(bridge.as_deref(), probe.as_ref(), &follower, pane_id);
+                #[cfg(not(unix))]
+                follower.send(crate::push::Trigger::Blocked { pane_id });
+                std::ops::ControlFlow::Continue(())
+            });
+        });
+    if let Err(e) = spawned {
+        logline!(
+            "tollgate daemon: failed to start the herdr follower ({e}); no blocked push is sent"
+        );
+    }
+    Some(queue)
+}
+
+/// The follower's one blocked pane: skip the push when the hub holds a live
+/// mod instance on the pane's agent session — the mod is the only `blocked`
+/// push source for its session (WP-8) — else push as base did, as the pane's
+/// own. A failed or empty probe (no session id readable) treats the pane as
+/// mod-less and pushes.
+#[cfg(unix)]
+fn on_pane_blocked(
+    bridge: Option<&crate::daemon::bridge::Hub>,
+    probe: &panes::PaneProbe,
+    queue: &crate::push::Queue,
+    pane_id: String,
+) {
+    let has_mod = panes::pane_session_id(probe, &pane_id)
+        .is_some_and(|session| bridge.is_some_and(|hub| hub.has_live_instance(&session)));
+    if has_mod {
+        return;
+    }
+    // Ruled exception (WP-8): a pane whose session id the probe could not read
+    // pushes as base did, mod-less, even when the pane is a live mod session
+    // that already announced — herdr's miss can double one push.
+    queue.send(crate::push::Trigger::Blocked { pane_id });
+}
 
 /// Concurrent connections served at once. The cap is what stops a connection
 /// flood from spawning threads without bound.
@@ -209,6 +279,30 @@ pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Pre
     Ok(Prepared { listen, tls_config })
 }
 
+/// Build the mod bridge and the API context together (unix): a bridge bind or
+/// spawn failure leaves `bridge` `None` and the daemon still serving (SB-1).
+/// Split from [`serve_prepared`] so a test drives the failure without a TLS
+/// identity.
+#[cfg(unix)]
+pub(crate) fn build_context(
+    config: ConfigHandle,
+    status_path: PathBuf,
+    live: super::LiveStores,
+    memory_stores: crate::usage::MemoryStores,
+) -> Arc<ApiContext> {
+    let bridge = crate::daemon::bridge::start();
+    ApiContext::new(
+        config,
+        status_path,
+        Some(live),
+        Some(memory_stores),
+        panes::real_probe(),
+        events::production_herdr_resolver(),
+        terminal::real_terminal_spawn(),
+        bridge,
+    )
+}
+
 /// Bind the listener [`prepare`] set up, fold in the legacy token, and start
 /// serving on it.
 ///
@@ -228,28 +322,40 @@ pub(crate) fn serve_prepared(
     config: ConfigHandle,
     status_path: PathBuf,
     live: super::LiveStores,
-) -> Result<()> {
+    memory_stores: crate::usage::MemoryStores,
+) -> Result<Arc<ApiContext>> {
     let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     devices::import_legacy()?;
     devices::note_at_start();
-    let ctx = ApiContext::new(
-        config,
-        status_path,
-        Some(live),
-        panes::real_probe(),
-        events::production_herdr_resolver(),
-        terminal::real_terminal_spawn(),
-    );
+    let ctx = {
+        #[cfg(unix)]
+        {
+            build_context(config, status_path, live, memory_stores)
+        }
+        #[cfg(not(unix))]
+        {
+            ApiContext::new(
+                config,
+                status_path,
+                Some(live),
+                Some(memory_stores),
+                panes::real_probe(),
+                events::production_herdr_resolver(),
+                terminal::real_terminal_spawn(),
+            )
+        }
+    };
 
+    let accept_ctx = Arc::clone(&ctx);
     let spawned = std::thread::Builder::new()
         .name("tollgate-api-accept".into())
-        .spawn(move || accept_loop(&listener, &tls_config, &ctx));
+        .spawn(move || accept_loop(&listener, &tls_config, &accept_ctx));
     spawned.context("failed to spawn the REST API accept thread")?;
 
     logline!("tollgate daemon: REST API listening on https://{listen}");
-    Ok(())
+    Ok(ctx)
 }
 
 fn accept_loop(
@@ -395,7 +501,14 @@ fn serve_connection(
                 break;
             }
             let (stream, leftover) = reader.into_parts();
-            terminal::run(stream, leftover, hijack, &ctx.terminal_spawn, expires);
+            terminal::run(
+                stream,
+                leftover,
+                hijack,
+                &ctx.terminal_spawn,
+                &ctx.terminal_holders,
+                expires,
+            );
             return;
         }
 

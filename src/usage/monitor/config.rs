@@ -451,7 +451,7 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
     let lower = name.bytes().filter(u8::is_ascii_lowercase).count();
     if name.len() >= 24 && digits >= 4 && lower >= 4 {
         bail!(
-            "that looks like a key, not a variable name — export the key and pass the \
+            "that looks like a key, not a variable name - export the key and pass the \
              variable's NAME instead"
         );
     }
@@ -535,7 +535,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<MonitorConfig>> {
             if let Some(k) = SECRET_KEYS.iter().find(|k| t.contains_key(**k)) {
                 let id = t.get("id").and_then(toml::Value::as_str).unwrap_or("?");
                 bail!(
-                    "monitors.toml: monitor '{id}' sets `{k}` — secrets are never stored here; \
+                    "monitors.toml: monitor '{id}' sets `{k}` - secrets are never stored here; \
                      name an environment variable with `api_key_env` / `billing_key_env` instead"
                 );
             }
@@ -580,7 +580,7 @@ fn redact_toml_message(message: &str) -> String {
     for c in message.chars() {
         if c == '"' {
             if quoted {
-                out.push_str("…\"");
+                out.push_str("...\"");
             } else {
                 out.push('"');
             }
@@ -648,7 +648,17 @@ fn edit_file(edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Re
     crate::profile::mkdir_700(&dir).with_context(|| format!("create {}", dir.display()))?;
     let lock = crate::profile::open_state_file(&dir.join(MONITORS_LOCK))
         .context("open the monitors.toml lock")?;
-    crate::lock::lock_file_with_timeout(&lock, std::time::Duration::from_secs(5))?;
+    crate::lock::lock_file_with_timeout(
+        &lock,
+        std::time::Duration::from_secs(5),
+        |waited| {
+            anyhow::anyhow!(
+                "timed out after {}s waiting for the monitors.toml lock",
+                waited.as_secs()
+            )
+        },
+        "failed to acquire the monitors.toml lock",
+    )?;
     let path = monitors_path()?;
     let text = read_capped(&path)?.unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {

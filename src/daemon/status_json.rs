@@ -12,7 +12,7 @@
 //! derived from the cache-file mtime so the single-shot `status --json` still
 //! produces a coherent shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -23,13 +23,13 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::profile_json::{
-    OauthAge, Window, oauth_age, provider_label, published_windows, publishes_a_live_window,
-    stale_after_ms, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_windows, published_windows_with_label,
+    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file,
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, now_ms, selected_next_refresh,
-    windows_maxed,
+    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
+    selected_next_refresh, windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -91,6 +91,9 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
+    /// The scheduler's OAuth usage store snapshot, for the canceled-exclusion
+    /// the queue membership rule reads (the daemon's own context).
+    pub(crate) usage: &'a HashMap<String, UsageInfo>,
     /// The gateway slot the daemon's supervisor last published. `None`
     /// single-shot or before the supervisor's first publish, where the slot
     /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
@@ -105,11 +108,6 @@ pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
         FetchStatus::RateLimited => "RateLimited",
         FetchStatus::AuthExpired => "AuthExpired",
     }
-}
-
-/// ISO-8601 (UTC) from an epoch-millisecond instant.
-fn iso_from_ms(ms: u64) -> String {
-    crate::providers::ms_to_iso(ms)
 }
 
 /// The `fallback` object for a profile: chain membership (`position` is
@@ -175,6 +173,18 @@ pub(crate) struct QueueEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ThirdPartyAvailability {
     pub(crate) available: bool,
+}
+
+/// One `spend`/`extra_usage` cap block as published per profile: `enabled`
+/// plus the block's own `percent` (its `utilization` for `extra_usage`). A
+/// dollar amount never reaches the feed; `percent` is `null` when the wire
+/// sent none (never a fabricated 0). The whole object is `null` when the
+/// cached usage carries no such block.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct CapBlock {
+    pub(crate) enabled: bool,
+    #[schema(required = true)]
+    pub(crate) percent: Option<f64>,
 }
 
 /// One `profiles[]` entry of the published `status.json` body — the shape both
@@ -249,7 +259,6 @@ pub(crate) struct ProfileEntry {
     /// it never opted into `auto_start`, or it cannot open a window.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) auto_start_queue: Option<QueueEntry>,
     #[schema(required = true)]
     pub(crate) bell_threshold: Option<f64>,
@@ -261,10 +270,32 @@ pub(crate) struct ProfileEntry {
     /// account's provider-derived ones. Empty when the cache behind them
     /// holds none.
     pub(crate) windows: Vec<Window>,
+    /// The label of this profile's LONG window by PRESENCE (`7d`, else `30d`
+    /// for a provider-marked monthly quota), carried in-memory only so the
+    /// push sender reads it off the entry it is already pushing instead of
+    /// re-reading the profile's cache every tick. Never published: the push
+    /// needs the presence label even when the long window's row is lapsed and
+    /// so absent from `windows`, which the published array cannot carry.
+    #[serde(skip)]
+    pub(crate) long_window_label: Option<&'static str>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.
     #[schema(required = true)]
     pub(crate) third_party: Option<ThirdPartyAvailability>,
+    /// The usage-credit `spend` block as `{enabled, percent}` — `null` when
+    /// the cached usage carries no `spend` block. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) spend: Option<CapBlock>,
+    /// The legacy credit `extra_usage` block as `{enabled, percent}`
+    /// (`percent` = its `utilization`) — `null` without the block.
+    #[serde(default)]
+    pub(crate) extra_usage: Option<CapBlock>,
+    /// Derived (#93): either block is capped
+    /// ([`crate::usage::UsageInfo::credit_capped`]). Never required: an older
+    /// daemon's body lacks it, so a reader defaults it to `false`.
+    #[serde(default)]
+    pub(crate) credit_capped: bool,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -280,6 +311,7 @@ pub(crate) fn build_profile_entries(
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
+    jobs: &crate::claude_jobs::JobTrees,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     // Interleaved auto-start queue (`usage::auto_start_queue`), hoisted so the
@@ -302,7 +334,14 @@ pub(crate) fn build_profile_entries(
             (now / 1000) as i64,
         ),
     };
-    let queue_members = crate::usage::auto_start_queue_members(config, &blocked);
+    let queue_members = match live {
+        Some(l) => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::fallback::refuses_service_from_usage(n, l.usage)
+        }),
+        None => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::profile_json::refuses_service_cached(n)
+        }),
+    };
     let queue_anchor = match live {
         Some(l) => l.queue_anchor,
         // The anchor replays every profile's history, never just the queue
@@ -320,12 +359,18 @@ pub(crate) fn build_profile_entries(
     let next_queue_open =
         crate::usage::next_queue_open_secs(queue_anchor, queue_members.len(), interval_ms)
             .and_then(|s| u64::try_from(s.saturating_mul(1000)).ok());
+    // One registry read per pass, shared by every profile's live-session cell —
+    // the same per-pass shape as the job snapshot, so the per-tick feed never
+    // pays profiles × rows registry reads.
+    let handed_off = crate::runtime::handed_off_live_members(jobs);
     config
         .profiles
         .iter()
         .filter(|p| include_disabled || !p.is_disabled() || config.is_active(&p.name))
         .map(|p| {
             let name = &p.name;
+            // Every age below is judged at the cadence this account is read at.
+            let interval_ms = crate::usage::usage_interval_ms(p, interval_ms);
             // Freshness reads each profile's OWN cache, through the one
             // selector every reader shares (`usage_cache_file` carries why).
             let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));
@@ -394,11 +439,19 @@ pub(crate) fn build_profile_entries(
             // daemonless surface. Bound to the credential that produced it, so
             // a re-login retires it and a profile nothing ever fetched has none.
             let recorded_expired = || {
-                crate::usage::profile_credential_fingerprint(p)
+                crate::usage::dead_login_fingerprint(p)
                     .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
                     .then_some(fetch_status_str(FetchStatus::AuthExpired))
             };
-            let fetch_status: Option<&'static str> = match live {
+            // A refused setup token outranks the live stores too: a stored pair
+            // keeps the OAuth leg's `/usage` poll fresh, while every session a
+            // switch starts runs on the refused token it installs ahead of the
+            // pair. Only there: a hybrid's record is its key's, and its OAuth
+            // leg's live status keeps the precedence above.
+            let token_refused = crate::usage::dead_login_is_setup_token(p)
+                .then(recorded_expired)
+                .flatten();
+            let fetch_status: Option<&'static str> = token_refused.or_else(|| match live {
                 Some(sig) => sig
                     .status
                     .get(name.as_str())
@@ -408,7 +461,7 @@ pub(crate) fn build_profile_entries(
                     .or_else(recorded_expired)
                     .or_else(derived_status),
                 None => recorded_expired().or_else(derived_status),
-            };
+            });
 
             // next_refresh_at: the live countdown store, else the derived
             // clock + interval (also the fallback for names the live store
@@ -535,6 +588,26 @@ pub(crate) fn build_profile_entries(
             } else {
                 None
             };
+            let (windows, long_window_label) = published_windows_with_label(name);
+            // The credit cap: the block the cache already loaded carries
+            // (`oauth_usage`), published as `{enabled, percent}` — never a
+            // dollar amount, and `percent` stays `null` when the wire sent
+            // none. `credit_capped` is the feed's cap verdict.
+            let spend = oauth_usage
+                .as_ref()
+                .and_then(|u| u.spend.as_ref())
+                .map(|s| CapBlock {
+                    enabled: s.enabled,
+                    percent: s.percent,
+                });
+            let extra_usage = oauth_usage
+                .as_ref()
+                .and_then(|u| u.extra_usage.as_ref())
+                .map(|e| CapBlock {
+                    enabled: e.is_enabled,
+                    percent: e.utilization,
+                });
+            let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
 
             ProfileEntry {
                 name: name.clone(),
@@ -565,24 +638,28 @@ pub(crate) fn build_profile_entries(
                     .map(crate::local_api::routes::redact_endpoint),
                 tier: tier_label(p),
                 harness: "claude".to_string(),
-                has_live_session: crate::runtime::has_live_session(name),
+                has_live_session: crate::runtime::has_live_session_in(name, jobs, &handed_off),
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
-                fetched_at: age_source_ms.map(iso_from_ms),
-                next_refresh_at: next_refresh_ms.map(iso_from_ms),
+                fetched_at: age_source_ms.map(ms_to_iso),
+                next_refresh_at: next_refresh_ms.map(ms_to_iso),
                 auto_start: p.auto_start,
                 auto_start_queue: queue_members
                     .iter()
                     .position(|n| n.as_str() == name.as_str())
                     .map(|i| QueueEntry {
                         position: i + 1,
-                        next_open_at: next_queue_open.map(iso_from_ms),
+                        next_open_at: next_queue_open.map(ms_to_iso),
                     }),
                 bell_threshold: p.bell_threshold,
                 fallback: fallback(config, p),
-                windows: published_windows(name),
+                windows,
+                long_window_label,
                 third_party,
+                spend,
+                extra_usage,
+                credit_capped,
             }
         })
         .collect()
@@ -628,7 +705,7 @@ pub(crate) fn build_codex_entries(
                         .and_then(|p| p.codex_plan.as_deref()),
                 ),
                 harness: "codex".to_string(),
-                has_live_session: crate::runtime::has_live_session(name),
+                has_live_session: crate::runtime::has_live_marker(name),
                 // `broken` is the server's terminal verdict on the chain
                 // (`codex_auth::read_quarantine`), the codex twin of the claude
                 // `auth_broken` grade; `expired` has no codex reading, since the
@@ -650,15 +727,24 @@ pub(crate) fn build_codex_entries(
                     .to_string()
                 }),
                 stale: false,
-                fetched_at: mtime_ms.map(iso_from_ms),
-                next_refresh_at: mtime_ms.map(|mt| iso_from_ms(mt.saturating_add(interval_ms))),
+                fetched_at: mtime_ms.map(ms_to_iso),
+                next_refresh_at: mtime_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
                 bell_threshold: None,
                 fallback: None,
                 windows: published_windows(name),
+                // Codex windows are always 5h/7d; the push reads its 7d label
+                // directly (no monthly), so the presence label is never needed.
+                long_window_label: None,
                 third_party: None,
+                // The credit cap is a claude-side reading (the `/usage` spend
+                // and `extra_usage` blocks); a codex entry publishes its
+                // no-data form rather than a fabricated one.
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             }
         })
         .collect()
@@ -714,7 +800,6 @@ pub(crate) struct StatusBody {
     /// that reads them today changes meaning. `default` so a reader stays
     /// additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) active_codex_profile: Option<String>,
     #[serde(default)]
     #[schema(value_type = Vec<String>)]
@@ -731,8 +816,32 @@ pub(crate) struct StatusBody {
     /// serves. `default` so a reader stays additive-tolerant of an older
     /// writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) gateway: Option<GatewaySlot>,
+    /// Additive: the lease holder's tps cache figures and `peaks`, plus
+    /// `age_secs` ([`TpsSlot`] names every field it carries; the cache's day
+    /// sums and producer state stay out). `None` = no producer cache.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) tps: Option<TpsSlot>,
+    /// Additive (#93): the model families Claude Code bills against usage
+    /// credits, `["fable", …]` from
+    /// [`crate::claude_json::credit_billed_families`]. `default` so a reader
+    /// stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) credit_billed_families: Vec<String>,
+    /// Additive: whether the WRITER's own executable changed since it started,
+    /// replaced or removed, the verdict its plugin heal stands down on
+    /// ([`crate::plugin_host::self_exe_change`]), so a same-version rebuild
+    /// counts. Only a fresh daemon's value says anything about the daemon.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) binary_replaced: bool,
+    /// Additive: the removed subset of `binary_replaced`, set only beside a
+    /// `true` `binary_replaced` when nothing sits at the writer's executable
+    /// path any more, so a reader that predates it still sees the change.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) binary_removed: bool,
     pub(crate) profiles: Vec<ProfileEntry>,
     /// Additive: the Hermes roster. Its own list, never appended to
     /// `profiles[]`: a Hermes home has no windows, tier or auth grade for a
@@ -740,6 +849,65 @@ pub(crate) struct StatusBody {
     /// of an older writer.
     #[serde(default)]
     pub(crate) hermes_profiles: Vec<HermesProfileEntry>,
+}
+
+/// The status feed's tps slot: the producer's cache figures and `peaks`, plus
+/// the cache's age in whole seconds. Every field is named here, so a cache
+/// field (day sums, producer-only state) reaches the feed only by being added.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct TpsSlot {
+    pub(crate) version: u16,
+    pub(crate) generated_at: String,
+    pub(crate) total: crate::tps::Figures,
+    pub(crate) accounts: BTreeMap<String, crate::tps::Figures>,
+    pub(crate) sessions: BTreeMap<String, TpsSession>,
+    pub(crate) age_secs: u64,
+    /// Additive: the cache's `peaks` republished as is.
+    pub(crate) peaks: crate::tps::Peaks,
+}
+
+/// One session's figures in the tps slot. Flattened-out (no serde flatten) so
+/// the schema derives cleanly while the wire shape stays `{account, live, m5,
+/// h1}` — identical to the cache's [`crate::tps::SessionFigures`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct TpsSession {
+    pub(crate) account: Option<String>,
+    pub(crate) live: crate::tps::Figure,
+    pub(crate) m5: crate::tps::Figure,
+    pub(crate) h1: crate::tps::Figure,
+}
+
+/// The cache's figures and `peaks`, plus `age_secs`; `None` when no cache
+/// exists or it does not parse. A cache older than
+/// [`crate::tps::STALE_AFTER_MS`] still republishes here — the feed is a fact,
+/// not a liveness gate (that gate is `which --json`'s).
+fn tps_slot() -> Option<TpsSlot> {
+    let snap = crate::tps::load_cache()?;
+    let age_ms = snap.age_ms(now_ms())?;
+    let sessions = snap
+        .sessions
+        .into_iter()
+        .map(|(sid, s)| {
+            (
+                sid,
+                TpsSession {
+                    account: s.account,
+                    live: s.figures.live,
+                    m5: s.figures.m5,
+                    h1: s.figures.h1,
+                },
+            )
+        })
+        .collect();
+    Some(TpsSlot {
+        version: snap.version,
+        generated_at: snap.generated_at,
+        total: snap.total,
+        accounts: snap.accounts,
+        sessions,
+        age_secs: age_ms / 1000,
+        peaks: snap.peaks,
+    })
 }
 
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
@@ -751,33 +919,82 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> StatusBody {
-    let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    build_status_with_codex(config, interval_ms, live, include_disabled).0
+}
+
+/// [`build_status`] that also hands back the codex state it read, so the one
+/// daemon tick that both publishes the body and judges its pushes reads the
+/// roster once rather than twice (two reads can disagree mid-tick). `None` when
+/// the read failed: the body still publishes an empty codex roster, but the
+/// caller must not forget codex names on a guess that tick.
+pub(crate) fn build_status_with_codex(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
+    build_status_impl(config, interval_ms, live, include_disabled, true)
+}
+
+/// [`build_status_with_codex`] for a body that carries its writer's own stamp
+/// (`own_stamp`) or a daemon's backdated one. The daemonless republish passes
+/// `false`: its stamp vouches for a daemon, not for this process, so it carries
+/// neither the tps slot (it would freeze a `tps.age_secs ~0` over a stale
+/// stamp, and the slot is the daemon's to republish) nor a `true`
+/// `binary_replaced` or `binary_removed` (this process's verdict would read as
+/// the daemon's).
+pub(crate) fn build_status_impl(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+    own_stamp: bool,
+) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
+    let mut profiles = build_profile_entries(
+        config,
+        interval_ms,
+        live,
+        include_disabled,
+        &crate::claude_jobs::job_trees(),
+    );
     // One read feeds both the entries and the slots below, so a load error
     // publishes an empty roster AND empty slots rather than a body whose two
     // halves describe different files.
-    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let codex = crate::codex_profiles::CodexState::load().ok();
+    let fallback = crate::codex_profiles::CodexState::default();
+    let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
     // prefix it always took.
-    profiles.extend(build_codex_entries(&codex, interval_ms));
+    profiles.extend(build_codex_entries(body_codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
+    let exe_change = if own_stamp {
+        crate::plugin_host::self_exe_change()
+    } else {
+        None
+    };
 
-    StatusBody {
+    let body = StatusBody {
         schema: SCHEMA_VERSION,
-        generated_at: iso_from_ms(now),
+        generated_at: ms_to_iso(now),
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
-        active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
-        codex_fallback_chain: codex.fallback_chain().to_vec(),
-        codex_wrap_off: codex.switch_off_when_spent(),
+        active_codex_profile: body_codex.active_profile().map(|n| n.as_str().to_string()),
+        codex_fallback_chain: body_codex.fallback_chain().to_vec(),
+        codex_wrap_off: body_codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         tollgate_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
+        tps: if own_stamp { tps_slot() } else { None },
+        credit_billed_families: crate::claude_json::credit_billed_families(),
+        binary_replaced: exe_change.is_some(),
+        binary_removed: exe_change == Some(crate::plugin_host::ExeChange::Removed),
         profiles,
         hermes_profiles: build_hermes_entries(),
-    }
+    };
+    (body, codex)
 }
 
 #[cfg(test)]

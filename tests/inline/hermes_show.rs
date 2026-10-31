@@ -154,7 +154,7 @@ fn pool_view_marks_env_entry_by_fingerprint() {
     let lines = pool_lines(&pool);
     assert_eq!(
         lines[0],
-        "#1 OPENROUTER_API_KEY  api_key/env:OPENROUTER_API_KEY  ok  req 5  prio 0  fp …5ae2  \
+        "#1 OPENROUTER_API_KEY  api_key/env:OPENROUTER_API_KEY  ok  req 5  prio 0  fp ...5ae2  \
          (the key tollgate bound)"
     );
     assert_eq!(
@@ -353,7 +353,7 @@ fn show_check_reports_each_guard_and_stops_at_the_first_refusal() {
             "G15 version",
             "S7(f) gate",
             "P projector",
-            "G7–G10a config",
+            "G7-G10a config",
             "G11 auth.json",
             "G12 env",
             "G13 binding",
@@ -445,7 +445,7 @@ fn list_renders_the_estimate_or_the_usage_error() {
     ];
     assert_eq!(
         render_list(&rows),
-        "● a  openrouter  account home  auth env  model m  $0.42 this month\n  b  nous        \
+        "* a  openrouter  account home  auth env  model m  $0.42 this month\n  b  nous        \
          pool home     auth pool  usage: sqlite3_missing\n"
     );
     assert!(render_list(&[]).starts_with("no Hermes profiles"));

@@ -367,14 +367,24 @@ fn edit<T>(f: impl FnOnce(&mut BTreeMap<String, Secret>) -> Result<T>) -> Result
         .open(dir.join(".secrets.lock"))?;
     #[cfg(unix)]
     check_metadata(&lock.metadata()?, false)?;
-    crate::lock::lock_file_with_timeout(&lock, std::time::Duration::from_secs(5))?;
+    crate::lock::lock_file_with_timeout(
+        &lock,
+        std::time::Duration::from_secs(5),
+        |waited| {
+            anyhow::anyhow!(
+                "timed out after {}s waiting for the secret store lock",
+                waited.as_secs()
+            )
+        },
+        "failed to acquire the secret store lock",
+    )?;
     let mut values = read_current()?;
     let result = f(&mut values)?;
     if values.len() > 64 {
         bail!("secret store allows at most 64 names");
     }
     let mut body = Zeroizing::new(String::from(
-        "# tollgate secrets v1 — managed by `tollgate secret`; values are never printed\n",
+        "# tollgate secrets v1 - managed by `tollgate secret`; values are never printed\n",
     ));
     for (name, value) in values {
         body.push_str(&name);
@@ -428,7 +438,7 @@ fn stored_confirmation(name: &str, value: &str) -> String {
     let suffix = if vendor.is_empty() {
         String::new()
     } else {
-        format!(", {vendor}…")
+        format!(", {vendor}...")
     };
     format!(
         "tollgate: stored {name} ({} chars{suffix}) in ~/.tollgate/secrets.env; the daemon picks it up within 10s",

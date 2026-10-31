@@ -104,21 +104,141 @@ fn an_opener_with_no_closer_marks_nothing() {
 #[test]
 fn wrap_counts_visible_width_only_and_keeps_styles_across_lines() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    // Visible: "re-login with tollgate login work" (33 chars). At width 22 the
-    // command splits "tollgate" onto line 1 and "login work" onto line 2; the
-    // markers' six code points never count toward the budget.
+    // Visible: "re-login with tollgate login work" (33 chars). At width 20 the
+    // 19-cell command cannot finish line 1, so it moves whole to line 2; at
+    // width 19 it still fits a line of its own, since the markers' code points
+    // never count toward the budget.
     let text = format!("re-login with {}", cmd("tollgate login work"));
-    let lines = wrap(&text, 22, dim());
+    let want = vec![
+        vec![Span::styled("re-login with", dim())],
+        vec![Span::styled("tollgate login work", cmd_style(dim()))],
+    ];
+    assert_eq!(wrap(&text, 20, dim()), want, "width 20");
+    assert_eq!(wrap(&text, 19, dim()), want, "width 19");
+}
+
+/// A command keeps to one row wherever it fits one: prose after it wraps on
+/// its own, and a command after a short lead word joins that word's row when
+/// both fit.
+#[test]
+fn wrap_never_breaks_a_command_that_fits_a_row() {
+    let text = format!("run {} to install it", cmd("tollgate herdr install"));
     assert_eq!(
-        lines,
+        wrap(&text, 26, dim()),
         vec![
             vec![
-                Span::styled("re-login with ", dim()),
-                Span::styled("tollgate", cmd_style(dim())),
+                Span::styled("run ", dim()),
+                Span::styled("tollgate herdr install", cmd_style(dim())),
             ],
-            vec![Span::styled("login work", cmd_style(dim()))],
+            vec![Span::styled("to install it", dim())],
         ]
     );
+    assert_eq!(
+        wrap(&text, 22, dim()),
+        vec![
+            vec![Span::styled("run", dim())],
+            vec![Span::styled("tollgate herdr install", cmd_style(dim()))],
+            vec![Span::styled("to install it", dim())],
+        ]
+    );
+}
+
+/// A command wider than the row breaks at its own spaces, never inside a
+/// word, the way prose does.
+#[test]
+fn wrap_breaks_a_command_wider_than_the_row_at_its_spaces() {
+    let text = format!("run {}", cmd("tollgate login some-long-name"));
+    assert_eq!(
+        wrap(&text, 14, dim()),
+        vec![
+            vec![
+                Span::styled("run ", dim()),
+                Span::styled("tollgate", cmd_style(dim())),
+            ],
+            vec![Span::styled("login", cmd_style(dim()))],
+            vec![Span::styled("some-long-name", cmd_style(dim()))],
+        ]
+    );
+}
+
+/// A key whose name holds a space (`⇧ tab`) is one wrap unit like a command:
+/// it never breaks across two rows.
+#[test]
+fn wrap_keeps_a_key_that_holds_a_space_whole() {
+    let text = format!("press {} to go back", key("⇧ tab"));
+    assert_eq!(
+        wrap(&text, 9, dim()),
+        vec![
+            vec![Span::styled("press", dim())],
+            vec![
+                Span::styled("⇧ tab", key_style(dim())),
+                Span::styled(" to", dim()),
+            ],
+            vec![Span::styled("go back", dim())],
+        ]
+    );
+}
+
+/// Prose-only copy wraps exactly as base `fd02ea48` did. The rows are literal
+/// values taken by running base's `wrap` in a copy, never computed by the code
+/// under test: the control-char, whitespace-run, wide-glyph and combining-mark
+/// cases each split differently from a naive char count.
+#[test]
+fn prose_only_wraps_pin_base_rows() {
+    let cases: [(&str, usize, &[&str]); 9] = [
+        (
+            "the quick brown fox jumps over the lazy dog and keeps on running",
+            12,
+            &[
+                "the quick",
+                "brown fox",
+                "jumps over",
+                "the lazy dog",
+                "and keeps on",
+                "running",
+            ],
+        ),
+        (
+            "the quick brown fox jumps over the lazy dog and keeps on running",
+            20,
+            &[
+                "the quick brown fox",
+                "jumps over the lazy",
+                "dog and keeps on",
+                "running",
+            ],
+        ),
+        (
+            "the quick brown fox jumps over the lazy dog and keeps on running",
+            33,
+            &[
+                "the quick brown fox jumps over",
+                "the lazy dog and keeps on running",
+            ],
+        ),
+        ("abc\u{1b}defghijkl.", 4, &["abcd", "efgh", "ijkl", "."]),
+        ("a  b\tc\u{a0}d e", 5, &["a b c", "d e"]),
+        ("a  b\tc\u{a0}d e", 4, &["a b", "c d", "e"]),
+        (
+            "\u{6f22}\u{6f22}\u{6f22} \u{6f22}\u{6f22}",
+            5,
+            &["\u{6f22}\u{6f22}", "\u{6f22}", "\u{6f22}\u{6f22}"],
+        ),
+        (
+            "\u{26a0}\u{fe0f}\u{26a0}\u{fe0f}\u{26a0}\u{fe0f}",
+            4,
+            &["\u{26a0}\u{fe0f}\u{26a0}\u{fe0f}", "\u{26a0}\u{fe0f}"],
+        ),
+        ("e\u{301}e f", 2, &["e\u{301}e", "f"]),
+    ];
+    for (text, width, want) in cases {
+        let got: Vec<String> = wrap(text, width, dim())
+            .into_iter()
+            .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        let want: Vec<String> = want.iter().map(|row| (*row).to_string()).collect();
+        assert_eq!(got, want, "{text:?} at width {width}");
+    }
 }
 
 #[test]
@@ -265,6 +385,110 @@ fn mark_commands_marks_a_backticked_command_and_leaves_other_spans_literal() {
         "`tollgate login\nwork` here"
     );
     assert_eq!(mark_commands(""), "");
+}
+
+/// A control character inside a hard-split word changes nothing the screen
+/// shows: every later chunk keeps its graphemes and the word's tail survives.
+/// The rows are base `fd02ea48` output, measured in a copy.
+#[test]
+fn a_control_char_never_shifts_a_hard_split() {
+    assert_eq!(
+        super::super::panes::wrap_words("abc\u{1b}defghijkl.", 4),
+        vec!["abcd", "efgh", "ijkl", "."]
+    );
+    let got: Vec<String> = wrap("abc\u{1b}defghijkl.", 4, dim())
+        .into_iter()
+        .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+        .collect();
+    assert_eq!(got, vec!["abcd", "efgh", "ijkl", "."]);
+}
+
+/// Punctuation pressed against a command belongs to its word: when the whole
+/// word no longer fits beside the row, the command still takes a row it fits
+/// and the glued punctuation opens the next row — never a break inside the
+/// command.
+#[test]
+fn wrap_cuts_a_glued_command_at_the_command_edges() {
+    let text = format!("run {})", cmd("tollgate login glm0 --api-key <key>"));
+    assert_eq!(
+        wrap(&text, 35, dim()),
+        vec![
+            vec![Span::styled("run", dim())],
+            vec![Span::styled(
+                "tollgate login glm0 --api-key <key>",
+                cmd_style(dim())
+            )],
+            vec![Span::styled(")", dim())],
+        ]
+    );
+    // Leading glue stays on the row it fits, then the command takes its own.
+    let text = format!("({})", cmd("QA QB"));
+    assert_eq!(
+        wrap(&text, 6, dim()),
+        vec![
+            vec![
+                Span::styled("(", dim()),
+                Span::styled("QA QB", cmd_style(dim())),
+            ],
+            vec![Span::styled(")", dim())],
+        ]
+    );
+}
+
+/// Whitespace inside a fitting command collapses to one ordinary space and a
+/// trailing one drops, so the rendered cells paste as the command; a
+/// non-breaking space is data, never a break point or a collapse.
+#[test]
+fn wrap_collapses_whitespace_inside_a_fitting_command() {
+    assert_eq!(
+        wrap(&format!("run {}", cmd("tollgate\tlogin")), 40, dim()),
+        vec![vec![
+            Span::styled("run ", dim()),
+            Span::styled("tollgate login", cmd_style(dim())),
+        ]]
+    );
+    assert_eq!(
+        wrap(&format!("x {}", cmd("a   b ")), 40, dim()),
+        vec![vec![
+            Span::styled("x ", dim()),
+            Span::styled("a b", cmd_style(dim())),
+        ]]
+    );
+    assert_eq!(
+        wrap(&format!("n {}", cmd("a\u{a0}b")), 40, dim()),
+        vec![vec![
+            Span::styled("n ", dim()),
+            Span::styled("a\u{a0}b", cmd_style(dim())),
+        ]]
+    );
+}
+
+fn row_texts(text: &str, width: usize) -> Vec<String> {
+    wrap(text, width, dim())
+        .into_iter()
+        .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+        .collect()
+}
+
+/// A command whose own text ends in whitespace keeps one space before prose
+/// pressed against its closing marker: the two words never fuse on screen.
+#[test]
+fn a_command_ending_in_whitespace_keeps_a_space_before_glued_prose() {
+    assert_eq!(
+        row_texts(&format!("run {}x", cmd("tollgate login ")), 40),
+        vec!["run tollgate login x"]
+    );
+    assert_eq!(
+        row_texts(&format!("run {}x", cmd("tollgate login\t")), 40),
+        vec!["run tollgate login x"]
+    );
+}
+
+/// A command holding only whitespace draws nothing and adds no blank cell
+/// between the prose words around it.
+#[test]
+fn a_whitespace_only_command_adds_no_blank_cell() {
+    assert_eq!(row_texts(&format!("a {} b", cmd("  ")), 40), vec!["a b"]);
 }
 
 #[test]

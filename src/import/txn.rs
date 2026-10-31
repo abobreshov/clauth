@@ -615,7 +615,7 @@ pub(crate) fn render_text(r: &Report, dry_run: bool) -> String {
         }
     };
     out.push(format!(
-        "  profiles  claude {} · codex {} · active {}",
+        "  profiles  claude {}; codex {}; active {}",
         list(&r.roster.claude),
         list(&r.roster.codex),
         r.roster.active.as_deref().unwrap_or("(none)")
@@ -624,7 +624,7 @@ pub(crate) fn render_text(r: &Report, dry_run: bool) -> String {
         out.push(format!("  rename    {old} -> {new}"));
     }
     out.push(format!(
-        "  slots     claude {}{} ({}) · codex {}{} ({})",
+        "  slots     claude {}{} ({}); codex {}{} ({})",
         r.live_slots.claude.state,
         r.live_slots
             .claude

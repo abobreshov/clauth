@@ -98,8 +98,20 @@ fn preferred_days_round_trip_through_config_toml() {
 }
 
 // Chain membership does not matter to `is_home_on` — it reads the profile
-// list — so the fixture only has to hold the profiles themselves.
+// list — so the fixture only has to hold the profiles themselves. The
+// day-claim axes (disabled, off-chain, the flag) judge a member that holds a
+// login; a login-less member reads "logged out" on the same exclusion the walk
+// applies, so the fixture holds one by default unless a test set its own.
 fn config_of(profiles: Vec<Profile>) -> AppConfig {
+    let profiles: Vec<Profile> = profiles
+        .into_iter()
+        .map(|mut p| {
+            if p.credentials.is_none() {
+                p.credentials = Some(crate::testutil::oauth_pair(p.name.as_str()));
+            }
+            p
+        })
+        .collect();
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
         state: AppState {
@@ -131,6 +143,7 @@ fn a_non_members_list_reads_inert() {
     off_chain.preferred_days = vec![Weekday::Sat];
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
+    flagged.credentials = Some(crate::testutil::oauth_pair("work"));
     let cfg = AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
@@ -291,6 +304,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
 
     let mut third = Profile::new("spare".to_string(), None, None);
     third.preferred_days = vec![Weekday::Sat];
+    third.credentials = Some(crate::testutil::oauth_pair("spare"));
     let mut widened = cfg;
     widened.state.profiles.push(ProfileName::from("spare"));
     widened
@@ -314,6 +328,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
 fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
     let mut member = Profile::new("work".to_string(), None, None);
     member.preferred_days = vec![Weekday::Sat];
+    member.credentials = Some(crate::testutil::oauth_pair("work"));
     let mut off_chain = Profile::new("personal".to_string(), None, None);
     off_chain.preferred_days = vec![Weekday::Sat];
 
@@ -393,12 +408,9 @@ fn a_passed_over_lister_names_what_became_of_the_day() {
     let notice = cfg
         .day_claim_passed_over(Weekday::Sat, &HashSet::new())
         .expect("a notice");
-    assert!(notice.starts_with("sat:"), "got {notice}");
-    assert!(notice.contains("the list on 'old'"), "got {notice}");
-    assert!(notice.contains("the account is disabled"), "got {notice}");
-    assert!(
-        notice.contains("'work' carries it"),
-        "a carried day still has somebody home, and the notice says who: {notice}"
+    assert_eq!(
+        notice,
+        "sat: the list on 'old' (the account is disabled) cannot claim it. 'work' carries it"
     );
 }
 
@@ -414,8 +426,11 @@ fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
     let notice = cfg
         .day_claim_passed_over(Weekday::Sat, &HashSet::new())
         .expect("a notice");
-    assert!(notice.contains("nothing else claims sat"), "got {notice}");
-    assert!(notice.contains("`preferred` decides it"), "got {notice}");
+    assert_eq!(
+        notice,
+        "sat: the list on 'old' (the account is disabled) cannot claim it. Nothing else claims \
+         sat, so `preferred` decides it"
+    );
 }
 
 // The ordinary case says nothing: every lister could serve, so no line is
@@ -1411,33 +1426,6 @@ fn oauth_credentials() -> ClaudeCredentials {
     }
 }
 
-/// A third-party account's windows are its usage snapshot: `load_profile`
-/// seeds `usage` from the same derivation the walk reads, so an api-key chain
-/// member is judged without waiting for a fetch.
-#[test]
-fn load_profile_seeds_usage_from_the_third_party_cache() {
-    let _home = HomeSandbox::new();
-    let name = "zai-seed";
-    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
-    p.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    p.api_key = Some("sk-fixture".to_string());
-    save_profile(&p).expect("save_profile");
-    crate::testutil::register_names(&[name]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from(name),
-        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        &crate::testutil::stats_with_bars(vec![
-            crate::testutil::bar("5h", 62.0),
-            crate::testutil::bar("7d", 31.0),
-        ]),
-    );
-
-    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
-    let usage = loaded.usage.expect("the derived windows seed usage");
-    assert_eq!(usage.five_hour.map(|w| w.utilization), Some(62.0));
-    assert_eq!(usage.seven_day.map(|w| w.utilization), Some(31.0));
-}
-
 /// Out-of-band per-profile thresholds are CLAMPED to the band at load, while the
 /// app-level weekly line RESETS TO DEFAULT (pinned separately by
 /// `weekly_switch_threshold_out_of_band_resets_to_default_at_load`). Two
@@ -1863,10 +1851,6 @@ fn an_env_token_profile_with_a_stored_pair_reads_usage_from_the_chain_cache() {
          figures live in the OAuth cache"
     );
     assert!(
-        loaded.third_party_usage.is_none(),
-        "and the load seeds no third-party figures from a cache nothing writes"
-    );
-    assert!(
         !stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
         "the lock-free reader answers the same"
     );
@@ -2049,6 +2033,7 @@ fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
     let got = recover_pending_credentials(
         &crate::profile::ProfileName::from(name),
         Some(committed.clone()),
+        true,
     );
     assert_eq!(
         refresh_token_of(&got),
@@ -2100,6 +2085,7 @@ fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
     let got = recover_pending_credentials(
         &crate::profile::ProfileName::from(name),
         Some(committed.clone()),
+        true,
     );
     assert_eq!(
         refresh_token_of(&got),
@@ -2152,7 +2138,8 @@ fn pending_sidecar_with_an_equal_mtime_is_adopted() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(committed)
+            Some(committed),
+            true,
         )),
         Some("tie-refresh"),
         "an equal mtime must adopt: the compare is `pending >= committed`",
@@ -2186,10 +2173,50 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            None
+            None,
+            true,
         )),
         Some("only-refresh"),
         "with no commit to compare against, the staged pair is the only live one",
+    );
+}
+
+/// A stale legacy `.pending` (older than the committed store) is one the RESOLVE
+/// half discards: `read_profile` answers with the committed store and neither
+/// adopts nor removes the sidecar — a read-only question must not mutate a
+/// credential store. `load_profile` keeps its land behaviour for the same shape
+/// (pinned by `pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled`).
+#[test]
+fn read_profile_neither_adopts_nor_removes_a_stale_pending_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "pending-read-stale";
+    let committed = pair("live-access", "live-refresh");
+    seed_committed(name, &committed);
+
+    let superseded = pair("spent-access", "spent-refresh");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &superseded)
+        .expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&cred_path, now);
+
+    let got = read_profile(&crate::profile::ProfileName::from(name)).expect("read_profile");
+    assert_eq!(
+        refresh_token_of(&got.credentials),
+        Some("live-refresh"),
+        "a stale sidecar resolves as the committed store, never the superseded pair"
+    );
+    assert!(
+        pending_path.exists(),
+        "the read must not remove a stale sidecar; only the load's land leg does"
     );
 }
 
@@ -2235,7 +2262,8 @@ fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(committed)
+            Some(committed),
+            true,
         )),
         Some("orphan-refresh"),
         "the stamp moved no bytes, so the staged pair is still the newest write",
@@ -2282,7 +2310,8 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(live)
+            Some(live),
+            true,
         )),
         Some("live-refresh"),
         "a commit newer than the sidecar still wins; the stamp's receipt is spent",
@@ -2377,6 +2406,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -2388,15 +2419,15 @@ fn credential_and_cache_files_have_restricted_permissions() {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: Some(creds.clone()),
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.
@@ -2667,6 +2698,177 @@ fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
         0o600,
         "a profile NAMED codex-home is a profile dir, retightened in full"
     );
+}
+
+/// #122: Claude Code writes `chrome/chrome-native-host` 0755 into a runtime
+/// tree and points the browser's native-messaging manifest at it, so the
+/// browser execs it. The sweep keeps an owner-executable file executable by
+/// its owner alone and strips every group and other bit; a file the owner
+/// could not execute stays 0600, whatever group or other carried.
+#[cfg(unix)]
+#[test]
+fn the_perms_sweep_keeps_an_executables_owner_exec_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let tollgate = tollgate_dir().expect("tollgate_dir");
+    let chrome = tollgate
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-7")
+        .join("chrome");
+    std::fs::create_dir_all(&chrome).expect("mkdir chrome");
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let wrapper = chrome.join("chrome-native-host");
+    std::fs::write(&wrapper, b"#!/bin/sh\nexit 7\n").expect("write wrapper");
+    chmod(&wrapper, 0o755);
+    let manifest = chrome.join("manifest.json");
+    std::fs::write(&manifest, b"{}").expect("write manifest");
+    chmod(&manifest, 0o644);
+    let other_exec = chrome.join("other-exec");
+    std::fs::write(&other_exec, b"#!/bin/sh\n").expect("write other-exec");
+    chmod(&other_exec, 0o651);
+    let open_exec = chrome.join("open-exec");
+    std::fs::write(&open_exec, b"#!/bin/sh\n").expect("write open-exec");
+    chmod(&open_exec, 0o777);
+    let open_plain = chrome.join("open-plain");
+    std::fs::write(&open_plain, b"{}").expect("write open-plain");
+    chmod(&open_plain, 0o666);
+    let open_dir = chrome.join("open-dir");
+    std::fs::create_dir(&open_dir).expect("mkdir open-dir");
+    chmod(&open_dir, 0o777);
+
+    enforce_tollgate_perms(&tollgate);
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&wrapper), 0o700, "the wrapper stays owner-executable");
+    assert_eq!(
+        mode(&manifest),
+        0o600,
+        "a plain file is retightened to 0600"
+    );
+    assert_eq!(
+        mode(&other_exec),
+        0o600,
+        "group and other exec bits never make a file owner-executable"
+    );
+    assert_eq!(
+        mode(&open_exec),
+        0o700,
+        "an executable loses every group and other bit, write included"
+    );
+    assert_eq!(
+        mode(&open_plain),
+        0o600,
+        "a plain file loses every group and other bit, write included"
+    );
+    assert_eq!(mode(&open_dir), 0o700, "a nested open dir is retightened");
+    assert_eq!(mode(&chrome), 0o700, "the dir keeps the invariant");
+
+    // The exec the browser performs. A sibling test thread forking while the
+    // write fd was open can leave the file text-busy for a moment (ETXTBSY).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        match std::process::Command::new(&wrapper)
+            .stdin(std::process::Stdio::null())
+            .status()
+        {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.expect("exec the wrapper"),
+        }
+    };
+    assert_eq!(status.code(), Some(7), "the swept wrapper still runs");
+}
+
+/// The owner-only checker every tree test leans on stays as strict as the rule
+/// tollgate's own state writers follow: a file is 0600 and a dir 0700, so a
+/// state writer that leaves any other mode, an owner exec bit included, is
+/// named (the sweep's exec-bit carry-over serves the executables Claude Code
+/// writes and the fake-mode tree copy carries in, never a state file).
+/// Each of the 512 modes is posed on a file and on an empty dir directly under
+/// the root, which pins the per-bit rule there; a 0o755 root, two 0o755
+/// non-empty dirs below it and a 0o644 file at the bottom pin that the walk
+/// reads the root and descends. A rule that differs only at another depth is
+/// not pinned here.
+#[cfg(unix)]
+#[test]
+fn the_owner_only_checker_names_every_mode_but_0600_files_and_0700_dirs() {
+    use crate::testutil::owner_only_violations;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Hands every posed dir back to 0o700 on drop, a panic included, so the
+    /// tempdir's own removal can read each one.
+    struct RestoreDirs(Vec<std::path::PathBuf>);
+    impl Drop for RestoreDirs {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("tree");
+    let nest = root.join("nest");
+    let inner = nest.join("inner");
+    std::fs::create_dir_all(&inner).expect("mkdir");
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let line = |mode: u32, path: &std::path::Path, want: u32| {
+        format!("{mode:#o} {} (want {want:#o})", path.display())
+    };
+    let mut want = Vec::new();
+    let mut dirs = RestoreDirs(Vec::new());
+    for mode in 0..=0o777u32 {
+        let file = root.join(format!("f{mode:03o}"));
+        std::fs::write(&file, b"").expect("write");
+        chmod(&file, mode);
+        if mode != 0o600 {
+            want.push(line(mode, &file, 0o600));
+        }
+        let dir = root.join(format!("d{mode:03o}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        dirs.0.push(dir.clone());
+        chmod(&dir, mode);
+        if mode != 0o700 {
+            want.push(line(mode, &dir, 0o700));
+        }
+    }
+    let deep = inner.join("deep");
+    std::fs::write(&deep, b"").expect("write");
+    chmod(&deep, 0o644);
+    want.push(line(0o644, &deep, 0o600));
+    chmod(&inner, 0o755);
+    want.push(line(0o755, &inner, 0o700));
+    chmod(&nest, 0o755);
+    want.push(line(0o755, &nest, 0o700));
+    chmod(&root, 0o755);
+    want.push(line(0o755, &root, 0o700));
+
+    let mut got = owner_only_violations(&root);
+    drop(dirs);
+    got.sort();
+    want.sort();
+    // Every file mode but 0o600, every dir mode but 0o700, the nested three and
+    // the root.
+    assert_eq!(want.len(), 511 + 511 + 4);
+    let missing: Vec<_> = want.iter().filter(|l| !got.contains(l)).collect();
+    assert!(missing.is_empty(), "the checker missed: {missing:?}");
+    let extra: Vec<_> = got.iter().filter(|l| !want.contains(l)).collect();
+    assert!(
+        extra.is_empty(),
+        "the checker named a compliant path: {extra:?}"
+    );
+    assert_eq!(got, want);
 }
 
 /// Installs from before the 0o600/0o700 rule carry a umask-moded tree that no
@@ -3217,6 +3419,56 @@ fn reload_fingerprint_catches_a_non_newest_config_edit() {
     );
 }
 
+/// An anchor-only write (a re-anchor) moves the reload fingerprint, so a
+/// detector picks it up even though no config/credential file changed.
+#[test]
+fn reload_fingerprint_moves_on_an_anchor_only_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile(&ProfileName::from("p"))).expect("save p");
+    save_app_state(&AppState {
+        profiles: vec!["p".into()],
+        ..Default::default()
+    })
+    .expect("app state");
+    let before = reload_fingerprint();
+    let anchor = profile_dir(&ProfileName::from("p"))
+        .expect("profile_dir")
+        .join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE);
+    std::fs::write(&anchor, "\"uuid-A\"").expect("write the anchor");
+    crate::testutil::set_mtime(
+        &anchor,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "an anchor-only write must flip the fingerprint"
+    );
+}
+
+/// A codex `auth.json`-only write moves the reload fingerprint, so a codex
+/// in-place rewrite (which touches nothing else) still triggers a reload.
+#[test]
+fn reload_fingerprint_moves_on_an_auth_json_only_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile(&ProfileName::from("p"))).expect("save p");
+    let auth = profile_dir(&ProfileName::from("p"))
+        .expect("profile_dir")
+        .join("auth.json");
+    std::fs::write(&auth, r#"{"tokens":{"account_id":"codex-A"}}"#).expect("write auth");
+    let before = reload_fingerprint();
+    std::fs::write(&auth, r#"{"tokens":{"account_id":"codex-B"}}"#).expect("rewrite auth");
+    crate::testutil::set_mtime(
+        &auth,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "an auth.json-only write must flip the fingerprint"
+    );
+}
+
 // The burn-aware tunable accessors reset a hand-edited out-of-band value to the
 // default (fail-safe, like the weekly line) and keep an in-band one. An unset
 // field reads as the default so `skip_serializing_if` keeps omitting it.
@@ -3535,6 +3787,36 @@ fn the_auth_expired_record_is_owner_only() {
     ));
 }
 
+/// The dead-key record is another writer under `~/.tollgate`, holding a hash of a
+/// live api key: the tree-wide 0600 rule covers it.
+#[cfg(unix)]
+#[test]
+fn the_dead_key_record_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["perm-dead-key"]);
+    let name = crate::profile::ProfileName::from("perm-dead-key");
+    crate::profile_cache::write_dead_key(&name, 0x0123_4567_89ab_cdef);
+    assert!(crate::profile_cache::dead_key_matches(
+        &name,
+        0x0123_4567_89ab_cdef
+    ));
+    assert!(
+        !crate::profile_cache::dead_key_matches(&name, 1),
+        "a record for another key is inert"
+    );
+
+    let path = crate::profile_cache::profile_cache_path(&name, crate::profile_cache::DEAD_KEY_FILE)
+        .expect("cache path");
+    let mode = std::fs::metadata(&path)
+        .expect("the dead-key record exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "got {mode:#o}");
+}
+
 /// `save_profile` must not drop non-login blocks (e.g. `mcpOAuth`) that a Claude
 /// login-token refresh rewrites over — those are per-MCP-server logins
 /// independent of the account. Synthetic tokens only.
@@ -3769,7 +4051,11 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
     crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
     crate::testutil::set_mtime(&pending_path, now);
 
-    recover_pending_credentials(&crate::profile::ProfileName::from(name), Some(committed));
+    recover_pending_credentials(
+        &crate::profile::ProfileName::from(name),
+        Some(committed),
+        true,
+    );
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
@@ -4321,6 +4607,81 @@ fn loading_a_config_toml_with_unknown_keys_does_not_rewrite_it() {
     );
 }
 
+/// A non-bare `[env]` key renders as a single-line quoted key that parses back
+/// to the same map, one fixture per encoding a key encoder can pick: a
+/// TUI-entered `A:B`, a space, a dot (which a bare render reads as a nested
+/// table), `=`, a `"` or `\`, both quote kinds, a newline and a control
+/// character. A bare-safe key stays bare, byte for byte. Residual: a key class
+/// outside these encodings is not exercised.
+#[test]
+fn an_env_key_that_needs_quotes_renders_quoted_and_round_trips() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    for (k, v) in [
+        ("A:B", "colon"),
+        ("HAS SPACE", "space"),
+        ("dot.ted", "dot"),
+        ("K=V", "equals"),
+        ("say\"hi", "quote"),
+        ("back\\slash", "backslash"),
+        ("it's \"both\"", "both quotes"),
+        ("A\nB", "newline"),
+        ("ctl\u{1}", "control"),
+        ("PLAIN_KEY-1", "bare"),
+    ] {
+        profile.env.insert(k.to_string(), v.to_string());
+    }
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered)
+        .unwrap_or_else(|e| panic!("the render does not parse: {e}\n{rendered}"));
+    assert_eq!(
+        parsed.env, profile.env,
+        "the env map round-trips:\n{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|l| l == "PLAIN_KEY-1 = \"bare\""),
+        "a bare-safe key stays bare:\n{rendered}"
+    );
+}
+
+/// A quoted `[env]` key survives the real write path: a save writes it, a load
+/// reads it back, and the file still parses for the load after that.
+#[test]
+fn a_saved_quoted_env_key_loads_and_reloads() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("envquote".to_string(), None, None);
+    profile.env.insert("A.B".to_string(), "x".to_string());
+    profile.env.insert("A:B".to_string(), "y".to_string());
+    save_profile(&profile).expect("save");
+
+    let name = crate::profile::ProfileName::from("envquote");
+    let config_path = profile_config_path(&name).expect("config path");
+    let on_disk = std::fs::read_to_string(&config_path).expect("read config");
+    let parsed: ProfileConfig = toml::from_str(&on_disk)
+        .unwrap_or_else(|e| panic!("the saved config.toml does not parse: {e}\n{on_disk}"));
+    assert_eq!(parsed.env, profile.env, "{on_disk}");
+
+    let first = load_profile(&name).expect("first load");
+    assert_eq!(first.env, profile.env);
+    let second = load_profile(&name).expect("second load");
+    assert_eq!(second.env, profile.env);
+}
+
+/// A hand-quoted key a value encoder would write multi-line survives two
+/// loads: the first load must not rewrite the file into one that no longer
+/// parses.
+#[test]
+fn a_hand_quoted_newline_env_key_survives_two_loads() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new("envnl".to_string(), None, None)).expect("save");
+    let name = crate::profile::ProfileName::from("envnl");
+    let config_path = profile_config_path(&name).expect("config path");
+    std::fs::write(&config_path, "[env]\n\"A\\nB\" = \"x\"\n").expect("write config");
+    load_profile(&name).expect("first load");
+    let second = load_profile(&name).expect("second load");
+    assert_eq!(second.env.get("A\nB").map(String::as_str), Some("x"));
+}
+
 /// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
 /// released tollgate ever wrote it, and a permanent alias for something that
 /// never shipped is pure legacy surface. An unknown key parses as OFF.
@@ -4525,6 +4886,119 @@ fn a_default_serve_table_carries_a_stray_key() {
     );
 }
 
+/// A config.toml an older tollgate wrote spells `auto_start` as its pre-rename
+/// alias `kick_timer`. The round-trip that decides "modelled" parses the alias
+/// into `auto_start` and re-emits it under that name, so `kick_timer` reads as
+/// unmodelled and was carried beside the render's own `auto_start`. Serde
+/// counts an alias and its field as one field, so the next load failed with a
+/// duplicate `auto_start` and the profile was unloadable until hand-edited.
+#[test]
+fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alias"]);
+    let name = ProfileName::from("alias");
+    let mut profile = crate::testutil::blank_profile(&name);
+    save_profile(&profile).expect("first save");
+    let path = profile_config_path(&name).expect("config path");
+    let rendered = std::fs::read_to_string(&path).expect("read");
+    // Off, the render writes only the commented `# auto_start = true` hint.
+    assert!(!rendered.contains("\nauto_start"), "{rendered}");
+    std::fs::write(&path, rendered + "kick_timer = true\n").expect("plant the pre-rename spelling");
+
+    profile.auto_start = true;
+    save_profile(&profile).expect("save over the aliased file");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let back = load_profile(&name).unwrap_or_else(|e| panic!("reload failed: {e:#}\n{after}"));
+    assert!(back.auto_start);
+    let table: toml::Table = after.parse().expect("parses");
+    assert!(
+        !table.contains_key("kick_timer"),
+        "the alias is rewritten under its field's name:\n{after}"
+    );
+}
+
+/// Turning auto-start OFF on a file that spells it `kick_timer = true`: the
+/// render leaves `auto_start` at its skipped default, so the alias is not a
+/// duplicate there, but carried back it would turn auto-start on again at the
+/// next load. The inert rule drops it because it changes a parsed value.
+#[test]
+fn turning_auto_start_off_never_carries_the_alias_back() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alias"]);
+    let name = ProfileName::from("alias");
+    let profile = crate::testutil::blank_profile(&name);
+    save_profile(&profile).expect("first save");
+    let path = profile_config_path(&name).expect("config path");
+    let rendered = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(&path, rendered + "kick_timer = true\n").expect("plant the pre-rename spelling");
+
+    let mut on = load_profile(&name).expect("the alias loads");
+    assert!(on.auto_start, "kick_timer = true reads as auto-start on");
+    on.auto_start = false;
+    save_profile(&on).expect("save auto-start off");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let back = load_profile(&name).unwrap_or_else(|e| panic!("reload failed: {e:#}\n{after}"));
+    assert!(!back.auto_start, "auto-start stays off:\n{after}");
+    let table: toml::Table = after.parse().expect("parses");
+    assert!(!table.contains_key("kick_timer"), "{after}");
+}
+
+/// A small model with a serde alias at the top level and inside a table, so
+/// the inert rule is pinned on its own: neither real model has a nested alias.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AliasModel {
+    #[serde(alias = "old")]
+    new: bool,
+    #[serde(default)]
+    inner: AliasInner,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AliasInner {
+    #[serde(alias = "old_in")]
+    new_in: bool,
+}
+
+#[test]
+fn an_alias_carry_is_never_inert_and_an_unmodelled_one_is() {
+    let render = "new = true\n\n[inner]\nnew_in = true\n";
+    let table: toml::Table = render.parse().unwrap();
+    let baseline = parsed_as::<AliasModel>(render);
+    assert!(baseline.is_some());
+    let yes = toml::Value::Boolean(true);
+
+    // Top level: the alias beside its field is a duplicate field.
+    assert!(!carry_is_inert::<AliasModel>(
+        baseline.as_deref(),
+        &table,
+        "old",
+        &yes
+    ));
+    assert!(carry_is_inert::<AliasModel>(
+        baseline.as_deref(),
+        &table,
+        "future",
+        &yes
+    ));
+    // A render that does not parse as the model carries nothing.
+    assert!(!carry_is_inert::<AliasModel>(None, &table, "future", &yes));
+
+    // Nested, entry by entry: the aliased key goes, its genuine sibling stays.
+    let nested = vec![
+        ("inner".to_string(), "old_in".to_string(), yes.clone()),
+        ("inner".to_string(), "future_in".to_string(), yes.clone()),
+    ];
+    let merged =
+        nested_carry_if_inert::<AliasModel>(render.to_string(), baseline.as_deref(), &nested);
+    let back: toml::Table = merged.parse().expect("merged parses");
+    let inner = back["inner"].as_table().expect("inner table");
+    assert!(inner.contains_key("future_in"), "{merged}");
+    assert!(!inner.contains_key("old_in"), "{merged}");
+    assert!(toml::from_str::<AliasModel>(&merged).is_ok(), "{merged}");
+}
+
 // `bell_command` is a hand-edited key: a rewrite keeps the operator's quoting
 // byte for byte.
 #[test]
@@ -4646,7 +5120,7 @@ fn a_legacy_pending_survives_a_load_that_cannot_take_the_flock() {
     let _held = hold_state_flock();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
 
-    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")), true);
     crate::lock::set_state_lock_timeout_override(None);
 
     assert_eq!(
@@ -4681,12 +5155,1378 @@ fn a_stale_legacy_pending_goes_without_waiting_on_the_flock() {
     let _held = hold_state_flock();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
 
-    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")), true);
     crate::lock::set_state_lock_timeout_override(None);
 
     assert_eq!(refresh_token_of(&got), Some("old-refresh"));
     assert!(
         !pending_path.exists(),
         "a stale sidecar goes without the flock"
+    );
+}
+
+/// The no-rewrite read (the MCP handshake) answers an adoptable legacy
+/// `.pending` sidecar with the pair the rule judges live — read lock-free and
+/// never written through — even while another process holds the state flock:
+/// the sidecar's pair comes back at once and both `credentials.json` and the
+/// sidecar are left for the next ordinary load to land under the flock.
+#[test]
+fn the_no_rewrite_read_adopts_a_pending_sidecar_lock_free_and_never_writes() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("pending-norewrite");
+    seed_committed(name.as_str(), &pair("old-access", "old-refresh"));
+    let dir = profile_dir(&name).expect("dir");
+    let cred_path = dir.join("credentials.json");
+    let pending_path = dir.join("credentials.json.pending");
+    std::fs::write(
+        &pending_path,
+        serde_json::to_vec(&pair("new-access", "new-refresh")).expect("serialize"),
+    )
+    .expect("write the legacy sidecar");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending_path, now);
+
+    let _held = hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(2)));
+
+    let started = std::time::Instant::now();
+    let profile = read_profile(&name).expect("the no-rewrite read succeeds");
+    let waited = started.elapsed();
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(
+        refresh_token_of(&profile.credentials),
+        Some("new-refresh"),
+        "the no-rewrite read answers with the sidecar's live pair"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "the no-rewrite read never waits on the state flock (2 s timeout): {waited:?}"
+    );
+    assert!(
+        pending_path.is_file(),
+        "the sidecar stays for the next ordinary load to land under the flock"
+    );
+    let on_disk: ClaudeCredentials = read_json_file(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        on_disk
+            .claude_ai_oauth
+            .and_then(|o| o.refresh_token)
+            .as_deref(),
+        Some("old-refresh"),
+        "the no-rewrite read never writes the adopted pair through"
+    );
+}
+
+// The credit gate (#93) defaults ON: an absent key in every config.toml
+// written before it existed keeps the cap checked, only `false` renders live,
+// and the load boundary turns absence into ON.
+#[test]
+fn the_credit_gate_defaults_on_and_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_credit_cap, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    assert!(
+        profile.check_credit_cap,
+        "a new profile checks its credit cap"
+    );
+    profile.check_credit_cap = false;
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("\ncheck_credit_cap = false\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_credit_cap, Some(false));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        stock.contains(
+            "\n\n# Whether auto-switching keeps off this account while its usage-credit cap\n\
+             # is spent (Claude Code then refuses credit-billed models such as Fable).\n\
+             # Set false to keep it in rotation for other models.\n\
+             # check_credit_cap = false\n"
+        ),
+        "the key carries its own comment block (cloudy, 2026-10-19): {stock}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_credit_cap, None);
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("credit-gate");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::write(&config_path, "").expect("write empty config.toml");
+    assert!(
+        load_profile(&name).expect("load").check_credit_cap,
+        "absent loads as ON"
+    );
+    std::fs::write(&config_path, "check_credit_cap = false\n").expect("write config.toml");
+    assert!(
+        !load_profile(&name).expect("load").check_credit_cap,
+        "an explicit false survives"
+    );
+}
+
+/// The MCP handshake's profile read never waits on the state flock, while the
+/// ordinary load DOES take it to land an adoptable legacy
+/// `credentials.json.pending` sidecar (`land_pending_credentials` writes it
+/// through under the flock). The fixture is that sidecar: with a peer holding
+/// the flock, `read_profile` answers at once from memory and leaves the sidecar
+/// for the next ordinary load, while `load_profile` blocks on the flock to land
+/// it.
+#[test]
+fn the_handshake_profile_read_never_waits_on_the_state_flock() {
+    let _home = HomeSandbox::new();
+    let tollgate = tollgate_dir().expect("tollgate dir");
+    std::fs::create_dir_all(tollgate.join("profiles").join("held")).expect("create profile dir");
+    let config_path = tollgate.join("profiles").join("held").join("config.toml");
+    std::fs::write(&config_path, "[env]\n\"A:B\" = \"x\"\n").expect("write config.toml");
+    // An adoptable legacy `.pending` sidecar (no `credentials.json` to be newer
+    // than): an ordinary load takes the state flock and writes it through.
+    let pending_path = tollgate
+        .join("profiles")
+        .join("held")
+        .join("credentials.json.pending");
+    let pending_json =
+        "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}";
+    std::fs::write(&pending_path, pending_json).expect("write the legacy sidecar");
+
+    // This process holds the flock a peer process would hold. `try_lock` so a
+    // second holder can never hang the suite; a lock file is never truncated.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(tollgate.join(".lock"))
+        .expect("open the state lock");
+    lock.try_lock().expect("take the state flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(2)));
+    let name = ProfileName::from("held");
+
+    let started = std::time::Instant::now();
+    let profile = read_profile(&name).expect("the no-rewrite read succeeds");
+    let waited = started.elapsed();
+    assert_eq!(
+        profile.env.get("A:B").map(String::as_str),
+        Some("x"),
+        "the no-rewrite read still reads the profile"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "the handshake read never waits on the state flock (2 s timeout): {waited:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read back"),
+        "[env]\n\"A:B\" = \"x\"\n",
+        "the no-rewrite read leaves the file as it is"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pending_path).expect("read back the sidecar"),
+        pending_json,
+        "the no-rewrite read leaves the sidecar for the next ordinary load"
+    );
+
+    // The control: the ordinary load takes the flock to land the same sidecar,
+    // so the test would fail if the fixture stopped being adoptable.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let control_name = name.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let outcome = load_profile(&control_name);
+        let _ = tx.send((started.elapsed(), outcome.is_ok()));
+    });
+    let (control_waited, ok) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the control load returns after the scaled flock timeout");
+    assert!(ok, "the control load still succeeds");
+    assert!(
+        control_waited >= std::time::Duration::from_millis(1500),
+        "the control: load_profile waits on the flock: {control_waited:?}"
+    );
+    drop(lock);
+}
+
+// ---- `stored_login` (the on-disk drain read) ----
+
+/// A `credentials.json` that exists but cannot be parsed proves nothing: the
+/// read is unknown — a store that exists but cannot be read or parsed — never
+/// "no login".
+#[test]
+fn stored_login_reads_a_torn_credentials_file_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-creds");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable credentials.json must not read as no login"
+    );
+}
+
+/// A `config.toml` that exists but cannot be parsed proves nothing: the read
+/// is unknown — a store that exists but cannot be read or parsed — never "no
+/// key".
+#[test]
+fn stored_login_reads_a_torn_config_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-config");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("config.toml"),
+        "api_key = \"sk-test\"\nbase_url = [",
+    )
+    .expect("write torn config.toml");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable config.toml must not read as no login"
+    );
+}
+
+/// A `session-token.json` that exists but cannot be parsed proves nothing: the
+/// read is unknown, never "no sidecar" (`session_token_status` disengages on a
+/// corrupt sidecar, which is right for installing, wrong for proving absence).
+#[test]
+fn stored_login_reads_a_torn_sidecar_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-sidecar");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn session-token.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable session-token.json must not read as no login"
+    );
+}
+
+/// Any readable fact proving a login wins, whatever else is unreadable: a
+/// `config.toml` with a usable api key holds a login even beside a torn
+/// `credentials.json`.
+#[test]
+fn stored_login_reads_a_torn_credentials_file_beside_a_readable_api_key_as_holding_a_login() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-beside-key");
+    let mut keyed = crate::testutil::blank_profile(&name);
+    keyed.api_key = Some("sk-test".to_string());
+    save_profile(&keyed).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::HoldsLogin,
+        "a readable api key holds a login even beside an unreadable credentials.json"
+    );
+}
+
+/// With no store files at all, the read proves none: every store that exists is
+/// readable and holds nothing.
+#[test]
+fn stored_login_reads_no_files_as_holding_none() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("no-files");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::HoldsNone,
+        "no store files prove no login"
+    );
+}
+
+// ---- a torn `credentials.json` at load ----
+
+const TORN_STORE: &str = "{\"claudeAiOauth\": {\"accessToken\": ";
+
+fn tear_store(name: &crate::profile::ProfileName) -> std::path::PathBuf {
+    let path = crate::profile::profile_dir(name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&path, TORN_STORE).expect("write torn credentials.json");
+    path
+}
+
+/// One unparseable store costs its own account its login and nothing else: the
+/// roster loads, the torn account keeps its settings and reads logged out, and
+/// the torn bytes stay on disk for a later read or a re-login.
+#[test]
+fn a_torn_store_loads_its_account_logged_out_beside_the_rest() {
+    let _home = HomeSandbox::new();
+    let torn = crate::profile::ProfileName::from("torn");
+    let fine = crate::profile::ProfileName::from("fine");
+    let mut torn_profile = crate::testutil::blank_profile(&torn);
+    torn_profile.fallback_threshold = Some(80.0);
+    torn_profile.credentials = Some(crate::testutil::oauth_pair("torn-access"));
+    save_profile(&torn_profile).expect("save torn");
+    let mut fine_profile = crate::testutil::blank_profile(&fine);
+    fine_profile.credentials = Some(crate::testutil::oauth_pair("fine-access"));
+    save_profile(&fine_profile).expect("save fine");
+    save_app_state(&AppState {
+        profiles: vec![torn.clone(), fine.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let store = tear_store(&torn);
+
+    let config = load_config().expect("one torn store must not fail the roster's load");
+
+    assert_eq!(config.profiles.len(), 2, "both accounts load");
+    let torn_loaded = config.find(&torn).expect("the torn account loads");
+    assert!(
+        torn_loaded.credentials.is_none(),
+        "the torn account reads logged out"
+    );
+    assert!(!torn_loaded.holds_login(), "a torn store proves no login");
+    assert_eq!(
+        torn_loaded.fallback_threshold,
+        Some(80.0),
+        "the torn account keeps its config"
+    );
+    assert_eq!(
+        config.find(&fine).and_then(|p| p.access_token()),
+        Some("fine-access"),
+        "the other account keeps its login"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read torn store"),
+        TORN_STORE,
+        "the load leaves the torn bytes as they were"
+    );
+
+    let without_rewrite = load_config_without_rewrite()
+        .expect("the handshake's no-rewrite load must not fail on a torn store either");
+    assert_eq!(without_rewrite.profiles.len(), 2);
+}
+
+/// An OAuth account whose `config.toml` also names an endpoint (and carries no
+/// key of its own) loads with that endpoint dropped, so its bearer never goes
+/// there. A torn store is a store that exists, so the endpoint stays dropped:
+/// the load must agree with the lock-free endpoint readers, which judge by the
+/// file existing.
+#[test]
+fn a_torn_store_keeps_an_oauth_accounts_endpoint_dropped() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("hybrid");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    hybrid.credentials = Some(crate::testutil::oauth_pair("hybrid-access"));
+    save_profile(&hybrid).expect("save hybrid");
+    assert_eq!(
+        load_profile(&name).expect("intact load").base_url,
+        None,
+        "control: an intact store drops the endpoint"
+    );
+    tear_store(&name);
+
+    let loaded = load_profile(&name).expect("a torn store loads");
+
+    assert_eq!(
+        loaded.base_url, None,
+        "a torn store drops the endpoint as an intact one does"
+    );
+    assert_eq!(loaded.provider, None);
+    assert!(
+        matches!(
+            crate::profile::stored_endpoint(&name),
+            crate::profile::StoredEndpoint::Anthropic
+        ),
+        "the lock-free endpoint reader agrees"
+    );
+}
+
+/// An account that runs on its own api key records the same spawn identity
+/// whether its OAuth store reads or not: the identity of a keyed account never
+/// reads the login, so a torn store must not cost a delegate's speed sample.
+#[test]
+fn a_torn_store_keeps_a_keyed_accounts_spawn_identity() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-spawn");
+    let mut keyed = crate::testutil::blank_profile(&name);
+    keyed.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    keyed.api_key = Some("sk-torn-spawn".to_string());
+    keyed.credentials = Some(crate::testutil::oauth_pair("torn-spawn-access"));
+    save_profile(&keyed).expect("save keyed");
+    let intact = crate::usage::throughput_identity_for_spawn(
+        &name,
+        &load_profile(&name).expect("intact load"),
+    );
+    assert!(
+        intact.is_some(),
+        "control: an intact store records an identity"
+    );
+    tear_store(&name);
+
+    let loaded = load_profile(&name).expect("a torn store loads");
+
+    assert_eq!(
+        crate::usage::throughput_identity_for_spawn(&name, &loaded),
+        intact,
+        "a torn store leaves a keyed account's spawn identity as it was"
+    );
+}
+
+/// A store that cannot be read at all (here a directory in its place) loads
+/// logged out like a torn one, and the account carries the read error the
+/// notice names instead of a parse failure.
+#[test]
+fn an_unreadable_store_loads_logged_out_and_names_the_os_error() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save p1");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::create_dir(&store).expect("a directory in the store's place");
+
+    let loaded = load_profile(&name).expect("an unreadable store loads");
+
+    assert!(loaded.credentials.is_none(), "it reads logged out");
+    // The OS renders the read error (`Is a directory (os error 21)` on unix,
+    // `Access is denied. (os error 5)` on windows): read it off the same path.
+    let os_error = crate::testutil::directory_read_error(&store);
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&loaded),
+        Some(format!(
+            "tollgate: p1: its stored login could not be read (credentials.json: {os_error}), so it shows as logged out until `tollgate login p1`"
+        )),
+    );
+    assert!(store.is_dir(), "the load leaves it as it was");
+}
+
+/// The notice for an unparseable store names the parse failure, and a loaded
+/// account with a readable store has none.
+#[test]
+fn the_unreadable_store_notice_names_a_parse_failure() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = crate::testutil::blank_profile(&name);
+    p1.credentials = Some(crate::testutil::oauth_pair("p1-access"));
+    save_profile(&p1).expect("save p1");
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&load_profile(&name).expect("intact")),
+        None,
+        "a readable store has no notice"
+    );
+    tear_store(&name);
+
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&load_profile(&name).expect("torn")).as_deref(),
+        Some(
+            "tollgate: p1: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `tollgate login p1`"
+        ),
+    );
+}
+
+/// A store truncated inside a multi-byte character is a content tear, not an
+/// OS read failure: the notice names a parse failure, not std's fixed
+/// "stream did not contain valid UTF-8".
+#[test]
+fn a_store_cut_mid_utf8_names_a_parse_failure() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save p1");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    // Cut inside the two-byte UTF-8 sequence for é (0xC3 0xA9): the file ends
+    // mid-codepoint, so `read_to_string` fails with `InvalidData`.
+    std::fs::write(&store, b"{\"claudeAiOauth\": {\"accessToken\": \"\xC3")
+        .expect("write mid-UTF-8 store");
+
+    let loaded = load_profile(&name).expect("a mid-UTF-8 store loads logged out");
+
+    assert!(loaded.credentials.is_none(), "it reads logged out");
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&loaded).as_deref(),
+        Some(
+            "tollgate: p1: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `tollgate login p1`"
+        ),
+        "a mid-codepoint cut is a parse failure, not an OS read error"
+    );
+}
+
+/// The torn-store notice prints at most once per account per process, however
+/// many times the roster loads, and only while the CLI dispatch has enabled it.
+#[test]
+fn a_torn_store_notice_prints_once_per_account_per_process() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-once");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let _store = tear_store(&name);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let _armed = crate::profile::TornStoreNoticeArmed::new();
+
+    load_config().expect("first load");
+    load_config().expect("second load");
+
+    drop(guard);
+
+    let expected = format!(
+        "tollgate: {name}: its stored login could not be read (credentials.json does not parse), so it shows as logged out until `tollgate login {name}`\n"
+    );
+    assert_eq!(
+        String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
+        expected,
+        "two roster loads print the notice exactly once"
+    );
+}
+
+/// The notice is off by default: a roster load no CLI dispatch armed prints
+/// nothing, so the TUI's alternate screen, the daemon's log and a machine
+/// channel never carry it.
+#[test]
+fn a_torn_store_load_without_the_notice_armed_prints_nothing() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-off");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let _store = tear_store(&name);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+
+    load_config().expect("an un-armed load still loads");
+
+    drop(guard);
+
+    assert!(
+        capture.snapshot().is_empty(),
+        "an un-armed load prints nothing: {:?}",
+        String::from_utf8_lossy(&capture.snapshot())
+    );
+}
+
+/// A legacy `.pending` sidecar beside a torn store still adopts: the load
+/// repairs `credentials.json` from the sidecar, and the account reads with the
+/// pair, not as torn.
+#[test]
+fn a_pending_sidecar_beside_a_torn_store_adopts_and_is_not_flagged() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-adopt");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let store = tear_store(&name);
+    let pending = profile_subpath(&name, "credentials.json.pending").expect("pending path");
+    std::fs::write(
+        &pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write pending sidecar");
+
+    let loaded = load_profile(&name).expect("a torn store beside a pending sidecar loads");
+
+    assert_eq!(
+        loaded.access_token(),
+        Some("tok-access"),
+        "the adoptable sidecar supplies the pair"
+    );
+    assert!(
+        loaded.unreadable_credentials_store.is_none(),
+        "an adopted pair is a login, not a torn store"
+    );
+    assert_ne!(
+        std::fs::read_to_string(&store).expect("read store"),
+        TORN_STORE,
+        "the adopt repairs the committed store"
+    );
+}
+
+/// A torn `config.toml` line would otherwise quote the api key in the parser's
+/// own message; the load renders the position alone, so the key never reaches
+/// `{e:?}`/`{e:#}` on any surface.
+#[test]
+fn a_torn_config_toml_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("c2-torn");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    // `api_key = "sk-c2probe-NOTAKEY` is an unterminated string: the span sits
+    // at end-of-input, so the position is line 1, column 30 (29 chars, one
+    // past the last).
+    std::fs::write(&config_path, "api_key = \"sk-c2probe-NOTAKEY").expect("write torn config");
+    let err = load_profile(&name).expect_err("a torn config fails the load");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "failed to parse c2-torn/config.toml at line 1, column 30"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+#[test]
+fn read_toml_file_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let tollgate = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&tollgate).expect("mkdir .tollgate");
+    let roster = tollgate.join("profiles.toml");
+    std::fs::write(&roster, "api_key = \"sk-c2probe-NOTAKEY").expect("write torn roster");
+    let err = read_toml_file::<toml::Value>(&roster).expect_err("a torn roster fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1, column 30", roster.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A token string where the `expiresAt` number belongs is a type error; the
+/// position names the spot without quoting the value.
+#[test]
+fn read_json_file_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .tollgate");
+    std::fs::write(
+        &cred,
+        "{\"claudeAiOauth\": {\"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+    )
+    .expect("write credentials");
+    let err = read_json_file::<ClaudeCredentials>(&cred)
+        .expect_err("a token string where a number belongs fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1, column 52", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A json error whose column is 0 (a whole-value type mismatch) names the line
+/// alone: there is no column to point at, but the file has a line to open.
+#[test]
+fn read_json_file_renders_line_alone_when_the_column_is_zero() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .tollgate");
+    // A top-level array where a map is expected fails with line 1, column 0.
+    std::fs::write(&cred, "[{\"endpoint\": \"x\"}]").expect("write credentials");
+    let err = read_json_file::<std::collections::HashMap<String, u64>>(&cred)
+        .expect_err("a top-level array where a map belongs fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A file torn right after a newline is an end-of-input error at column 0 on
+/// line 2: the empty-file carve-out is line 1 column 0 alone, so this names
+/// line 2 rather than rendering the bare label.
+#[test]
+fn read_json_file_names_the_line_for_a_file_torn_after_a_newline() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .tollgate");
+    std::fs::write(&cred, "{\"a\": 1,\n").expect("write credentials");
+    let err = read_json_file::<serde_json::Value>(&cred)
+        .expect_err("a file torn right after a newline fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 2", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A content writer that fails inside the open temp leaves no temp behind and
+/// the target as it was.
+#[test]
+fn a_failing_content_writer_leaves_no_temp_and_the_target_untouched() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".tollgate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.json");
+    std::fs::write(&path, b"old").unwrap();
+    let err = atomic_write_600_with(&path, |f| {
+        std::io::Write::write_all(f, b"partial")?;
+        Err(std::io::Error::other("full"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "full");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["f.json"], "a temp stayed behind");
+}
+
+/// The same for the plain writer behind [`atomic_write`]: a failing content
+/// writer passes its error through, keeps the target and leaves no temp.
+#[test]
+fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::fs::write(&path, b"old").unwrap();
+    let err = atomic_write_with(&path, |f| {
+        std::io::Write::write_all(f, b"partial")?;
+        Err(std::io::Error::other("full"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "full");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["settings.json"], "a temp stayed behind");
+}
+
+// ── a profile's id: what a login in flight lands by ──────────────────────────
+
+fn create_account(name: &str) {
+    let mut config = load_config().expect("config");
+    crate::actions::create_blank_profile(
+        &mut config,
+        name.to_string(),
+        None,
+        Some("sk-id".to_string()),
+        None,
+    )
+    .expect("create");
+}
+
+fn claim(name: &str) -> ProfileId {
+    claim_profile_id(&ProfileName::from(name)).expect("claim")
+}
+
+/// A settings edit and a whole-profile save can land while a re-login waits on
+/// the browser; each keeps the id the login claimed, so the login still lands.
+/// A rename carries it to the new name.
+#[test]
+fn a_profile_id_survives_every_config_write_and_a_rename() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let id = claim("work");
+    let name = ProfileName::from("work");
+
+    let mut p = load_profile(&name).expect("load");
+    p.auto_start = true;
+    save_profile_config(&p).expect("settings edit");
+    assert_eq!(claim("work"), id, "a settings edit keeps it");
+
+    save_profile(&p).expect("whole save");
+    assert_eq!(claim("work"), id, "a whole-profile save keeps it");
+
+    let guard = crate::actions::rotation_guard_for_mutation(&name).expect("guard");
+    crate::actions::rename_profile(
+        &mut load_config().expect("config"),
+        &name,
+        &ProfileName::from("moved"),
+        &guard,
+    )
+    .expect("rename");
+    assert_eq!(claim("moved"), id, "a rename carries it");
+}
+
+/// An older tollgate does not model `id`: its saves carry it below the
+/// preserved-keys marker. This tollgate still reads it there, and its next save
+/// renders it back as its own key.
+#[test]
+fn a_profile_id_an_older_save_moved_is_still_the_profile_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let id = claim("work");
+    let name = ProfileName::from("work");
+    let path = profile_config_path(&name).expect("path");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    let id_line = raw
+        .lines()
+        .find(|l| l.starts_with("id = "))
+        .expect("the id line")
+        .to_string();
+    // Where an older save leaves a carried scalar: under the marker, before the
+    // first table.
+    let stripped = raw.replacen(&format!("{id_line}\n\n"), "", 1);
+    let carried = format!(
+        "# keys preserved from the previous file; not modelled by this tollgate:\n{id_line}\n"
+    );
+    let moved = match stripped.find("\n[") {
+        Some(at) => {
+            let (head, tail) = stripped.split_at(at + 1);
+            format!("{head}{carried}{tail}")
+        }
+        None => format!("{stripped}{carried}"),
+    };
+    assert!(!moved.starts_with("# tollgate profile configuration\n\nid = "));
+    assert_eq!(moved.matches("id = ").count(), 1);
+    std::fs::write(&path, moved).expect("write");
+    assert_eq!(claim("work"), id, "read where the older save left it");
+
+    save_profile_config(&load_profile(&name).expect("load")).expect("save");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        after.matches("id = ").count(),
+        1,
+        "one id, not two: {after}"
+    );
+    assert_eq!(claim("work"), id);
+}
+
+/// A profile an older tollgate created has no id until a login starts on it;
+/// the claim mints one into its `config.toml` and every later claim reads it.
+#[test]
+fn a_claim_mints_an_id_into_a_profile_without_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let name = ProfileName::from("work");
+    let path = profile_config_path(&name).expect("path");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    let id_line = raw
+        .lines()
+        .find(|l| l.starts_with("id = "))
+        .expect("id")
+        .to_string();
+    std::fs::write(&path, raw.replacen(&format!("{id_line}\n"), "", 1)).expect("strip");
+    let first = claim("work");
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("read")
+            .contains("id = "),
+        "the claim persisted it"
+    );
+    assert_eq!(claim("work"), first);
+}
+
+/// A create over a directory an earlier account left behind is a new
+/// account: it gets a fresh id, never the leftover's.
+#[test]
+fn a_create_over_a_leftover_directory_gets_a_fresh_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    create_account("work");
+    let old = claim("work");
+    save_app_state(&AppState::default()).expect("drop the record, keep the dir");
+    create_account("work");
+    assert_ne!(claim("work"), old);
+}
+
+/// A `~/.claude` dir tollgate creates (`sessions/`, a `projects/<slug>/`) that an
+/// older build left at the umask is retightened at load: never a file inside
+/// it, never through a symlink, never a dir tollgate does not create. Unpinned
+/// here and by its siblings: the swap race itself (a link swapped in between
+/// the no-follow open and the chmod, or inside the owner-read-off fallback),
+/// which no seam reaches.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_the_claude_dirs_tollgate_creates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let chmod = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+
+    let sessions = claude.join("sessions");
+    let slug = claude.join("projects").join("-home-u-repo");
+    let foreign = claude.join("plugins");
+    for dir in [&sessions, &slug, &foreign] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        chmod(dir, 0o755);
+    }
+    let record = sessions.join("123.json");
+    std::fs::write(&record, b"{}").expect("write record");
+    chmod(&record, 0o644);
+
+    // A shared-mode link points into a tree tollgate does not own.
+    let outside = home.home().join("outside-paste-cache");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    chmod(&outside, 0o755);
+    std::os::unix::fs::symlink(&outside, claude.join("paste-cache")).expect("symlink");
+
+    load_config().expect("load_config");
+
+    assert_eq!(mode(&sessions), 0o700, "sessions/ retightened");
+    assert_eq!(mode(&slug), 0o700, "projects/<slug>/ retightened");
+    assert_eq!(mode(&record), 0o644, "a file inside is left as found");
+    assert_eq!(mode(&outside), 0o755, "a symlinked dir is never followed");
+    assert_eq!(
+        mode(&foreign),
+        0o755,
+        "a dir tollgate never creates is left alone"
+    );
+}
+
+/// C-G13 (ledger): in guest mode `~/.claude` is upstream clauth's tree, so the
+/// retighten changes no mode there: `projects/` and `projects/<slug>/`, staged
+/// at 0755, and a sidecar tree tollgate would otherwise create keep theirs.
+#[cfg(unix)]
+#[test]
+fn guest_mode_leaves_the_claude_dir_modes_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    let projects = claude.join("projects");
+    let slug = projects.join("-home-u-repo");
+    let sessions = claude.join("sessions");
+    for dir in [&projects, &slug, &sessions] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    std::fs::create_dir_all(home.home().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+        .expect("stage the upstream data dir");
+    assert!(crate::identity::upstream_active());
+
+    enforce_claude_dirs_perms();
+
+    assert_eq!(mode(&projects), 0o755, "projects/ left as found");
+    assert_eq!(mode(&slug), 0o755, "projects/<slug>/ left as found");
+    assert_eq!(mode(&sessions), 0o755, "sessions/ left as found");
+}
+
+/// The retighten never follows a `projects/<slug>` link: the link resolves
+/// into the operator's tree and chmodding through it would restyle a dir
+/// tollgate does not own. The sibling retighten test pins a linked `paste-cache`;
+/// this one pins the `projects/` child shape.
+#[cfg(unix)]
+#[test]
+fn load_config_does_not_follow_a_symlinked_project_slug() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(claude.join("projects")).expect("mkdir projects");
+
+    let outside = home.home().join("outside-slug");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::os::unix::fs::symlink(&outside, claude.join("projects").join("-home-u-repo"))
+        .expect("symlink");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&outside)
+        .expect("outside metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "a symlinked project slug is never followed");
+}
+
+/// The retighten is non-recursive: a dir one level under `sessions/` is left
+/// as found. tollgate's writers create `sessions/` itself, not its children —
+/// those are Claude Code's, and the session-id listing is the leak this
+/// closes.
+#[cfg(unix)]
+#[test]
+fn load_config_leaves_a_dir_nested_under_sessions_as_found() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let sessions = claude.join("sessions");
+    let nested = sessions.join("some-session-id");
+    std::fs::create_dir_all(&nested).expect("mkdir nested");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&sessions), 0o700, "sessions/ retightened");
+    assert_eq!(
+        mode(&nested),
+        0o755,
+        "a dir one level down is left as found"
+    );
+}
+
+/// A real loose `paste-cache/` is retightened too: the sibling tests pin it
+/// only as a symlink, so a dropped name would leave this mode at the umask.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_a_real_loose_paste_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let paste = claude_dir().expect("claude_dir").join("paste-cache");
+    std::fs::create_dir_all(&paste).expect("mkdir");
+    std::fs::set_permissions(&paste, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    load_config().expect("load_config");
+    let mode = std::fs::metadata(&paste)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "paste-cache/ retightened");
+}
+
+/// A regular file in a retightened slot (`projects/<slug>`) is never chmodded:
+/// the set covers dirs only, so dropping the dir guard would restyle a file the
+/// operator owns.
+#[cfg(unix)]
+#[test]
+fn load_config_never_chmods_a_file_in_a_retightened_slot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(claude.join("projects")).expect("mkdir");
+    let file = claude.join("projects").join("stray.json");
+    std::fs::write(&file, b"{}").expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    load_config().expect("load_config");
+    let mode = std::fs::symlink_metadata(&file)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o644, "a file is never chmodded");
+}
+
+/// A linked `projects/` itself lists nothing: the listing gate refuses the link
+/// before iterating, so the operator's children behind it are never restyled.
+#[cfg(unix)]
+#[test]
+fn load_config_does_not_follow_a_linked_projects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    std::fs::create_dir_all(&claude).expect("mkdir");
+    let outside = home.home().join("outside-projects");
+    let child = outside.join("-home-u-repo");
+    std::fs::create_dir_all(&child).expect("mkdir");
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::os::unix::fs::symlink(&outside, claude.join("projects")).expect("symlink");
+    load_config().expect("load_config");
+    let mode = std::fs::metadata(&child)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "a linked projects/ lists nothing");
+}
+
+/// The retighten clears only group and other bits: a 0500 dir keeps its owner
+/// r-x and a 0755 one reads 0700, so a narrowed mode is never widened back.
+#[cfg(unix)]
+#[test]
+fn load_config_clears_only_group_and_other_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let narrow = claude.join("plans");
+    let loose = claude.join("tasks");
+    for dir in [&narrow, &loose] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    std::fs::set_permissions(&narrow, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&narrow), 0o500, "a 0500 dir keeps its owner bits");
+    assert_eq!(mode(&loose), 0o700, "a 0755 dir loses only group and other");
+}
+
+/// A 0555 dir has group and other bits set, so the retighten runs its chmod
+/// branch — unlike the sibling 0500 case, which has none and never does. The
+/// branch must clear only group and other, never re-add owner write.
+#[cfg(unix)]
+#[test]
+fn load_config_a_0555_dir_never_gains_owner_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let plans = claude_dir().expect("claude_dir").join("plans");
+    std::fs::create_dir_all(&plans).expect("mkdir");
+    std::fs::set_permissions(&plans, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&plans)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o500, "a 0555 dir loses group and other only");
+}
+
+/// The retighten keeps setgid as found: clearing group and other bits must not
+/// strip the 02000 bit (a `mode & 0o700` mask would). The fixture check fails
+/// the test if the filesystem drops setgid before `load_config` runs.
+#[cfg(unix)]
+#[test]
+fn load_config_a_setgid_dir_keeps_setgid() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let sessions = claude_dir().expect("claude_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o2755)).expect("chmod");
+    let before = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(before, 0o2755, "fixture took setgid");
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o2700, "setgid stays as found");
+}
+
+/// Every top-level name in the set — the rescue's `SIDECAR_TREES` plus
+/// the store-link dirs `jobs` and `projects` — is retightened. The names are
+/// hand-listed, not read from the constant, so a dropped or renamed entry reds
+/// here instead of hiding in a mirrored loop.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_every_named_claude_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let claude = claude_dir().expect("claude_dir");
+    let names = [
+        "file-history",
+        "paste-cache",
+        "plans",
+        "session-env",
+        "sessions",
+        "shell-snapshots",
+        "tasks",
+        "todos",
+        "jobs",
+        "projects",
+    ];
+    for name in names {
+        let dir = claude.join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    load_config().expect("load_config");
+
+    for name in names {
+        let mode = std::fs::metadata(claude.join(name))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{name}/ retightened");
+    }
+}
+
+/// A dir whose owner read bit is off but whose group and other bits are set
+/// (0377) fails the no-follow open with `EACCES`, yet those bits are exactly
+/// what must go: the by-path fallback clears them to 0300 instead of skipping
+/// the dir.
+#[cfg(unix)]
+#[test]
+fn load_config_retightens_a_dir_whose_owner_read_is_off() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Hands the dir back to 0o700 before the sandbox drops, a panic included,
+    /// so the tempdir's own removal can read it.
+    struct RestoreDir(std::path::PathBuf);
+    impl Drop for RestoreDir {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let _home = HomeSandbox::new();
+    let sessions = claude_dir().expect("claude_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o377)).expect("chmod");
+    let _restore = RestoreDir(sessions.clone());
+
+    load_config().expect("load_config");
+
+    let mode = std::fs::metadata(&sessions)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o300, "group and other bits cleared, owner bits kept");
+}
+
+// The usage probe defaults off at 90 s: both keys render commented until set,
+// and a set switch and a non-default interval render live and parse back.
+#[test]
+fn the_usage_probe_defaults_off_and_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(!cfg.usage_probe);
+    assert_eq!(cfg.usage_probe_interval_ms, None);
+
+    let stock = Profile::new("p".to_string(), None, None);
+    assert!(!stock.usage_probe, "a new profile does not probe");
+    assert_eq!(stock.usage_probe_interval_ms, 90_000);
+    let rendered = render_config_toml(&stock);
+    assert!(rendered.contains("\n# usage_probe = true\n"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "\n# How often the usage probe runs, in milliseconds: 60000 to\n\
+             # 450000. A value outside that range is clamped into it.\n\
+             # usage_probe_interval_ms = 90000\n"
+        ),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse stock toml");
+    assert!(!parsed.usage_probe);
+    assert_eq!(parsed.usage_probe_interval_ms, None);
+
+    let mut probed = Profile::new("p".to_string(), None, None);
+    probed.usage_probe = true;
+    probed.usage_probe_interval_ms = 120_000;
+    let rendered = render_config_toml(&probed);
+    assert!(rendered.contains("\nusage_probe = true\n"), "{rendered}");
+    assert!(
+        rendered.contains("\nusage_probe_interval_ms = 120000\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.usage_probe);
+    assert_eq!(parsed.usage_probe_interval_ms, Some(120_000));
+}
+
+// A hand-edited probe interval loads inside 1 min ..= 7.5 min, the edges
+// included, and an absent one loads as the default.
+#[test]
+fn a_stored_probe_interval_loads_inside_its_band() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probe-interval");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    for (stored, loaded) in [
+        (0, 60_000),
+        (59_999, 60_000),
+        (60_000, 60_000),
+        (90_000, 90_000),
+        (450_000, 450_000),
+        (450_001, 450_000),
+        (600_000, 450_000),
+        (3_600_000, 450_000),
+    ] {
+        std::fs::write(
+            &config_path,
+            format!("usage_probe = true\nusage_probe_interval_ms = {stored}\n"),
+        )
+        .expect("write config.toml");
+        let profile = load_profile(&name).expect("load");
+        assert!(profile.usage_probe);
+        assert_eq!(profile.usage_probe_interval_ms, loaded, "stored {stored}");
+    }
+    std::fs::write(&config_path, "usage_probe = true\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(&name).expect("load").usage_probe_interval_ms,
+        90_000,
+        "absent loads as the default"
+    );
+}
+
+/// The loader is where a profile gets its setup token's digest, the key a
+/// refused token's durable verdict is bound to: a pairless profile loaded
+/// from disk whose token the probe refused is passed over by the walks and
+/// `tollgate start --auto`, through the verdict the loaded digest matches.
+#[test]
+fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
+    let _sb = HomeSandbox::new();
+    let name = ProfileName::from("refused");
+    let names = vec![name.clone(), ProfileName::from("next")];
+    save_app_state(&AppState {
+        active_profile: Some(name.clone()),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    })
+    .expect("persist the chain");
+    let mut probed = crate::testutil::blank_profile(&name);
+    crate::testutil::make_probed_account(&mut probed);
+    let mut next = crate::testutil::blank_profile(&ProfileName::from("next"));
+    next.credentials = Some(crate::testutil::oauth_pair("next"));
+    save_profile(&next).expect("save next");
+    let digest = crate::claude::installed_session_token(&name)
+        .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token)
+        .expect("the installed token's digest");
+    crate::profile_cache::write_auth_expired(&name, digest);
+
+    let config = load_config().expect("load_config");
+    let (rows, picked) = crate::fallback::start_walk(
+        &config,
+        crate::runtime::Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
+    assert_eq!(picked, Some(1), "the walk passes the refused token over");
+    assert_eq!(rows[0].block, Some(crate::fallback::StartBlock::AuthBroken));
+    let loaded = config.find(&name).expect("the loaded profile");
+    assert_eq!(loaded.setup_token_digest, Some(digest));
+    assert!(
+        crate::fallback::durable_key_rejected_seed([loaded]).contains_key("refused"),
+        "the verdict binds to the digest the loader read"
     );
 }

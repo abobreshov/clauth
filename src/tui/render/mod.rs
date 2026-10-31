@@ -41,6 +41,27 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let background = Block::default().style(theme::base());
     frame.render_widget(background, area);
 
+    // The toast rects are laid out before the tab and modal draws so every
+    // caret can avoid them; the toasts themselves draw last, over any open
+    // modal.
+    let toast_rects = toasts::stack_rects(area, app);
+
+    // While a modal is open, body editors under it must not leave a caret
+    // visible on the modal (the same stray-cursor class the toast check
+    // closes); hand the tab draws a whole-area blocker then. The modal still
+    // places its own caret, so it keeps the toast rects.
+    let body_caret_rects = if app.modals.is_empty() {
+        toast_rects.as_slice()
+    } else {
+        std::slice::from_ref(&area)
+    };
+
+    // One per-frame readings snapshot, taken before any render entry locks
+    // `Config`: the stores rank below it, so a store lock under a config guard
+    // would invert the order the debug build asserts on. Every entry that
+    // renders a reading reads this snapshot alone.
+    let readings = app.readings_snapshot();
+
     // Content frame's top border doubles as the header/content separator; the
     // header is always 3 rows (brand / count+status / tabs+gauge).
     let [header_area, content_area, footer_area] = Layout::vertical([
@@ -50,7 +71,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     ])
     .areas(area);
 
-    header::draw(frame, header_area, app);
+    header::draw(frame, header_area, app, &readings);
 
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {
@@ -63,22 +84,22 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     };
 
     match app.tab {
-        Tab::Overview => overview::draw(frame, body_area, app),
-        Tab::Usage => usage::draw(frame, body_area, app),
+        Tab::Overview => overview::draw(frame, body_area, app, &readings),
+        Tab::Usage => usage::draw(frame, body_area, app, &readings, body_caret_rects),
         Tab::Tokens => tokens::draw(frame, body_area, app),
-        Tab::Setup => config::draw(frame, body_area, app),
-        Tab::Fallback => chain::draw(frame, body_area, app),
-        Tab::Config => global_config::draw(frame, body_area, app),
+        Tab::Setup => config::draw(frame, body_area, app, &readings, body_caret_rects),
+        Tab::Fallback => chain::draw(frame, body_area, app, &readings, body_caret_rects),
+        Tab::Config => global_config::draw(frame, body_area, app, body_caret_rects),
         Tab::Status => status::draw(frame, body_area, app),
-        Tab::Plugin => plugin::draw(frame, body_area, app),
+        Tab::Plugin => plugin::draw(frame, body_area, app, body_caret_rects),
     }
     footer::draw(frame, footer_area, app);
 
-    toasts::draw(frame, area, app);
-
     if let Some(modal) = app.modals.last() {
-        modals::draw(frame, area, app, modal);
+        modals::draw(frame, area, app, modal, &toast_rects);
     }
+
+    toasts::draw(frame, area, app);
 }
 
 #[cfg(test)]

@@ -321,6 +321,33 @@ fn an_unreadable_store_refuses_and_is_never_rewritten() {
     );
 }
 
+/// A string where the `schema` number belongs would otherwise quote it in the
+/// parser's message; the read names the position alone.
+#[test]
+fn a_mistyped_store_names_the_position() {
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "{\"schema\": \"sk-c2probe-NOTAKEY\"}").expect("mistyped store");
+
+    let err = match read_store() {
+        Err(e) => e,
+        Ok(_) => panic!("a mistyped store must fail the read"),
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!(
+            "{} is not a device list tollgate can read (line 1, column 31)",
+            path.display()
+        )
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
 /// A tier and a field this build does not know survive its rewrite: the row
 /// was written by a newer tollgate, and a downgrade adding a device must not
 /// erase what that build meant.
@@ -611,7 +638,7 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
     let epoch = iso_to_epoch_secs(&device.paired_at).expect("parse");
     let stamp = crate::format::local_stamp(epoch).expect("stamp");
     let table = render_table(&[device], epoch + 3 * 3600 + 300);
-    let cell = format!("{stamp} · 3h 5m ago");
+    let cell = format!("{stamp} (3h ago)");
     assert_eq!(
         table,
         format!(
@@ -628,6 +655,21 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
 #[test]
 fn an_unparseable_stamp_renders_as_no_data() {
     assert_eq!(paired_cell("synthetic-fixture", 0), "-");
+}
+
+/// The paired cell drops the age half once the age would be a date (30 days
+/// and past): the full local stamp already carries the date, so a second copy
+/// reads as a duplicate. Younger rows keep `stamp (age)` (`4w ago` at 29 days).
+#[test]
+fn the_paired_cell_drops_the_age_half_once_it_would_be_a_date() {
+    let iso = "2026-01-02T03:04:05+00:00";
+    let epoch = iso_to_epoch_secs(iso).expect("parse");
+    let stamp = crate::format::local_stamp(epoch).expect("stamp");
+    assert_eq!(
+        paired_cell(iso, epoch + 29 * 86_400),
+        format!("{stamp} (4w ago)")
+    );
+    assert_eq!(paired_cell(iso, epoch + 30 * 86_400), stamp);
 }
 
 #[test]
@@ -681,10 +723,12 @@ fn a_revoked_legacy_token_is_not_imported_again() {
     let body = legacy_body(TOKEN, Some("control"));
     seed_legacy(&body);
     import_logged().0.expect("import");
-    // The state a failed delete leaves: the list holds the import and the
-    // plaintext is still on disk.
+    // The state a failed import delete and a failed revoke delete leave: the
+    // list remembers the import and the plaintext is still on disk.
     seed_legacy(&body);
-    revoke("legacy").expect("revoke");
+    fail_next_legacy_delete();
+    let err = revoke("legacy").expect_err("the revoke's own delete fails");
+    assert!(err.downcast_ref::<LegacyLeft>().is_some(), "{err:#}");
 
     let (result, logged) = import_logged();
     result.expect("the next start");
@@ -719,10 +763,12 @@ fn a_revoked_token_a_downgrade_handed_legacy_is_not_imported_again() {
     let downgrade = legacy_body(OTHER, Some("control"));
     seed_legacy(&downgrade);
     import_logged().0.expect("the downgrade's token takes over");
-    // The state a failed delete leaves: the list holds the downgrade's token
-    // and its plaintext is still on disk.
+    // The state a failed import delete and a failed revoke delete leave: the
+    // list holds the downgrade's token and its plaintext is still on disk.
     seed_legacy(&downgrade);
-    revoke("legacy").expect("revoke");
+    fail_next_legacy_delete();
+    let err = revoke("legacy").expect_err("the revoke's own delete fails");
+    assert!(err.downcast_ref::<LegacyLeft>().is_some(), "{err:#}");
 
     let (result, logged) = import_logged();
     result.expect("the next start");
@@ -736,6 +782,267 @@ fn a_revoked_token_a_downgrade_handed_legacy_is_not_imported_again() {
         "the revoked plaintext is deleted"
     );
     assert_eq!(logged, vec![REVOKED]);
+}
+
+/// Run `tollgate devices revoke <name>` with its stdout captured.
+fn run_revoke_printed(name: &str) -> (anyhow::Result<()>, String) {
+    let out = crate::out::OutCapture::new();
+    let guard = out.capture_here();
+    let result = run_revoke(name);
+    drop(guard);
+    (
+        result,
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+    )
+}
+
+/// The revoke itself deletes a plaintext copy of the token it revoked, which a
+/// failed import delete left behind: a pre-pairing tollgate started before the
+/// next `--listen` start would otherwise still serve that token.
+#[test]
+fn revoking_legacy_deletes_the_plaintext_copy_of_its_token() {
+    let _home = HomeSandbox::new();
+    let body = legacy_body(TOKEN, Some("control"));
+    seed_legacy(&body);
+    import_logged().0.expect("import");
+    // The state a failed import delete leaves.
+    seed_legacy(&body);
+
+    let (result, printed) = run_revoke_printed("legacy");
+    result.expect("revoke");
+
+    assert!(
+        !legacy_path().expect("path").exists(),
+        "the revoke deletes the plaintext copy of the token it revoked"
+    );
+    assert!(authenticate(Some(TOKEN)).expect("read").is_none());
+    assert_eq!(
+        printed,
+        "tollgate: revoked device 'legacy'; its next request is refused.\n\
+         tollgate: deleted ~/.tollgate/auth_token.json, which still held its token.\n"
+    );
+}
+
+/// A file holding another token is a downgrade's fresh mint, not the revoked
+/// one: the revoke leaves it for the next start's import and says nothing.
+#[test]
+fn revoking_legacy_keeps_a_file_holding_another_token() {
+    let _home = HomeSandbox::new();
+    seed_legacy(&legacy_body(TOKEN, Some("control")));
+    import_logged().0.expect("import");
+    let fresh = legacy_body(OTHER, Some("control"));
+    seed_legacy(&fresh);
+
+    let (result, printed) = run_revoke_printed("legacy");
+    result.expect("revoke");
+
+    assert_eq!(
+        std::fs::read_to_string(legacy_path().expect("path")).expect("the file stays"),
+        fresh
+    );
+    assert_eq!(
+        printed,
+        "tollgate: revoked device 'legacy'; its next request is refused.\n"
+    );
+}
+
+/// A delete that fails leaves the device revoked and the command failing, its
+/// error naming the file an older tollgate would still serve.
+#[test]
+fn a_failed_plaintext_delete_fails_the_revoke_and_names_the_file() {
+    let _home = HomeSandbox::new();
+    let body = legacy_body(TOKEN, Some("control"));
+    seed_legacy(&body);
+    import_logged().0.expect("import");
+    seed_legacy(&body);
+    fail_next_legacy_delete();
+
+    let (result, printed) = run_revoke_printed("legacy");
+    let err = result.expect_err("a plaintext token left behind fails the command");
+
+    assert_eq!(
+        format!("{err:#}"),
+        "revoked device 'legacy', but ~/.tollgate/auth_token.json still holds its token and \
+         could not be deleted (injected failure deleting auth_token.json); an older tollgate \
+         would still accept it, so delete the file by hand"
+    );
+    assert_eq!(printed, "");
+    assert!(authenticate(Some(TOKEN)).expect("read").is_none());
+    assert_eq!(
+        std::fs::read_to_string(legacy_path().expect("path")).expect("the file stays"),
+        body
+    );
+    assert!(
+        !FAIL_NEXT_LEGACY_DELETE.load(std::sync::atomic::Ordering::Acquire),
+        "the revoke reached the delete"
+    );
+}
+
+fn damage_the_push_store() {
+    let home = profile_home();
+    std::fs::write(
+        home.join(".tollgate").join("push-subscriptions.json"),
+        b"{ not json",
+    )
+    .expect("damage the subscription list");
+}
+
+fn profile_home() -> std::path::PathBuf {
+    legacy_path()
+        .expect("path")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("home")
+        .to_path_buf()
+}
+
+/// A push row that cannot be dropped never keeps the plaintext token on disk:
+/// both leftovers are tried, and the deletion is said before the push error.
+#[test]
+fn a_failed_push_drop_still_deletes_the_plaintext_copy() {
+    let _home = HomeSandbox::new();
+    let body = legacy_body(TOKEN, Some("control"));
+    seed_legacy(&body);
+    import_logged().0.expect("import");
+    seed_legacy(&body);
+    damage_the_push_store();
+
+    let (result, printed) = run_revoke_printed("legacy");
+    let err = result.expect_err("the push row could not be dropped");
+
+    assert!(
+        err.downcast_ref::<super::super::push::SubscriptionLeft>()
+            .is_some(),
+        "the push leftover keeps its type: {err:#}"
+    );
+    assert!(
+        !legacy_path().expect("path").exists(),
+        "the plaintext copy is deleted even though the push drop failed"
+    );
+    assert_eq!(
+        printed,
+        "tollgate: revoked device 'legacy'; its next request is refused.\n\
+         tollgate: deleted ~/.tollgate/auth_token.json, which still held its token.\n"
+    );
+    assert!(authenticate(Some(TOKEN)).expect("read").is_none());
+}
+
+/// Both leftovers failing: the token file's sentence leads with its instruction,
+/// then the push row's, each cause in its own place.
+#[test]
+fn both_leftovers_failing_name_the_file_first() {
+    let _home = HomeSandbox::new();
+    let body = legacy_body(TOKEN, Some("control"));
+    seed_legacy(&body);
+    import_logged().0.expect("import");
+    seed_legacy(&body);
+    damage_the_push_store();
+    fail_next_legacy_delete();
+
+    let (result, printed) = run_revoke_printed("legacy");
+    let text = format!("{:#}", result.expect_err("both leftovers failed"));
+
+    let head = "revoked device 'legacy', but ~/.tollgate/auth_token.json still holds its token \
+                and could not be deleted (injected failure deleting auth_token.json); an older \
+                tollgate would still accept it, so delete the file by hand; the device's push \
+                subscription could not be dropped either (";
+    let tail = "): it receives no push, since nothing is pushed to a pairing the device list no \
+                longer holds, and the first subscription write after the list reads again drops \
+                it; to clear it now, move ~/.tollgate/push-subscriptions.json aside, and every \
+                subscribed device then subscribes again";
+    assert!(text.starts_with(head), "{text}");
+    assert!(text.ends_with(tail), "{text}");
+    let cause = &text[head.len()..text.len() - tail.len()];
+    assert!(
+        !cause.is_empty() && !cause.contains("auth_token"),
+        "the push cause sits alone between them: {cause:?}"
+    );
+    assert_eq!(printed, "");
+    assert_eq!(
+        std::fs::read_to_string(legacy_path().expect("path")).expect("the file stays"),
+        body
+    );
+}
+
+/// A file that exists but cannot be read may still hold the revoked token: the
+/// revoke fails naming it rather than passing over it.
+#[test]
+fn an_unreadable_plaintext_file_fails_the_revoke() {
+    let _home = HomeSandbox::new();
+    seed_legacy(&legacy_body(TOKEN, Some("control")));
+    import_logged().0.expect("import");
+    // A directory in the file's place reads as an error on every platform.
+    let path = legacy_path().expect("path");
+    std::fs::create_dir(&path).expect("a directory where the file was");
+
+    let (result, printed) = run_revoke_printed("legacy");
+    let err = result.expect_err("an unreadable file fails the command");
+
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "revoked device 'legacy', but ~/.tollgate/auth_token.json could not be read ({}), \
+             so tollgate cannot tell whether it still holds that token; check the file and \
+             delete it if it does",
+            crate::testutil::directory_read_error(&path)
+        )
+    );
+    assert_eq!(printed, "");
+    assert!(authenticate(Some(TOKEN)).expect("read").is_none());
+    assert!(path.is_dir(), "nothing is deleted");
+}
+
+/// An unreadable file and a push row that stayed: the file's sentence first,
+/// then the device's push row, each cause in its own place.
+#[test]
+fn an_unreadable_file_and_a_failed_push_drop_name_both() {
+    let _home = HomeSandbox::new();
+    seed_legacy(&legacy_body(TOKEN, Some("control")));
+    import_logged().0.expect("import");
+    let path = legacy_path().expect("path");
+    std::fs::create_dir(&path).expect("a directory where the file was");
+    damage_the_push_store();
+
+    let (result, printed) = run_revoke_printed("legacy");
+    let text = format!("{:#}", result.expect_err("both leftovers failed"));
+
+    let head = format!(
+        "revoked device 'legacy', but ~/.tollgate/auth_token.json could not be read ({}), so \
+         tollgate cannot tell whether it still holds that token; check the file and delete it if \
+         it does; the device's push subscription could not be dropped either (",
+        crate::testutil::directory_read_error(&path)
+    );
+    let tail = "): it receives no push, since nothing is pushed to a pairing the device list no \
+                longer holds, and the first subscription write after the list reads again drops \
+                it; to clear it now, move ~/.tollgate/push-subscriptions.json aside, and every \
+                subscribed device then subscribes again";
+    assert!(text.starts_with(&head), "{text}");
+    assert!(text.ends_with(tail), "{text}");
+    assert!(text.len() > head.len() + tail.len(), "{text}");
+    assert_eq!(printed, "");
+    assert!(path.is_dir(), "nothing is deleted");
+}
+
+/// Of the paired devices, only the one the list imported can have its token in
+/// `auth_token.json`, so revoking any other never reads the file: an unreadable
+/// one is no leftover of theirs.
+#[test]
+fn revoking_another_device_leaves_an_unreadable_plaintext_file_alone() {
+    let _home = HomeSandbox::new();
+    seed_legacy(&legacy_body(TOKEN, Some("control")));
+    import_logged().0.expect("import");
+    seed("phone", Tier::View, OTHER);
+    let path = legacy_path().expect("path");
+    std::fs::create_dir(&path).expect("a directory where the file was");
+
+    let (result, printed) = run_revoke_printed("phone");
+    result.expect("the phone's token was never in the file");
+
+    assert_eq!(
+        printed,
+        "tollgate: revoked device 'phone'; its next request is refused.\n"
+    );
+    assert!(path.is_dir(), "nothing is deleted");
 }
 
 // ── sessions grant ─────────────────────────────────────────────────────────

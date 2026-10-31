@@ -73,6 +73,10 @@ struct PresetFile {
 struct Builtin {
     name: &'static str,
     base_url: &'static str,
+    /// Model ids this built-in shipped in an earlier release. A row holding one
+    /// of these (exact string equality) is offered the current bind for that
+    /// row; any other stored id stays.
+    former_ids: &'static [&'static str],
     binds: Binds,
     /// Env switches, each one on [`PRESET_ENV_ALLOWLIST`].
     env: &'static [(&'static str, &'static str)],
@@ -93,13 +97,6 @@ enum Binds {
         haiku: &'static str,
         fable: &'static str,
     },
-    /// One id on `default`, every tier and the subagent row. Alibaba's
-    /// `POST /apps/anthropic/v1/messages` answers `400 InvalidParameter "Model
-    /// not exist."` to `claude-sonnet-4-5` and `claude-haiku-4-5-20251001`
-    /// (measured 2026-08-11 against `token-plan.ap-southeast-1`), so a row left
-    /// unset is a hard failure there; Alibaba's own `bl config agent --agent
-    /// claude-code` writes every row for the same reason.
-    Every(&'static str),
 }
 
 impl Binds {
@@ -120,14 +117,6 @@ impl Binds {
                 fable: id(fable),
                 subagent: None,
             },
-            Binds::Every(model) => ModelSettings {
-                default: id(model),
-                opus: id(model),
-                sonnet: id(model),
-                haiku: id(model),
-                fable: id(model),
-                subagent: id(model),
-            },
         }
     }
 }
@@ -138,6 +127,7 @@ const BUILTINS: &[Builtin] = &[
         env: &[],
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/anthropic",
+        former_ids: &["deepseek-chat"],
         binds: Binds::Tiers {
             opus: "deepseek-v4-pro[1m]",
             sonnet: "deepseek-flash[1m]",
@@ -149,6 +139,7 @@ const BUILTINS: &[Builtin] = &[
         env: &[],
         name: "Z.ai",
         base_url: "https://api.z.ai/api/anthropic",
+        former_ids: &["glm-5.2"],
         binds: Binds::Tiers {
             opus: "glm-5.3[1m]",
             sonnet: "glm-5.3-flash[1m]",
@@ -163,6 +154,7 @@ const BUILTINS: &[Builtin] = &[
         // `/v1/messages` lands on `/api/v1/messages` (openrouter.ai docs,
         // "Connect Claude to OpenRouter").
         base_url: "https://openrouter.ai/api",
+        former_ids: &["openrouter/auto"],
         // OpenRouter serves the real Claude models, so each tier binds its own
         // family's moving `-latest` alias instead of a pro/flash pair; the same
         // guide marks only the fable, opus and sonnet aliases `[1m]`-capable.
@@ -182,6 +174,7 @@ const BUILTINS: &[Builtin] = &[
         // account and endpoint; only the international one ships, matching what
         // `providers::minimax` claims.
         base_url: "https://api.minimax.io/anthropic",
+        former_ids: &["MiniMax-M3"],
         // The fast model is sold on the M Plan alone: a pay-as-you-go key
         // fails on sonnet and haiku until those two rows are re-pointed.
         binds: Binds::Tiers {
@@ -193,27 +186,18 @@ const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         env: &[],
-        name: "Qwen-TokenPlan-Intl",
-        base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-        binds: Binds::Every("qwen3.8-max"),
-    },
-    Builtin {
-        env: &[],
-        name: "Qwen-TokenPlan-CN",
-        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        binds: Binds::Every("qwen3.8-max"),
-    },
-    Builtin {
-        env: &[],
-        name: "Qwen-CodingPlan-Intl",
-        base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-        binds: Binds::Every("qwen3-coder-plus"),
-    },
-    Builtin {
-        env: &[],
-        name: "Qwen-CodingPlan-CN",
-        base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-        binds: Binds::Every("qwen3-coder-plus"),
+        name: "Qwen",
+        // Qwen Cloud serves Token Plan for every region from one host, which
+        // answered `400 "Model not exist."` to `claude-sonnet-5-5` (measured
+        // 2026-10-13), so every tier binds a Qwen id.
+        base_url: "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+        former_ids: &["qwen3.8-max", "qwen3-coder-plus"],
+        binds: Binds::Tiers {
+            opus: "qwen3.8-max[1m]",
+            sonnet: "qwen3.8-flash[1m]",
+            haiku: "qwen3.8-flash[1m]",
+            fable: "qwen3.8-max[1m]",
+        },
     },
     Builtin {
         name: "Ollama-Cloud",
@@ -231,6 +215,7 @@ const BUILTINS: &[Builtin] = &[
         // subagent from it (Setup tab, or `tollgate login <p> --base-url
         // https://ollama.com --api-key` then `--model <id>` / `[models]` in the
         // profile's config.toml).
+        former_ids: &[],
         binds: Binds::Unbound,
         // What `ollama launch claude` sets (ollama cmd/launch/claude.go),
         // minus the context-window knob, which depends on the model picked.
@@ -260,8 +245,8 @@ fn builtins() -> Vec<Preset> {
         .collect()
 }
 
-/// Whether `name` collides with a built-in. Case-insensitive: a
-/// case-folding filesystem would let `deepseek.json` shadow the built-in's slot
+/// Whether `name` collides with a built-in, case-insensitive: the built-in owns
+/// its name, and a case-folding filesystem would read `qwen.json` as that name
 /// on one host and not another, so the refusal can't depend on spelling.
 pub(crate) fn is_builtin(name: &str) -> bool {
     BUILTINS
@@ -274,7 +259,7 @@ fn presets_dir() -> Result<std::path::PathBuf> {
 }
 
 /// The name's own path, refusing anything that isn't a bare filename. Reuses the
-/// profile-name charset (`[A-Za-z0-9-_.@+]`, no leading `.`), which is what keeps
+/// profile-name charset ([`crate::actions::is_name_char`], no leading `.`), which is what keeps
 /// a separator or a `..` out of the join.
 fn preset_path(name: &str) -> Result<std::path::PathBuf> {
     let trimmed = crate::actions::validate_name_chars(name)?;
@@ -301,12 +286,16 @@ pub(crate) fn list_presets() -> Vec<Preset> {
         let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // A built-in's slot is never readable from disk: the binary's copy is
-        // the only definition, so a stray file with that stem stays invisible
-        // instead of quietly shadowing it.
-        if is_builtin(name) {
+        // Apply and delete reach the file through `preset_path`, which trims the
+        // name and refuses one outside the preset charset; a row they could
+        // never open, or would open as another file, is skipped like an
+        // unparseable one.
+        if crate::actions::validate_name_chars(name).ok() != Some(name) {
             continue;
         }
+        // A file whose stem matches a built-in's name still lists as the user's
+        // own saved preset: the built-in keeps its name, the file keeps its
+        // stem, and neither replaces the other.
         let Ok(file) = read_json_file::<PresetFile>(&path) else {
             continue;
         };
@@ -332,6 +321,14 @@ pub(crate) fn load_preset(name: &str) -> Option<Preset> {
     {
         return Some(p);
     }
+    load_saved_preset(trimmed)
+}
+
+/// The disk half of [`load_preset`]: reads only the file, never the built-ins.
+/// A built-in's name with no file on disk is `None`, so this is how the saved
+/// `qwen` beside the built-in `Qwen` is told apart from it.
+pub(crate) fn load_saved_preset(name: &str) -> Option<Preset> {
+    let trimmed = name.trim();
     let path = preset_path(trimmed).ok()?;
     let file = read_json_file::<PresetFile>(&path).ok()?;
     Some(Preset {
@@ -350,8 +347,8 @@ pub(crate) fn preset_exists(name: &str) -> bool {
 }
 
 /// Write `name` to disk, replacing any custom preset already there. Refuses a
-/// built-in name outright — the binary's copy is the definition, so a file in
-/// that slot would be written and then never read.
+/// built-in name outright — the built-in owns that name, and a fresh save under
+/// it would add a second row beside the shipped one, never replace it.
 pub(crate) fn save_preset(
     name: &str,
     base_url: &Option<String>,
@@ -377,15 +374,191 @@ pub(crate) fn save_preset(
 
 pub(crate) fn delete_preset(name: &str) -> Result<()> {
     let trimmed = name.trim();
+    let path = preset_path(trimmed)?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        return Ok(());
+    }
+    // No file at the name's path: it is either a built-in (whose copy ships in
+    // the binary and can't be deleted) or unknown.
     if is_builtin(trimmed) {
         bail!("'{trimmed}' is a built-in preset and cannot be deleted");
     }
-    let path = preset_path(trimmed)?;
-    if !path.exists() {
-        bail!("no preset named '{trimmed}'");
+    bail!("no preset named '{trimmed}'");
+}
+
+// ── Re-bind offer engine ──────────────────────────────────────────────────────
+
+/// The model rows the offer walks, in render order (`default` is the account's
+/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row).
+pub(crate) const MODEL_ROWS: [&str; 6] =
+    ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+
+/// The `(unset)` marker for a row with no stored id, on both the old and the
+/// new side.
+const UNSET: &str = "(unset)";
+
+/// One row a built-in's bind fills: `None` renders `(unset)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowMove {
+    pub(crate) row: &'static str,
+    pub(crate) old: Option<String>,
+    pub(crate) new: Option<String>,
+}
+
+impl RowMove {
+    pub(crate) fn old_display(&self) -> &str {
+        self.old.as_deref().unwrap_or(UNSET)
     }
-    std::fs::remove_file(&path)?;
-    Ok(())
+
+    pub(crate) fn new_display(&self) -> &str {
+        self.new.as_deref().unwrap_or(UNSET)
+    }
+}
+
+/// Every row one account is offered, in [`MODEL_ROWS`] order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountOffers {
+    pub(crate) account: String,
+    pub(crate) rows: Vec<RowMove>,
+}
+
+/// Accounts whose change sets are identical share one block: the shared rows
+/// once, then one toggle line per account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebindBlock {
+    pub(crate) rows: Vec<RowMove>,
+    pub(crate) accounts: Vec<String>,
+}
+
+/// `a` and `b` name the same endpoint: the crate's shared host predicate
+/// (`providers::url_matches_host`), case-insensitive on scheme + host and
+/// forgiving a trailing slash. It also admits a longer path under `b` (e.g.
+/// `…/anthropic/v1`), which still points at that built-in's endpoint.
+pub(crate) fn base_url_matches(a: &str, b: &str) -> bool {
+    crate::providers::url_matches_host(a, b)
+}
+
+/// The per-account offer, in roster order: every account whose `base_url`
+/// matches a built-in, with one [`RowMove`] per row that is empty or still
+/// holds a former id of that built-in. A row holding any other id is untouched,
+/// and a row already equal to its new value is no change.
+pub(crate) fn rebind_offers(config: &crate::profile::AppConfig) -> Vec<AccountOffers> {
+    let mut out = Vec::new();
+    for profile in &config.profiles {
+        let Some(base) = profile.base_url.as_deref() else {
+            continue;
+        };
+        let Some(builtin) = BUILTINS.iter().find(|b| base_url_matches(base, b.base_url)) else {
+            continue;
+        };
+        let binds = builtin.binds.models();
+        let mut rows = Vec::new();
+        for row in MODEL_ROWS {
+            let old = profile.models.field(row).cloned();
+            let new = binds.field(row).cloned();
+            if old == new {
+                continue;
+            }
+            match &old {
+                None => {
+                    if new.is_some() {
+                        rows.push(RowMove {
+                            row,
+                            old: None,
+                            new,
+                        });
+                    }
+                }
+                Some(old_id) => {
+                    if builtin.former_ids.contains(&old_id.as_str()) {
+                        rows.push(RowMove {
+                            row,
+                            old: Some(old_id.clone()),
+                            new,
+                        });
+                    }
+                }
+            }
+        }
+        if !rows.is_empty() {
+            out.push(AccountOffers {
+                account: profile.name.to_string(),
+                rows,
+            });
+        }
+    }
+    out
+}
+
+/// Group offers whose row change sets are identical, preserving first-seen
+/// order for both the blocks and the accounts inside them.
+pub(crate) fn group_offers(offers: Vec<AccountOffers>) -> Vec<RebindBlock> {
+    let mut blocks: Vec<RebindBlock> = Vec::new();
+    for offer in offers {
+        if let Some(block) = blocks.iter_mut().find(|b| b.rows == offer.rows) {
+            block.accounts.push(offer.account);
+        } else {
+            blocks.push(RebindBlock {
+                rows: offer.rows,
+                accounts: vec![offer.account],
+            });
+        }
+    }
+    blocks
+}
+
+/// SHA-256 (hex) of the shipped bind table: each built-in's name, base_url,
+/// resolved models and former ids. Changes whenever the table's names,
+/// endpoints, binds or former ids change (their order included), so a stored
+/// digest stands for "this release's binds were already offered" — a release
+/// that only adds a former id reopens the confirm for an account that
+/// dismissed it.
+pub(crate) fn builtin_binds_digest() -> String {
+    digest_of_builtins(BUILTINS)
+}
+
+/// The digest over a specific table — split out so a test can pin that two
+/// literal tables differ without recomputing the shipped one.
+fn digest_of_builtins(builtins: &[Builtin]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for builtin in builtins {
+        hasher.update(builtin.name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(builtin.base_url.as_bytes());
+        hasher.update([0u8]);
+        let binds = builtin.binds.models();
+        for row in MODEL_ROWS {
+            hasher.update(row.as_bytes());
+            hasher.update([0u8]);
+            if let Some(value) = binds.field(row) {
+                hasher.update(value.as_bytes());
+            }
+            hasher.update([0u8]);
+        }
+        // The `0` after each id keeps `["ab", "c"]` and `["a", "bc"]` apart; the
+        // count prefix keeps a list's last id from reading as the start of the
+        // next built-in's name.
+        hasher.update((builtin.former_ids.len() as u64).to_le_bytes());
+        for id in builtin.former_ids {
+            hasher.update(id.as_bytes());
+            hasher.update([0u8]);
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `N row(s) on M account(s)`, singular-aware — the one phrase the TUI toast
+/// and the CLI's two count lines share.
+pub(crate) fn rows_on_accounts(rows: usize, accounts: usize) -> String {
+    let row_word = if rows == 1 { "row" } else { "rows" };
+    let acct_word = if accounts == 1 { "account" } else { "accounts" };
+    format!("{rows} {row_word} on {accounts} {acct_word}")
 }
 
 #[cfg(test)]

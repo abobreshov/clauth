@@ -117,6 +117,7 @@ fn divergence_without_default_errors() {
         &crate::profile::ProfileName::from("target"),
         None,
         no_network,
+        None,
     );
     assert!(
         err.is_err(),
@@ -141,6 +142,7 @@ fn divergence_new_profile_default_errors() {
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::NewProfile),
         no_network,
+        None,
     );
     assert!(
         err.is_err(),
@@ -160,11 +162,12 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
         Some(creds("target-a", "target-r")),
     ));
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
         no_network,
+        None,
     )
     .expect("overwrite switch");
     assert_eq!(previous.as_deref(), Some("active"));
@@ -221,11 +224,12 @@ fn divergence_over_a_shell_switches_without_capturing() {
         "a blank-token shell still classifies Diverged",
     );
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
         no_network,
+        None,
     )
     .expect("shell switch proceeds");
     assert_eq!(previous.as_deref(), Some("active"));
@@ -270,11 +274,12 @@ fn divergence_discard_drops_relogin_and_relinks_target() {
         Some(creds("target-a", "target-r")),
     ));
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Discard),
         no_network,
+        None,
     )
     .expect("discard switch succeeds — it force-relinks past the divergence guard");
     assert_eq!(previous.as_deref(), Some("active"));
@@ -330,6 +335,7 @@ fn divergence_discard_to_a_ghost_target_bails_before_side_effects() {
         &crate::profile::ProfileName::from("ghost"),
         Some(DivergenceChoice::Discard),
         no_network,
+        None,
     )
     .expect_err("a ghost target must bail");
     assert!(
@@ -379,6 +385,7 @@ fn divergence_overwrite_to_a_ghost_target_bails_before_capture() {
         &crate::profile::ProfileName::from("ghost"),
         Some(DivergenceChoice::Overwrite),
         no_network,
+        None,
     )
     .expect_err("a ghost target must bail");
     assert!(
@@ -437,11 +444,12 @@ fn non_diverged_switch_takes_plain_path() {
         "precondition: active is cleanly linked, not diverged",
     );
 
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("target"),
         None,
         no_network,
+        None,
     )
     .expect("plain switch");
     assert_eq!(previous.as_deref(), Some("active"));
@@ -475,6 +483,7 @@ fn non_diverged_switch_refuses_a_disabled_target() {
         &crate::profile::ProfileName::from("target"),
         None,
         no_network,
+        None,
     )
     .expect_err("a disabled target must be refused");
     assert_eq!(
@@ -541,6 +550,7 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
         &crate::profile::ProfileName::from("target"),
         None,
         spy_refresher(&called),
+        None,
     )
     .expect_err("a disabled target must be refused");
     assert_eq!(
@@ -586,6 +596,7 @@ fn non_diverged_switch_refreshes_a_non_disabled_expired_target() {
         &crate::profile::ProfileName::from("target"),
         None,
         spy_refresher(&called),
+        None,
     );
     assert!(
         called.load(std::sync::atomic::Ordering::SeqCst),
@@ -624,6 +635,7 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
         &crate::profile::ProfileName::from("target"),
         None,
         revoked,
+        None,
     )
     .expect_err("a revoked target must refuse the switch");
     assert!(
@@ -681,6 +693,7 @@ fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
         &crate::profile::ProfileName::from("target"),
         None,
         no_network,
+        None,
     )
     .expect_err("a transient refresh failure must refuse the switch");
     assert!(
@@ -732,11 +745,12 @@ fn switch_to_the_active_profile_never_gates() {
             invalid_grant: true,
         })
     };
-    let (previous, active) = switch_profile_noninteractive(
+    let (previous, active, _) = switch_profile_noninteractive(
         &config,
         &crate::profile::ProfileName::from("active"),
         None,
         revoked,
+        None,
     )
     .expect("switch-to-active must no-op, never gate");
     assert_eq!(previous.as_deref(), Some("active"));
@@ -779,11 +793,13 @@ fn a_login_change_during_the_gates_refresh_defers_the_switch() {
             crate::actions::overwrite_captured_profile(
                 &mut cfg,
                 &crate::profile::ProfileName::from("target"),
+                &crate::testutil::profile_id("target"),
                 crate::actions::CaptureSnapshot {
                     credentials: Some(creds_expired("relogin-a", "relogin-r")),
                     base_url: None,
                     api_key: None,
                     anchor: crate::actions::AnchorAction::Unproven,
+                    plan: None,
                 },
             )
             .expect("install the re-login mid-refresh");
@@ -794,13 +810,14 @@ fn a_login_change_during_the_gates_refresh_defers_the_switch() {
                 scope: None,
             })
         },
+        None,
     )
     .expect_err("an expiring re-login defers the switch");
 
     match err {
         SwitchError::Deferred(sentence) => assert_eq!(
             sentence,
-            "'target' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'target' login changed during its refresh and the new login expires soon. Retry in a moment"
         ),
         other => panic!("expected a deferral, got {other:?}"),
     }

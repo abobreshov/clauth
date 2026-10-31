@@ -174,6 +174,11 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "a_frame_arrives_over_the_bridge",
             "a_history_page_serves_the_records_verbatim_paged_backward",
             "the_pane_id_is_the_path_segment_decoded_once",
+            // the session prompt and interrupt routes the bullet gained with the
+            // mod bridge (T31a).
+            "a_prompt_reaches_only_its_own_sessions_poll",
+            "an_interrupt_reaches_the_mod",
+            "the_herdr_fallback_drives_the_joined_pane",
             "a_missing_certificate_fails_in_prepare_not_after_the_claim",
             // rolling session token (#59): the daemon leg — the tick that
             // re-stamps the sidecar and the gate it goes through.

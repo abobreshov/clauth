@@ -32,6 +32,28 @@ fn app_with_extras(extras: Vec<AccountObservation>) -> App {
     app
 }
 
+/// Render the real selector shared by Setup and Usage, without the detail pane.
+fn render_usage_rail(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    let selected = app
+        .usage_extra_cursor
+        .map_or_else(|| app.usage_position(), |i| app.setup_items().len() + i);
+    term.draw(|frame| {
+        super::super::config::draw_band_selector(
+            frame,
+            frame.area(),
+            app,
+            app.usage_detail_focus == StatusFocus::List,
+            selected,
+            false,
+            &app.usage_selector,
+        )
+    })
+    .expect("draw rail");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
 #[test]
 fn a_monitor_card_renders_in_the_usage_tab_with_palette_colours() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -42,16 +64,19 @@ fn a_monitor_card_renders_in_the_usage_tab_with_palette_colours() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
-    term.draw(|f| super::super::usage::draw(f, f.area(), &app))
+    term.draw(|f| super::super::usage::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
     let text = rows.join("\n");
 
-    // The rail: the profile, then both extras, tagged by origin.
+    // The shared rail: profiles precede extras, whose group headings identify their origin.
+    let rail = render_usage_rail(&app, 100, 24).join("\n");
     assert!(text.contains("work"), "{text}");
-    assert!(text.contains("oll-main · monitor"), "{text}");
-    assert!(text.contains("personal · clauth"), "{text}");
+    assert!(rail.contains("monitors · Ollama Cloud"), "{rail}");
+    assert!(text.contains("oll-main"), "{text}");
+    assert!(rail.contains("upstream accounts (read-only)"), "{rail}");
+    assert!(text.contains("personal"), "{text}");
     // The detail: header, failure with its hint, the window card, the balance.
     assert!(text.contains("Ollama Cloud · pro (monitor)"), "{text}");
     assert!(text.contains("⚠ ollama.com did not answer · retries on the next poll"));
@@ -78,7 +103,7 @@ fn without_extras_the_usage_tab_is_unchanged() {
     let app = app_with_extras(Vec::new());
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).expect("terminal");
-    term.draw(|f| super::super::usage::draw(f, f.area(), &app))
+    term.draw(|f| super::super::usage::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
     assert!(!text.contains("· monitor"));
@@ -90,14 +115,24 @@ fn the_rail_cursor_walks_profiles_then_extras_and_wraps() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["work"]);
     let mut app = app_with_extras(vec![monitor(), upstream()]);
-    assert_eq!((app.profile_cursor, app.usage_extra_cursor), (0, None));
+    assert_eq!(
+        (app.profile_cursor.read(), app.usage_extra_cursor),
+        (0, None)
+    );
     step_usage_cursor(&mut app, 1);
     assert_eq!(app.usage_extra_cursor, Some(0));
-    assert_eq!(app.profile_cursor, 0, "the other tabs' cursor stays put");
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "the other tabs' cursor stays put"
+    );
     step_usage_cursor(&mut app, 1);
     assert_eq!(app.usage_extra_cursor, Some(1));
     step_usage_cursor(&mut app, 1);
-    assert_eq!((app.profile_cursor, app.usage_extra_cursor), (0, None));
+    assert_eq!(
+        (app.profile_cursor.read(), app.usage_extra_cursor),
+        (0, None)
+    );
     step_usage_cursor(&mut app, -1);
     assert_eq!(app.usage_extra_cursor, Some(1));
 }
@@ -210,11 +245,7 @@ fn usage_rail_groups_accounts_by_provider() {
         "Antigravity (agy login)",
     );
     let app = app_with_extras(vec![grok, agy]);
-    let mut term =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
-    term.draw(|f| super::super::usage::draw(f, f.area(), &app))
-        .expect("draw");
-    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let rows = render_usage_rail(&app, 100, 24);
     let text = rows.join("\n");
     let at = |needle: &str| {
         rows.iter()
@@ -223,14 +254,14 @@ fn usage_rail_groups_accounts_by_provider() {
     };
 
     assert!(at("  Anthropic") < at("❯ work"), "{text}");
-    assert!(at("❯ work") < at("  Grok"), "{text}");
-    assert!(at("  Grok") < at("Grok (CLI login) · moni"), "{text}");
+    assert!(at("❯ work") < at("  monitors · Grok"), "{text}");
+    assert!(at("  monitors · Grok") < at("Grok (CLI login)"), "{text}");
     assert!(
-        at("Grok (CLI login) · moni") < at("  Antigravity"),
+        at("Grok (CLI login)") < at("  monitors · Antigravity"),
         "{text}"
     );
     assert!(
-        at("  Antigravity") < at("Antigravity (agy login)"),
+        at("  monitors · Antigravity") < at("Antigravity (agy login)"),
         "{text}"
     );
 }

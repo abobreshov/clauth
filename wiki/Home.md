@@ -18,7 +18,7 @@ tollgate is a hard fork of [clauth](https://github.com/uwuclxdy/clauth) (MIT). T
 | [Codex](Codex) | OpenAI codex accounts: adopt or mint a ChatGPT login, run `codex` under a profile, the codex chain |
 | [Hermes](Hermes) | Hermes Agent homes as profiles: the child `HOME`, the launch guards, spend from `state.db`, the credential pool |
 | [Daemon](Daemon) | `tollgate daemon`, the local agent API, the TLS REST API, and the `status.json` read contract |
-| [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its five tools, `delegate` in full |
+| [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its five tools, `delegate` in full, answering a session from your phone |
 | [herdr plugin](Herdr-Plugin) | the tollgate popup in herdr, the keys, the usage-aware pane tag |
 | [Tokens and cost](Tokens-And-Cost) | where the token dashboard reads from, what the cost figure means |
 | [Security](Security) | where credentials live, what a switch touches, secrets rules, the API token |

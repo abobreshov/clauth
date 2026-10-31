@@ -139,7 +139,7 @@ pub(crate) fn render_list(rows: &[ListRow]) -> String {
         let mode = format!("{} home", r.mode);
         out.push_str(&format!(
             "{}{:name_w$}  {:provider_w$}  {:mode_w$}  auth {}{}{}\n",
-            if r.live { "● " } else { "  " },
+            if r.live { "* " } else { "  " },
             r.name,
             r.provider,
             mode,
@@ -252,7 +252,7 @@ pub(crate) fn pool_out(view: &PoolAuthView, profile: &HermesProfile) -> PoolOut 
 }
 
 /// `#<n> <label>  <auth_type>/<source>  <status>[ until <reset>]  req <count>
-/// prio <p>  fp …<last 4 hex>`, one line per entry.
+/// prio <p>  fp ...<last 4 hex>`, one line per entry.
 pub(crate) fn pool_lines(pool: &PoolOut) -> Vec<String> {
     // Labels and statuses are Hermes-written, and a label is whatever the
     // user typed at `auth add`: no control character reaches the terminal.
@@ -282,7 +282,7 @@ pub(crate) fn pool_lines(pool: &PoolOut) -> Vec<String> {
                 dash(&e.priority)
             ));
             if let Some(tail) = &e.fingerprint_tail {
-                line.push_str(&format!("  fp …{tail}"));
+                line.push_str(&format!("  fp ...{tail}"));
             }
             if e.tollgate_key {
                 line.push_str("  (the key tollgate bound)");
@@ -489,7 +489,7 @@ pub(crate) fn check_report(name: &str, profile: &HermesProfile) -> Result<Vec<Ch
         };
     step!("P projector", Ok(None));
     step!(
-        "G7–G10a config",
+        "G7-G10a config",
         guards::audit_projection(
             name,
             &paths.home,
@@ -632,8 +632,8 @@ pub(crate) fn render_show(s: &ShowOut) -> String {
         out.push('\n');
     };
     push(format!(
-        "{}{}  {} · {} home · auth {}",
-        if s.live { "● " } else { "" },
+        "{}{}  {}, {} home, auth {}",
+        if s.live { "* " } else { "" },
         s.name,
         s.provider,
         s.mode,
@@ -701,8 +701,8 @@ pub(crate) fn render_show(s: &ShowOut) -> String {
         for c in check {
             match &c.verdict {
                 Verdict::Pass => push(format!("    {:<18} ok", c.guard)),
-                Verdict::Note { text } => push(format!("    {:<18} ok — {text}", c.guard)),
-                Verdict::Refused { text } => push(format!("    {:<18} REFUSED — {text}", c.guard)),
+                Verdict::Note { text } => push(format!("    {:<18} ok: {text}", c.guard)),
+                Verdict::Refused { text } => push(format!("    {:<18} REFUSED: {text}", c.guard)),
             }
         }
     }

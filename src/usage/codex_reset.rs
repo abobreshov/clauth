@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::fetch::iso_to_epoch_secs;
-use crate::format::{local_stamp, plural, truncate};
+use crate::format::{local_stamp, plural, terminal_safe, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
 /// one a tollgate-held login reaches (see `codex::CODEX_USAGE_URL`).
@@ -91,20 +91,40 @@ pub(crate) struct ResetCredit {
 }
 
 impl ResetCredit {
-    fn is_available(&self) -> bool {
-        self.status == AVAILABLE
+    /// The status as `--list` shows it: `terminal_safe`, its padding off.
+    fn shown_status(&self) -> String {
+        trim_padding(&terminal_safe(&self.status)).to_string()
     }
 
-    /// The server's title, or the generic name codex's picker falls back to.
-    /// Control characters are dropped: this text reaches a terminal.
-    fn label(&self) -> String {
+    /// Whether the shown status reads `available`: its invisible characters
+    /// never keep a row that reads available from being the one spent.
+    fn is_available(&self) -> bool {
+        let shown: String = self
+            .shown_status()
+            .chars()
+            .filter(|&c| !is_invisible(c))
+            .collect();
+        shown == AVAILABLE
+    }
+
+    /// The server's title, else `None` when it is absent or, after
+    /// `terminal_safe`, holds nothing a terminal draws: blanks and invisible
+    /// characters only. Blank and invisible padding comes off both ends, and
+    /// the cap counts only what takes a cell, since this text reaches a
+    /// terminal.
+    fn shown_title(&self) -> Option<String> {
         let title = terminal_safe(self.title.as_deref().unwrap_or_default());
-        let title = title.trim();
-        if title.is_empty() {
-            "usage-limit reset".to_string()
+        if shows_nothing(&title) {
+            None
         } else {
-            truncate(title, 60)
+            Some(cap_drawn(trim_padding(&title), 60))
         }
+    }
+
+    /// The title, or the generic name codex's picker falls back to.
+    fn label(&self) -> String {
+        self.shown_title()
+            .unwrap_or_else(|| "usage-limit reset".to_string())
     }
 }
 
@@ -299,10 +319,103 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 // One spelling per outcome. A script can read the first stdout line as the
 // success summary and a failure off stderr.
 
-/// Server text with its control characters dropped: it reaches a terminal,
-/// where an escape sequence could retitle it or hide the confirm line.
-fn terminal_safe(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
+/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
+/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
+/// Asian Width calls them wide and halfwidth), so they count as blank: a cap
+/// cuts early rather than late, and a status holding one inside is never spent.
+fn is_blank(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// Whether a terminal draws nothing for `c` and it takes no cell either: a
+/// `Default_Ignorable_Code_Point` character that is neither a blank nor the
+/// soft hyphen `U+00AD`, which glibc's `wcwidth` gives a cell.
+fn is_invisible(c: char) -> bool {
+    draws_nothing(c) && !is_blank(c) && c != '\u{AD}'
+}
+
+/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
+/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
+/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
+fn draws_nothing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Whether `c` takes a cell in a terminal: every character but an invisible one
+/// does, blanks included.
+fn takes_a_cell(c: char) -> bool {
+    !is_invisible(c)
+}
+
+/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
+/// soft hyphen included. Callers pass `terminal_safe` output.
+fn shows_nothing(text: &str) -> bool {
+    text.chars().all(|c| is_blank(c) || draws_nothing(c))
+}
+
+/// `text` without the blank and `draws_nothing` padding on either end: the slice from
+/// the first drawn character through the last, plus the invisible characters
+/// directly after the last one (a variation selector travels with its emoji).
+/// `""` when `text` holds no drawn character.
+fn trim_padding(text: &str) -> &str {
+    let drawn = |c: char| !is_blank(c) && !draws_nothing(c);
+    let Some(start) = text.find(drawn) else {
+        return "";
+    };
+    let last = text.rfind(drawn).unwrap_or(start);
+    let after = last + text[last..].chars().next().map_or(0, char::len_utf8);
+    let tail = text[after..]
+        .find(|c: char| !is_invisible(c))
+        .unwrap_or(text.len() - after);
+    &text[start..after + tail]
+}
+
+/// Cap `text` at `max` characters that take a cell — drawn characters and
+/// blanks alike, never the invisible ones — appending `...` when it is over; at
+/// or under the cap the text comes back unchanged, padding and all. A cut keeps
+/// the invisible characters directly after the last character that takes a
+/// cell, so an emoji keeps its variation selector, and never counts those
+/// against the cap.
+fn cap_drawn(text: &str, max: usize) -> String {
+    if text.chars().filter(|&c| takes_a_cell(c)).count() <= max {
+        return text.to_string();
+    }
+    if max < 3 {
+        return truncate(text, max);
+    }
+    let mut kept = String::new();
+    let mut cells = 0;
+    for c in text.chars() {
+        if takes_a_cell(c) {
+            if cells == max - 3 {
+                break;
+            }
+            cells += 1;
+        }
+        kept.push(c);
+    }
+    kept.push_str("...");
+    kept
 }
 
 /// An RFC 3339 stamp as local wall-clock time, or the raw text (made
@@ -311,27 +424,42 @@ fn terminal_safe(s: &str) -> String {
 fn stamp(raw: &str) -> String {
     iso_to_epoch_secs(raw)
         .and_then(local_stamp)
-        .unwrap_or_else(|| truncate(&terminal_safe(raw), 40))
+        .unwrap_or_else(|| cap_drawn(&terminal_safe(raw), 40))
 }
 
 fn expiry(credit: &ResetCredit) -> String {
     match credit.expires_at.as_deref() {
-        Some(raw) => format!("expires {}", stamp(raw)),
-        None => "no expiry".to_string(),
+        Some(raw) if !shows_nothing(&terminal_safe(raw)) => {
+            format!("expires {}", stamp(raw))
+        }
+        Some(_) | None => "no expiry".to_string(),
+    }
+}
+
+/// Raise a clause's first letter so it can open a sentence.
+fn capitalize(clause: &str) -> String {
+    let mut chars = clause.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
+/// An untitled credit opens on its expiry alone: the question already says a
+/// usage-limit reset is what gets spent.
 pub(crate) fn limit_reset_prompt(
     name: &str,
     credits: &ResetCredits,
     credit: &ResetCredit,
 ) -> String {
+    let subject = match credit.shown_title() {
+        Some(title) => format!("{title}, {}", expiry(credit)),
+        None => capitalize(&expiry(credit)),
+    };
     format!(
-        "tollgate: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
+        "tollgate: use a usage-limit reset on '{name}'? {subject}, 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
-        credit.label(),
-        expiry(credit),
         credits.stated_count()
     )
 }
@@ -351,17 +479,22 @@ pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<
     }];
     for credit in &credits.credits {
         let marked = next == Some(credit.id.as_str());
-        let status = terminal_safe(&credit.status);
-        let granted = credit
-            .granted_at
-            .as_deref()
-            .map(|g| format!(", granted {}", stamp(g)))
-            .unwrap_or_default();
+        let status = credit.shown_status();
+        let status_clause = if shows_nothing(&status) {
+            String::new()
+        } else {
+            format!("{}, ", cap_drawn(&status, 20))
+        };
+        let granted = match credit.granted_at.as_deref() {
+            Some(raw) if !shows_nothing(&terminal_safe(raw)) => {
+                format!(", granted {}", stamp(raw))
+            }
+            Some(_) | None => String::new(),
+        };
         lines.push(format!(
-            "  {} {} — {}, {}{granted}{}",
+            "  {} {}: {status_clause}{}{granted}{}",
             if marked { "*" } else { " " },
             credit.label(),
-            truncate(&status, 20),
             expiry(credit),
             if marked { "  (used next)" } else { "" },
         ));
@@ -377,8 +510,8 @@ pub(crate) fn no_resets_available(name: &str) -> String {
 /// who does refresh it.
 fn token_rejected(name: &str) -> String {
     format!(
-        "codex rejected the stored access token for '{name}' — the daemon refreshes it \
-         for a parked account and codex does for the one in use; try again after that"
+        "codex rejected the stored access token for '{name}'. The daemon refreshes it \
+         for a parked account and codex does for the one in use. Try again after that"
     )
 }
 
@@ -389,7 +522,7 @@ fn check_list_hint(name: &str) -> String {
 /// A failed GET. Nothing was spent, and every line says so.
 pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}; no reset was used", token_rejected(name)),
+        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
         ResetCallError::Status(status) => format!(
             "codex answered the reset list for '{name}' with HTTP {status}; no reset was used"
         ),
@@ -407,7 +540,7 @@ pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
 /// leaves the outcome open, and the line says to look before retrying.
 pub(crate) fn consume_failure(name: &str, err: &ResetCallError) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}; no reset was used", token_rejected(name)),
+        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
         ResetCallError::Status(status) => format!(
             "codex answered the reset request for '{name}' with HTTP {status}; {}",
             check_list_hint(name)

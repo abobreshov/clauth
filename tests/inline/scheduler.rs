@@ -9,10 +9,10 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 use super::{
     ActivityStore, ClaudeRollingPacing, EpochMs, FetchLeg, FetchStamp, LastFetchedAt, LegKey,
     ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedAuthExpiredStore, ThirdPartyEntry,
-    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, clear_activity, clear_orphaned_forced,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, fetch_third_party_due,
-    filter_suppressed, generic_slot_deferral, mark_activity, memoized_identity, partition_due,
-    should_anchor_fetch, window_lapsed,
+    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, any_fetch_leg_polls, clear_activity,
+    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    fetch_third_party_due, filter_suppressed, generic_slot_deferral, mark_activity,
+    memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -24,12 +24,41 @@ fn token(name: &str) -> TokenEntry {
         access_expires_at: None,
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::OAuth,
+        ),
     }
 }
 
 /// The OAuth leg's key for `name` — most scheduler tests drive [`TokenEntry`].
 fn oauth_key(name: &str) -> LegKey {
     FetchLeg::OAuth.key(crate::profile::ProfileName::from(name))
+}
+
+/// `collect_tokens`' entries built for a LANDING: each entry carries the OAuth
+/// epoch read NOW (the test's start), never the build-time 0. A prior test in
+/// the same process that forgot one of these names moved its epoch, and the
+/// landing's section-2 gate must read the same value the entry carries (N3).
+fn collect_tokens_for_landing(config: &crate::profile::AppConfig) -> Vec<TokenEntry> {
+    collect_tokens(config)
+        .into_iter()
+        .map(|mut e| {
+            e.epoch_at_spawn = crate::usage::epoch_value(&e.name, crate::usage::Half::OAuth);
+            e
+        })
+        .collect()
+}
+
+/// A single `collect_tokens` entry built for a `run_fetch` landing, stamped with
+/// the OAuth epoch read NOW (never the build-time 0): a prior test in the same
+/// process that forgot the name moved its epoch, and the kick's section-2 gate
+/// must read the same value the entry carries (N3).
+fn collect_one_token_for_landing(config: &crate::profile::AppConfig) -> TokenEntry {
+    let mut e = collect_tokens(config).into_iter().next().expect("token");
+    e.epoch_at_spawn = crate::usage::epoch_value(&e.name, crate::usage::Half::OAuth);
+    e
 }
 
 /// The third-party leg's key for `name`.
@@ -71,6 +100,7 @@ fn auto_start_queue_profile(name: &str) -> crate::profile::Profile {
 fn collect_tokens_excludes_disabled_profiles_includes_enabled_siblings() {
     use crate::profile::{AppConfig, AppState};
 
+    let _home = crate::testutil::HomeSandbox::new();
     let config = AppConfig {
         state: AppState::default(),
         profiles: vec![
@@ -115,17 +145,17 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
         ],
     };
 
-    let seed = collect_oauth_seed_names(&config);
+    let seed = collect_oauth_seed_names(&config, REFRESH_INTERVAL_MS);
     assert!(
-        seed.contains(&"off".to_string()),
+        seed.contains(&("off".to_string(), REFRESH_INTERVAL_MS)),
         "the display seed must include a disabled OAuth profile: {seed:?}"
     );
     assert!(
-        seed.contains(&"on".to_string()),
+        seed.contains(&("on".to_string(), REFRESH_INTERVAL_MS)),
         "and its enabled sibling: {seed:?}"
     );
     assert!(
-        !seed.contains(&"credless".to_string()),
+        !seed.iter().any(|(name, _)| name == "credless"),
         "a credential-less profile has no oauth cache to seed: {seed:?}"
     );
 
@@ -147,7 +177,7 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    super::bootstrap_fetch(&store, &status, &last_fetched, &seed, REFRESH_INTERVAL_MS);
+    super::bootstrap_fetch(&store, &status, &last_fetched, &seed);
 
     let seeded = store.lock().unwrap().get("off").cloned();
     assert_eq!(
@@ -231,6 +261,147 @@ fn collect_third_party_entries_skips_an_empty_key_profile() {
     );
 }
 
+/// `any_fetch_leg_polls` must answer exactly "is this profile on either fetch
+/// leg's work list" — [`collect_tokens`] ∪ [`collect_third_party_entries`] —
+/// across every profile shape the two membership rules distinguish. A predicate
+/// that restates the rule instead of sharing it drifts silently: an OAuth arm
+/// dropping its login test, a third-party arm reading `third_party_credentialed`
+/// alone (missing the endpoint-shape test), or either arm ignoring disabled-ness.
+#[test]
+fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let deepseek = "https://api.deepseek.com/anthropic";
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let generic = "https://api.example.com/anthropic";
+
+    // One enabled profile per shape. The endpoint-shape axis (recognised
+    // provider vs generic `base_url` vs neither) is what separates the typed,
+    // generic and plain-key third-party shapes.
+    let enabled = vec![
+        oauth_profile_disabled("oauth-login", false),
+        Profile::new("oauth-logged-out".to_string(), None, None),
+        {
+            let mut p = oauth_profile_disabled("hybrid-login-key", false);
+            p.base_url = Some(deepseek.to_string());
+            p.api_key = Some("sk-hybrid".to_string());
+            p.provider = crate::providers::Provider::from_base_url(deepseek);
+            p
+        },
+        Profile::new(
+            "typed-key".to_string(),
+            Some(deepseek.to_string()),
+            Some("sk-typed".to_string()),
+        ),
+        Profile::new(
+            "typed-keyless".to_string(),
+            Some(deepseek.to_string()),
+            None,
+        ),
+        Profile::new(
+            "typed-blank-key".to_string(),
+            Some(deepseek.to_string()),
+            Some("  \t ".to_string()),
+        ),
+        Profile::new(
+            "alibaba-console".to_string(),
+            Some(alibaba.to_string()),
+            None,
+        ),
+        Profile::new(
+            "generic-key".to_string(),
+            Some(generic.to_string()),
+            Some("sk-generic".to_string()),
+        ),
+        Profile::new(
+            "generic-keyless".to_string(),
+            Some(generic.to_string()),
+            None,
+        ),
+        Profile::new(
+            "plain-key-no-base-url".to_string(),
+            None,
+            Some("sk-plain".to_string()),
+        ),
+        // The usage probe's axis: the switch on a setup-token-only account,
+        // on an account with no pair and no setup token either (set by hand:
+        // the probe has nothing to send), beside a pair (where `/usage` reads
+        // it), and on an endpoint profile.
+        {
+            let mut p = Profile::new("probe-no-pair".to_string(), None, None);
+            p.usage_probe = true;
+            p.has_long_lived_sidecar = true;
+            p
+        },
+        {
+            let mut p = Profile::new("probe-no-token".to_string(), None, None);
+            p.usage_probe = true;
+            p
+        },
+        {
+            let mut p = oauth_profile_disabled("probe-beside-pair", false);
+            p.usage_probe = true;
+            p
+        },
+        {
+            let mut p = Profile::new(
+                "probe-generic-keyless".to_string(),
+                Some(generic.to_string()),
+                None,
+            );
+            p.usage_probe = true;
+            p
+        },
+    ];
+
+    // A disabled copy of every shape: no work list admits a disabled profile.
+    let disabled: Vec<Profile> = enabled
+        .iter()
+        .map(|p| {
+            let mut d = p.clone();
+            d.name = crate::profile::ProfileName::from(format!("{}-disabled", p.name.as_str()));
+            d.disabled = true;
+            d
+        })
+        .collect();
+
+    let all: Vec<Profile> = enabled.into_iter().chain(disabled).collect();
+    let cfg = AppConfig {
+        state: AppState::default(),
+        profiles: all.clone(),
+    };
+    let oauth_members: HashSet<String> = collect_tokens(&cfg)
+        .into_iter()
+        .map(|e| e.name.to_string())
+        .collect();
+    let tp_members: HashSet<String> = collect_third_party_entries(&cfg.profiles)
+        .into_iter()
+        .map(|e| e.name.to_string())
+        .collect();
+    let probe_members: HashSet<String> = super::collect_probe_seeds(&cfg)
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    assert_eq!(
+        probe_members,
+        HashSet::from(["probe-no-pair".to_string()]),
+        "the probe leg takes the switch on a setup-token-only account alone"
+    );
+
+    for p in &all {
+        let on_a_work_list = oauth_members.contains(p.name.as_str())
+            || tp_members.contains(p.name.as_str())
+            || probe_members.contains(p.name.as_str());
+        assert_eq!(
+            any_fetch_leg_polls(p),
+            on_a_work_list,
+            "any_fetch_leg_polls({}) disagrees with the work lists",
+            p.name.as_str(),
+        );
+    }
+}
+
 /// Every profile uses the same fixed `REFRESH_INTERVAL_MS` cadence: a
 /// never-fetched profile is due once `now` reaches the interval, a just-fetched
 /// one is not due until exactly one interval has elapsed, and the published
@@ -238,7 +409,7 @@ fn collect_third_party_entries_skips_an_empty_key_profile() {
 #[test]
 fn partition_due_uses_fixed_interval() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
     let base = 1_700_000_000_000u64; // realistic epoch-ms
 
@@ -472,7 +643,7 @@ fn spent_skip_set_selects_only_unforced_spent_accounts() {
 #[test]
 fn partition_due_excludes_refreshing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
 
     mark_activity(
@@ -502,7 +673,7 @@ fn partition_due_excludes_refreshing() {
 #[test]
 fn partition_due_excludes_switching() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let snapshot = vec![token("a")];
 
     mark_activity(
@@ -533,7 +704,7 @@ fn partition_due_excludes_switching() {
 #[test]
 fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     // partition marks the leg due, then a rotation opens on the same profile.
@@ -570,32 +741,12 @@ fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
     );
 }
 
-/// The rotation owner's handoff is one write: the account marker retires and the
-/// OAuth leg opens under a single hold, so `partition_due` never observes the
-/// profile idle between the two.
-#[test]
-fn the_rotation_owner_hands_its_marker_to_the_oauth_leg() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let name = crate::profile::ProfileName::from("a");
-
-    mark_activity(&activity, &name, ProfileActivity::Refreshing);
-    super::rotation_into_fetch(&activity, &name);
-
-    let states = activity.lock().unwrap();
-    let state = states.get("a").expect("activity state");
-    assert_eq!(state.account, None, "the rotation marker retires");
-    assert_eq!(
-        state.fetch(FetchLeg::OAuth),
-        Some(ProfileActivity::Fetching)
-    );
-}
-
 /// `end_rotation` retires the rotation marker alone. A rotation result drains on
 /// the UI thread a tick or more after its worker returned, by which time an
 /// unrelated refetch may already own the OAuth leg.
 #[test]
 fn end_rotation_leaves_a_later_oauth_refetch_standing() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -616,7 +767,7 @@ fn end_rotation_leaves_a_later_oauth_refetch_standing() {
 /// `Refreshing` retires here, so a switch opened after the rotation survives.
 #[test]
 fn end_rotation_leaves_a_switch_gate_standing() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Switching);
@@ -634,7 +785,7 @@ fn end_rotation_leaves_a_switch_gate_standing() {
 /// that reached into them would drop a spinner it never raised.
 #[test]
 fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("a");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -664,7 +815,7 @@ fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
 #[test]
 fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -737,7 +888,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
 #[test]
 fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -816,7 +967,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
 #[test]
 fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
     // The stamp already carries the deep 429 extra (`apply_outcome` recorded it).
@@ -863,11 +1014,12 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
 fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
     use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome, now_ms};
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     // Deep on both axes before the outcome lands; update_streaks only widens.
     streaks.lock().unwrap().insert(
@@ -888,6 +1040,15 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("storm"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     apply_outcome(
         outcome,
@@ -943,7 +1104,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
 #[test]
 fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
     // A non-429 stamp: the deadline is bare, the recorded ladder is 0.
@@ -982,7 +1143,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
 #[test]
 fn partition_due_clamps_the_active_capped_bake_exactly() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     // `next_slot_deferral`'s cap: active streak 5 ladders to 2*interval, so the
     // recorded bake is one interval (2*interval - interval), not the raw floor.
@@ -1026,7 +1187,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
 #[test]
 fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     let baked_extra = 30_000u64; // streak-2 ladder, same on both axes
 
@@ -1090,7 +1251,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
 #[test]
 fn partition_due_clamp_leaves_third_party_untouched() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let base = 1_700_000_000_000u64;
     last_fetched
         .lock()
@@ -1216,13 +1377,13 @@ fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
         &store,
         &status,
         &last_fetched,
-        &["hybrid".to_string()],
-        REFRESH_INTERVAL_MS,
+        &[("hybrid".to_string(), REFRESH_INTERVAL_MS)],
     );
     super::bootstrap_third_party(
         &tp_store,
         &tp_status,
         &last_fetched,
+        &["hybrid".to_string()],
         &[tp_entry("hybrid")],
         REFRESH_INTERVAL_MS,
     );
@@ -1288,37 +1449,100 @@ fn selected_next_refresh_picks_the_provider_leg_for_a_hybrid() {
     );
 }
 
-/// A panicking OAuth worker owns BOTH slots at the moment it dies: the leg it
-/// was queued on, and the account marker its own rotation raised inside
-/// `poll_one`. The join loop is the only site left to free either, so it frees
-/// both. Freeing the leg alone strands `Refreshing`, and `partition_due`
-/// excludes the profile from every later tick.
+/// A poll worker that dies inside its rotation's claimed window owns two
+/// things: the leg it was queued on and its scheduler spend claim. The claim's
+/// guard drops its count on unwind, and the join loop frees the leg, so neither
+/// is stranded: a stranded claim would exclude the profile from
+/// `partition_due` on every later tick and hold every quit.
 #[test]
 fn a_panicking_oauth_worker_strands_neither_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "boom-claimed";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let marker_at_death = Arc::new(std::sync::Mutex::new(None));
+    {
+        let activity = Arc::clone(&state.activity);
+        let marker_at_death = Arc::clone(&marker_at_death);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || {
+                *marker_at_death.lock().expect("record") =
+                    Some(super::token_spend_in_flight(&activity));
+                panic!("the worker dies holding its claim")
+            }),
+        );
+    }
+
+    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        *marker_at_death.lock().expect("record"),
+        Some(true),
+        "the worker died inside its claimed rotation window"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the worker died before the token exchange: {seen:?}"
+    );
+    assert!(
+        super::is_idle(&state.activity, &profile),
+        "the claim's guard drops its count and the join loop frees the leg"
+    );
+}
+
+/// The reap frees only what the dead worker owned: an account marker the TUI
+/// stamped (its rotate) while the worker ran is the TUI's, and survives the
+/// worker's panic.
+#[test]
+fn a_panicking_oauth_worker_leaves_a_foreign_account_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["boom"]);
+    crate::testutil::register_names(&["boom-foreign"]);
     let state = completion_order_state();
     let activity = Arc::clone(&state.activity);
-    let name = crate::profile::ProfileName::from("boom");
 
     super::fetch_oauth_due_with(
         &state,
-        vec![token("boom")],
+        vec![token("boom-foreign")],
         REFRESH_INTERVAL_MS,
         move |_| {
-            // What `poll_one` does before it reaches its rotation handoff.
+            // The TUI's rotate stamps the account while this worker runs, then
+            // the worker dies before it claimed anything.
             mark_activity(
                 &activity,
-                &crate::profile::ProfileName::from("boom"),
+                &crate::profile::ProfileName::from("boom-foreign"),
                 ProfileActivity::Refreshing,
             );
-            panic!("simulated worker panic mid-rotation")
+            panic!("simulated worker panic before any claim")
         },
     );
 
-    assert!(
-        super::is_idle(&state.activity, &name),
-        "the join loop frees the dead worker's account marker as well as its leg"
+    assert_eq!(
+        account_marker(&state.activity, "boom-foreign"),
+        Some(ProfileActivity::Refreshing),
+        "the TUI rotate's marker is not the dead worker's to clear"
     );
 }
 
@@ -1344,25 +1568,26 @@ fn a_panicking_oauth_worker_records_failed_status() {
     );
 }
 
-/// Third-party twin: the join loop's panic arm records Failed in the provider
-/// status store AND clears the live broken mark — a panicked worker produced no
+/// Third-party twin: the reap's panic arm records Failed in the provider status
+/// store, clears the live broken mark — a panicked worker produced no
 /// key-rejection, so a pre-seeded mark must not survive to keep a recovered
-/// member chain-broken.
+/// member chain-broken — and frees the provider slot its worker marked
+/// `Fetching` before the fetch that died, which no landing will ever clear.
 #[test]
 fn a_panicking_third_party_worker_records_failed_status() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["boom"]);
     let state = third_party_state(|_, _, _| panic!("simulated provider worker panic"));
+    // Build the entry BEFORE taking the broken-store guard: `tp_entry` reads the
+    // epoch (rank 160), which cannot be acquired while the guard (295) is held.
+    let boom = tp_entry("boom");
     state
         .third_party_broken
         .lock()
         .expect("broken store unpoisoned")
-        .insert(
-            "boom".to_string(),
-            tp_entry("boom").credential_fingerprint(),
-        );
+        .insert("boom".to_string(), boom.credential_fingerprint());
 
-    fetch_third_party_due(&state, vec![tp_entry("boom")]);
+    fetch_third_party_due(&state, vec![boom]);
 
     let status = state
         .third_party_status
@@ -1374,12 +1599,18 @@ fn a_panicking_third_party_worker_records_failed_status() {
         "a panicked provider worker records Failed"
     );
     assert!(
-        !state
+        state
             .third_party_broken
             .lock()
             .expect("broken store unpoisoned")
             .contains_key("boom"),
-        "a panic clears the live broken mark — no key rejection was observed"
+        "a panic proves nothing about the key: the broken mark stands"
+    );
+    // The worker marked its own provider slot `Fetching` before the fetch that
+    // panicked; no landing will clear it, so an unreaped slot spins forever.
+    assert!(
+        super::is_idle(&state.activity, &crate::profile::ProfileName::from("boom")),
+        "the reap frees the panicked worker's provider slot"
     );
 }
 
@@ -1403,6 +1634,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
         REFRESH_INTERVAL_MS,
         |entry| cached_outcome(&entry.name),
     );
+    let after = super::now_ms();
     {
         let activity = oauth.activity.lock().unwrap();
         let state = activity.get("hybrid").expect("provider activity survives");
@@ -1414,7 +1646,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     }
     let oauth_next = oauth.next_refresh_per_profile.lock().unwrap()[&oauth_key("hybrid")];
     assert!(
-        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000).contains(&oauth_next),
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&oauth_next),
         "OAuth completion publishes its own cadence deadline: {oauth_next}"
     );
 
@@ -1426,6 +1658,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     );
     let before = super::now_ms();
     fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
+    let after = super::now_ms();
     {
         let activity = provider.activity.lock().unwrap();
         let state = activity.get("hybrid").expect("OAuth activity survives");
@@ -1437,8 +1670,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
     }
     let provider_next = provider.next_refresh_per_profile.lock().unwrap()[&tp_key("hybrid")];
     assert!(
-        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000)
-            .contains(&provider_next),
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&provider_next),
         "provider completion publishes its own cadence deadline: {provider_next}"
     );
 }
@@ -1504,7 +1736,7 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
 /// in-flight switch pending state.
 #[test]
 fn merge_forced_skips_switching() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     mark_activity(
         &activity,
         &crate::profile::ProfileName::from("switching"),
@@ -1562,6 +1794,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         FetchOutcome, StatusStore, apply_outcome, now_ms, partition_due, rotation_bail_context,
     };
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1578,6 +1811,15 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         login_gone: false,
         plan_override: None,
         retry_after,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("u"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
@@ -1616,7 +1858,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 
     // partition_due honors the deferral end to end.
     let snapshot = vec![token("u")];
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (due, _) = partition_due(
         &snapshot,
         stamp + REFRESH_INTERVAL_MS - 1,
@@ -1643,7 +1885,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 /// are both left alone.
 #[test]
 fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     mark_activity(
         &activity,
         &crate::profile::ProfileName::from("orphan"),
@@ -1693,7 +1935,7 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
 /// `a_panicking_oauth_worker_strands_neither_slot`.
 #[test]
 fn refresh_all_panic_arm_frees_the_account_slot_alone() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let name = crate::profile::ProfileName::from("test-profile");
 
     mark_activity(&activity, &name, ProfileActivity::Refreshing);
@@ -1729,6 +1971,7 @@ fn cached_fallback_does_not_clobber_store() {
     use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
     use crate::usage::{UsageInfo, UsageWindow};
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1756,6 +1999,15 @@ fn cached_fallback_does_not_clobber_store() {
             login_gone: false,
             plan_override: None,
             retry_after: None,
+            oauth_identity: crate::usage::OAuthIdentity::default(),
+            sent_access_token: String::new(),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("a"),
+                crate::usage::Half::OAuth,
+            ),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
         },
         &store,
         &status,
@@ -1788,6 +2040,15 @@ fn cached_fallback_does_not_clobber_store() {
             login_gone: false,
             plan_override: None,
             retry_after: None,
+            oauth_identity: crate::usage::OAuthIdentity::default(),
+            sent_access_token: String::new(),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("b"),
+                crate::usage::Half::OAuth,
+            ),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
         },
         &store,
         &status,
@@ -1847,14 +2108,19 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
     };
+    let mut outcome = FetchOutcome::cached(
+        &crate::profile::ProfileName::from("a"),
+        FetchStatus::RateLimited,
+        None,
+        None,
+    )
+    .with_plan(Some(canceled));
+    outcome.epoch_at_spawn = crate::usage::epoch_value(
+        &crate::profile::ProfileName::from("a"),
+        crate::usage::Half::OAuth,
+    );
     apply_outcome(
-        FetchOutcome::cached(
-            &crate::profile::ProfileName::from("a"),
-            FetchStatus::RateLimited,
-            None,
-            None,
-        )
-        .with_plan(Some(canceled)),
+        outcome,
         &store,
         &status,
         &last_fetched,
@@ -1917,14 +2183,19 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
     };
+    let mut outcome = FetchOutcome::cached(
+        &crate::profile::ProfileName::from("cold"),
+        FetchStatus::RateLimited,
+        None,
+        None,
+    )
+    .with_plan(Some(canceled));
+    outcome.epoch_at_spawn = crate::usage::epoch_value(
+        &crate::profile::ProfileName::from("cold"),
+        crate::usage::Half::OAuth,
+    );
     apply_outcome(
-        FetchOutcome::cached(
-            &crate::profile::ProfileName::from("cold"),
-            FetchStatus::RateLimited,
-            None,
-            None,
-        )
-        .with_plan(Some(canceled)),
+        outcome,
         &store,
         &status,
         &last_fetched,
@@ -2002,14 +2273,19 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
     };
+    let mut outcome = FetchOutcome::cached(
+        &crate::profile::ProfileName::from("a"),
+        FetchStatus::RateLimited,
+        None,
+        None,
+    )
+    .with_plan(Some(canceled));
+    outcome.epoch_at_spawn = crate::usage::epoch_value(
+        &crate::profile::ProfileName::from("a"),
+        crate::usage::Half::OAuth,
+    );
     apply_outcome(
-        FetchOutcome::cached(
-            &crate::profile::ProfileName::from("a"),
-            FetchStatus::RateLimited,
-            None,
-            None,
-        )
-        .with_plan(Some(canceled)),
+        outcome,
         &store,
         &status,
         &last_fetched,
@@ -2041,7 +2317,13 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
         state: AppState::default(),
         profiles: vec![oauth_profile_disabled("a", false)],
     };
-    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        REFRESH_INTERVAL_MS,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let entry = entries
         .iter()
         .find(|e| e.name.as_str() == "a")
@@ -2086,6 +2368,15 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             login_gone: false,
             plan_override: None,
             retry_after: None,
+            oauth_identity: crate::usage::OAuthIdentity::default(),
+            sent_access_token: String::new(),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("a"),
+                crate::usage::Half::OAuth,
+            ),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
         },
         &store,
         &status,
@@ -2112,7 +2403,13 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
         state: AppState::default(),
         profiles: vec![oauth_profile_disabled("a", false)],
     };
-    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        REFRESH_INTERVAL_MS,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let entry = entries
         .iter()
         .find(|e| e.name.as_str() == "a")
@@ -2799,6 +3096,15 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("w"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
 
     // The one shape that sets the mark: fresh, opted in, hard-cap rollover,
@@ -2925,10 +3231,8 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         state: AppState::default(),
         profiles: vec![auto_start_queue_profile("a")],
     };
-    let entry = super::collect_tokens(&app_config)
-        .into_iter()
-        .next()
-        .expect("queued token");
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
     let config = Arc::new(RankedMutex::new(app_config));
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -2941,7 +3245,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
@@ -3026,6 +3330,7 @@ fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
 
     let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
     let now_before = crate::usage::now_epoch_secs();
     let reset = now_before + 6_073;
     let limiter = crate::testutil::window_exhaustion_429_headers(reset, now_before + 383_473);
@@ -3052,10 +3357,13 @@ fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
         state: AppState::default(),
         profiles: vec![auto_start_queue_profile("a")],
     };
-    let entry = super::collect_tokens(&app_config)
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = super::collect_tokens(&app_config)
         .into_iter()
         .next()
         .expect("queued token");
+    entry.epoch_at_spawn =
+        crate::usage::epoch_value(&ProfileName::from("a"), crate::usage::Half::OAuth);
     let config = Arc::new(RankedMutex::new(app_config));
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -3068,7 +3376,7 @@ fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     // The weekly-reset mark makes the first tick kick on a live window; the
@@ -3102,6 +3410,11 @@ fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
     assert!(
         super::kick_rejected_names(&blocks, now_before).is_empty(),
         "one exhaustion kick must not move the chain"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&a, crate::profile_cache::KICK_BLOCK_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the matched kick writes the durable kick_block.json"
     );
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
@@ -3177,6 +3490,12 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
     assert!(
@@ -3356,98 +3675,63 @@ fn only_a_switch_grade_kick_block_rotates_the_chain() {
 /// failure (transport, 401 path) leaves existing state untouched.
 #[test]
 fn kick_block_persists_and_clears_by_outcome() {
-    use super::{kick_block, note_kick_outcome, sync_kick_blocks_from_cache};
+    use super::{
+        kick_block, kick_block_after_429, note_kick_block_disk, note_kick_outcome,
+        sync_kick_blocks_from_cache,
+    };
     use crate::oauth::KickRateLimit;
     use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, load_profile_cache};
 
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["kitty"]);
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("kitty");
     let now = 2_000_000;
     let rl = KickRateLimit {
         rejected: true,
         until_epoch_secs: Some(now + 600),
     };
 
-    note_kick_outcome(
-        &blocks,
-        &crate::profile::ProfileName::from("kitty"),
-        false,
-        Some(rl),
-        now,
-    );
-    let live = kick_block(&blocks, &crate::profile::ProfileName::from("kitty"))
-        .expect("429 outcome must block");
+    let next = kick_block_after_429(kick_block(&blocks, &name), &rl, now);
+    note_kick_outcome(&blocks, &name, false, Some(next), now);
+    note_kick_block_disk(&name, false, Some(next));
+    let live = kick_block(&blocks, &name).expect("429 outcome must block");
     assert_eq!(live.streak, 1);
-    let on_disk: super::KickBlock = load_profile_cache(
-        &crate::profile::ProfileName::from("kitty"),
-        KICK_BLOCK_CACHE_FILE,
-    )
-    .expect("block written through");
+    let on_disk: super::KickBlock =
+        load_profile_cache(&name, KICK_BLOCK_CACHE_FILE).expect("block written through");
     assert_eq!(on_disk, live);
 
     // A failure with no limiter metadata must not disturb the block.
-    note_kick_outcome(
-        &blocks,
-        &crate::profile::ProfileName::from("kitty"),
-        false,
-        None,
-        now + 20,
-    );
-    assert_eq!(
-        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")),
-        Some(live)
-    );
+    note_kick_outcome(&blocks, &name, false, None, now + 20);
+    assert_eq!(kick_block(&blocks, &name), Some(live));
 
     // A second 429 grows the streak in place.
-    note_kick_outcome(
-        &blocks,
-        &crate::profile::ProfileName::from("kitty"),
-        false,
-        Some(rl),
-        now + 30,
-    );
-    assert_eq!(
-        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")).map(|b| b.streak),
-        Some(2)
-    );
+    let next = kick_block_after_429(kick_block(&blocks, &name), &rl, now + 30);
+    note_kick_outcome(&blocks, &name, false, Some(next), now + 30);
+    note_kick_block_disk(&name, false, Some(next));
+    assert_eq!(kick_block(&blocks, &name).map(|b| b.streak), Some(2));
     assert_eq!(
         super::kick_rejected_names(&blocks, now + 30),
-        vec![crate::profile::ProfileName::from("kitty")],
+        vec![name.clone()],
         "two 429s carrying the limiter's rejection make the block switch-grade"
     );
 
     // A fresh map (new process) resumes the persisted block…
     let rehydrated: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
-    assert_eq!(
-        kick_block(&rehydrated, &crate::profile::ProfileName::from("kitty")).map(|b| b.streak),
-        Some(2)
-    );
+    assert_eq!(kick_block(&rehydrated, &name).map(|b| b.streak), Some(2));
 
     // …and a successful kick clears map + file, so the next sync clears mirrors.
-    note_kick_outcome(
-        &blocks,
-        &crate::profile::ProfileName::from("kitty"),
-        true,
-        None,
-        now + 40,
-    );
-    assert_eq!(
-        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")),
-        None
-    );
+    note_kick_outcome(&blocks, &name, true, None, now + 40);
+    note_kick_block_disk(&name, true, None);
+    assert_eq!(kick_block(&blocks, &name), None);
     assert!(
-        load_profile_cache::<super::KickBlock>(
-            &crate::profile::ProfileName::from("kitty"),
-            KICK_BLOCK_CACHE_FILE
-        )
-        .is_none(),
+        load_profile_cache::<super::KickBlock>(&name, KICK_BLOCK_CACHE_FILE).is_none(),
         "clearing must remove the cache file"
     );
     sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
     assert_eq!(
-        kick_block(&rehydrated, &crate::profile::ProfileName::from("kitty")),
+        kick_block(&rehydrated, &name),
         None,
         "a mirroring instance drops the block once the file is gone"
     );
@@ -3501,8 +3785,10 @@ fn only_a_fresh_read_drives_a_switch_decision() {
 #[test]
 fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     let frozen_state = || {
         // The wedge's exact shape: the active's last-ever read is maxed on a
@@ -3535,7 +3821,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
             ("b".to_string(), FetchStatus::Fresh),
         ])));
         let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let activity = crate::testutil::fresh_activity();
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         (store, status, streaks, activity, pending, pending_off)
@@ -3548,10 +3834,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
                 fallback_chain: vec!["a".into(), "b".into()],
                 ..AppState::default()
             },
-            profiles: vec![
-                Profile::new("a".to_string(), None, None),
-                Profile::new("b".to_string(), None, None),
-            ],
+            profiles: vec![logged_in("a"), logged_in("b")],
         };
         cfg.set_auth_broken(&crate::profile::ProfileName::from("a"), broken);
         Arc::new(RankedMutex::new(cfg))
@@ -3567,6 +3850,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -3589,6 +3873,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -3601,15 +3886,124 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     );
 }
 
+/// \#110: what the "tollgate won't switch away from it on its own" copy promises,
+/// pinned where the promise is actually kept. A member tollgate cannot measure
+/// never gets a `Fresh` status, because nothing polls it, and
+/// [`reading_is_actionable`] is what every scan asks before it may act on an
+/// active's reading. So the chain stays on such a member however much room a
+/// sibling has. Pinned here rather than on the walk core: by the time the walk
+/// runs it has been handed a snapshot that already passed this gate, so a change
+/// to the gate would leave a walk-core test green while the copy went false.
+///
+/// The sidecar is not part of this gate: what decides is the ABSENCE of an
+/// actionable reading, the same absence whether a long-lived token or nothing
+/// at all serves the member's sessions. The fixture installs one only so
+/// `blind` is the member the copy names.
+#[test]
+fn an_unmeasured_active_is_never_switched_away_from() {
+    use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let config_handle = || -> crate::profile::ConfigHandle {
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState {
+                active_profile: Some("blind".into()),
+                profiles: vec!["blind".into(), "c".into()],
+                fallback_chain: vec!["blind".into(), "c".into()],
+                ..AppState::default()
+            },
+            profiles: vec![
+                {
+                    let mut p = logged_in("blind");
+                    p.credentials = None;
+                    p.has_long_lived_sidecar = true;
+                    p
+                },
+                logged_in("c"),
+            ],
+        }))
+    };
+    // One scan with `blind` active and `c` clear, read live, waiting behind it.
+    // `blind` carries whatever reading the arm names, or none at all.
+    let queued = |blind: Option<(f64, FetchStatus)>| -> Vec<String> {
+        let mut readings = HashMap::from([("c".to_string(), live(10.0))]);
+        let mut statuses = HashMap::from([("c".to_string(), FetchStatus::Fresh)]);
+        if let Some((utilization, status)) = blind {
+            readings.insert("blind".to_string(), live(utilization));
+            statuses.insert("blind".to_string(), status);
+        }
+        let store: UsageStore = Arc::new(RankedMutex::new(readings));
+        let status: StatusStore = Arc::new(RankedMutex::new(statuses));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+        scan_auto_switch(
+            &config_handle(),
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+        );
+        let mut targets: Vec<String> = pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.target.clone())
+            .collect();
+        targets.sort();
+        targets
+    };
+
+    assert!(
+        queued(None).is_empty(),
+        "an active with no reading at all has no exhaustion evidence and no \
+         actionable status, so nothing moves the chain off it"
+    );
+    // The leftover reading a removed login leaves behind, maxed and stale: the
+    // gate refuses it (not `Fresh`, and not a deep-stuck `RateLimited`), so even
+    // a figure that says "spent" cannot drive the switch.
+    assert!(
+        queued(Some((100.0, FetchStatus::Cached))).is_empty(),
+        "a reading nothing refreshed is not one a switch may act on"
+    );
+    // The same chain and the same figure, with the status a real poll would
+    // have written: now it switches. So the two arms above are held by the
+    // gate, not by a chain with nowhere to go.
+    assert_eq!(
+        queued(Some((100.0, FetchStatus::Fresh))),
+        ["c"],
+        "with an actionable reading the identical chain does switch"
+    );
+}
+
 /// The scan fills `ChainSnapshot::fresh`, which `snapshot_chain` cannot: config
-/// carries no freshness and `Profile.fetch_status` is written by the UI thread
-/// only, so the daemon reads it stale. Without this fill the store twin's
-/// fresh-preference pass matches nothing and silently degrades to walk order.
+/// carries no freshness, which lives in the status store. Without this fill
+/// the store twin's fresh-preference pass matches nothing and silently degrades
+/// to walk order.
 #[test]
 fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
     use super::{FetchStatus, PendingSwitch, StatusStore, scan_auto_switch};
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     let live = |utilization: f64| UsageInfo {
         five_hour: Some(UsageWindow {
@@ -3636,11 +4030,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
             fallback_chain: vec!["a".into(), "b".into(), "c".into()],
             ..AppState::default()
         },
-        profiles: vec![
-            Profile::new("a".to_string(), None, None),
-            Profile::new("b".to_string(), None, None),
-            Profile::new("c".to_string(), None, None),
-        ],
+        profiles: vec![logged_in("a"), logged_in("b"), logged_in("c")],
     }));
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     scan_auto_switch(
@@ -3651,6 +4041,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3672,7 +4063,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
 /// `decision_fresh_any` unions BOTH status stores. Before the fix the scheduler
 /// read only the OAuth `StatusStore`, so a fresh third-party member looked
 /// stale to its fresh-preference/recovery gate while the config-side walk
-/// (reading `Profile.fetch_status`, filled from both in `apply_usage`) saw it —
+/// (reading fetch status, filled from both in `apply_usage`) saw it —
 /// the two legs disagreed on a mixed OAuth+third-party chain (2026-07-17).
 #[test]
 fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
@@ -3745,8 +4136,10 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
         ACTIVE_CAP_MAX_STREAK, FetchStatus, PendingSwitch, PendingSwitchOff, PollStreaks,
         StatusStore, scan_auto_switch,
     };
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    // The global walk reads each member's credit refusal off the disk.
+    let _home = crate::testutil::HomeSandbox::new();
 
     // `a` is active and RateLimited; `active_util` on a 5h window whose reset is
     // `resets_offset` seconds from now (negative = a LAPSED window, which
@@ -3786,7 +4179,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
                 refresh_fail: 0,
             },
         )])));
-        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let activity = crate::testutil::fresh_activity();
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         (store, status, streaks, activity, pending, pending_off)
@@ -3799,10 +4192,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
                 fallback_chain: vec!["a".into(), "b".into()],
                 ..AppState::default()
             },
-            profiles: vec![
-                Profile::new("a".to_string(), None, None),
-                Profile::new("b".to_string(), None, None),
-            ],
+            profiles: vec![logged_in("a"), logged_in("b")],
         }))
     };
     let deep = ACTIVE_CAP_MAX_STREAK + 1;
@@ -3818,6 +4208,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
             &streaks,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
@@ -3873,15 +4264,22 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         start_profile: start_profile.to_string(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,
         follows_chain: true,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        // The remaining fields (tollgate's executor/launch-class record and
+        // upstream's boot transport, delegate and background flags) at the
+        // fixture's defaults.
         ..crate::testutil::live_row("0-0", "-")
     }
 }
@@ -3902,67 +4300,87 @@ fn register_live_row(row: &crate::live_sessions::LiveSession) -> std::fs::File {
 }
 
 /// A chain of plain OAuth members, every one `swap_eligible`, with `active` as the
-/// global active profile.
+/// global active profile. Written to disk so the decision leg's `stored_login`
+/// re-read answers `HoldsLogin` — the leg reads the committed store, not the
+/// in-memory profile.
 fn session_config(names: &[&str], active: Option<&str>) -> crate::profile::ConfigHandle {
-    use crate::profile::{AppConfig, AppState, Profile};
-    Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: active.map(Into::into),
-            profiles: names.iter().map(|n| (*n).into()).collect(),
-            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
-            ..AppState::default()
-        },
-        profiles: names
-            .iter()
-            .map(|n| Profile::new((*n).to_string(), None, None))
-            .collect(),
-    }))
+    use crate::profile::{AppConfig, AppState};
+
+    crate::testutil::register_names(names);
+    let profiles: Vec<crate::profile::Profile> = names
+        .iter()
+        .map(|n| {
+            let p = logged_in(n);
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: active.map(Into::into),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
+}
+
+/// A blank profile holding a stored OAuth pair — the walk-driving fixtures use
+/// it so a login-less member stays the exception, not the default.
+fn logged_in(name: &str) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::testutil::oauth_pair(name));
+    p
 }
 
 /// `session_config` plus a third-party credential (the same generic endpoint +
 /// key `tp_entry` uses) on the named profiles, so a key-rejected mark recorded
 /// against that credential's fingerprint intersects with the REAL config
-/// fingerprint the scan now reads.
+/// fingerprint the scan now reads. Written to disk like `session_config`.
 fn session_config_tp(
     names: &[&str],
     active: Option<&str>,
     third_party: &[&str],
 ) -> crate::profile::ConfigHandle {
     use crate::profile::{AppConfig, AppState, Profile};
-    Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: active.map(Into::into),
-            profiles: names.iter().map(|n| (*n).into()).collect(),
-            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
-            ..AppState::default()
-        },
-        profiles: names
-            .iter()
-            .map(|n| {
-                if third_party.contains(n) {
-                    let mut p = Profile::new(
-                        (*n).to_string(),
-                        Some("https://example.com".to_string()),
-                        Some("key".to_string()),
-                    );
-                    // A real hybrid: an OAuth pair behind the base_url + key.
-                    p.credentials = Some(crate::profile::ClaudeCredentials {
-                        claude_ai_oauth: Some(crate::profile::OAuthToken {
-                            access_token: "at".into(),
-                            refresh_token: Some("rt".into()),
-                            expires_at: None,
-                            scopes: None,
-                            subscription_type: None,
-                            ..crate::profile::OAuthToken::default_extra()
-                        }),
-                    });
-                    p
-                } else {
-                    Profile::new((*n).to_string(), None, None)
-                }
-            })
-            .collect(),
-    }))
+
+    crate::testutil::register_names(names);
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let p = if third_party.contains(n) {
+                let mut p = Profile::new(
+                    (*n).to_string(),
+                    Some("https://example.com".to_string()),
+                    Some("key".to_string()),
+                );
+                // A real hybrid: an OAuth pair behind the base_url + key.
+                p.credentials = Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at".into(),
+                        refresh_token: Some("rt".into()),
+                        expires_at: None,
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                });
+                p
+            } else {
+                logged_in(n)
+            };
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: active.map(Into::into),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
 }
 
 /// Live 5h windows at the given utilizations — a member at 100 is spent, one at 10
@@ -4030,6 +4448,31 @@ fn scan_sessions_with_streaks(
         &Arc::new(RankedMutex::new(HashMap::new())),
         streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
+    );
+}
+
+/// [`scan_sessions`] with the skip store the session walk reads — the one input
+/// the skip-set tests set.
+fn scan_sessions_skipped(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    skipped: &super::SkippedUnreadable,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        skipped,
+        None,
     );
 }
 
@@ -4052,6 +4495,8 @@ fn scan_sessions_tp(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
     );
 }
 
@@ -4118,6 +4563,6812 @@ fn two_opted_in_sessions_on_different_members_get_different_intended_members() {
         decision_of("4242-1"),
         (Some("a".to_string()), Some(0)),
         "the session on d must WRAP to a — the same chain, a different cursor"
+    );
+}
+
+// ── the usage-credit cap moves a live session (trigger a) ───────────────────
+//
+// Claude Code refuses a credit-billed model (fable, plus its cached
+// `tengu_calm_seal` families) on an account whose usage-credit cap is spent,
+// whatever the windows say. A session whose LAUNCH demand is credit-billed
+// moves off such an account at once; one whose demand resolves no family moves
+// only on its own spend-cap 429 row; an opus session never moves.
+
+/// [`session_config`] with each named member's `[models] default` and the
+/// named members' credit gate switched off. A member NOT named in `defaults`
+/// carries the launch profile's default: a live session's model is a property
+/// of the whole chain, and `swap_eligible` drops a target whose `[models]`
+/// differs from the launch — so a heterogeneous chain would leave the walk with
+/// no target before trigger a ever runs. Like [`session_config`], each member
+/// holds a stored OAuth pair and is written to disk, so the decision leg's
+/// `stored_login` re-read and `swap_target_precondition` answer `HoldsLogin`.
+fn session_config_models(
+    names: &[&str],
+    defaults: &[(&str, &str)],
+    gate_off: &[&str],
+) -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let launch_default = defaults.first().map(|(_, model)| *model);
+    crate::testutil::register_names(names);
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = Profile::new((*n).to_string(), None, None);
+            p.credentials = Some(crate::testutil::oauth_pair(n));
+            p.models.default = defaults
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, model)| (*model).to_string())
+                .or_else(|| launch_default.map(str::to_string));
+            p.check_credit_cap = !gate_off.contains(n);
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: names.first().map(|n| (*n).into()),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        // These credit-refusal tests come from upstream, which has no walk
+        // dwell. Tollgate's 30-minute dwell (pinned by
+        // `session_home_walk_uses_its_own_swap_cooldown_and_exhaustion_bypasses_it`)
+        // would hold every just-swapped row where it is, so a return home
+        // could never be observed. Zero keeps the walk itself under test.
+        walk_cooldown_mins: Some(0),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
+}
+
+/// [`session_store`] at 10% on every member, the named ones with their
+/// usage-credit cap spent (billing on, used == limit).
+fn credit_store(names: &[&str], capped: &[&str]) -> UsageStore {
+    let store = session_store(&names.iter().map(|n| (*n, 10.0)).collect::<Vec<_>>());
+    {
+        let mut map = store.lock().unwrap();
+        for n in capped {
+            let info = map.get_mut(*n).expect("member in the store");
+            info.spend = Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            });
+            assert!(
+                info.credit_capped(),
+                "fixture control: {n}'s cap reads spent"
+            );
+        }
+    }
+    store
+}
+
+#[test]
+fn a_fable_session_moves_off_an_account_whose_credit_cap_is_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fable session fails every turn on a spent cap, so it must leave a"
+    );
+}
+
+/// A credit-forced leave skips tollgate's default 30-minute walk dwell: the
+/// walk runs the dwell only when nothing forces the move. `session_config_models`
+/// turns the dwell off for upstream's tests, so this pins the precedence with the
+/// default restored and the row swapped this very moment. The control half is
+/// the same dwell holding an unforced walk home in the same fixture.
+#[test]
+fn a_credit_forced_leave_skips_the_default_walk_dwell() {
+    let default_dwell = |config: &crate::profile::ConfigHandle| {
+        config.lock().unwrap().state.walk_cooldown_mins = None;
+        assert_eq!(
+            config.lock().unwrap().state.walk_cooldown_secs(),
+            1800,
+            "fixture control: tollgate's default dwell"
+        );
+    };
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut row = session_row("4243-0", "a");
+        row.launch_families = Some(vec!["fable".to_string()]);
+        row.last_swap_at = Some(crate::usage::now_ms());
+        let _marker = register_live_row(&row);
+        let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+        default_dwell(&config);
+        scan_sessions(
+            &config,
+            &credit_store(&["a", "b"], &["a"]),
+            &all_fresh(&["a", "b"]),
+        );
+        assert_eq!(
+            decision_of("4243-0"),
+            (Some("b".to_string()), Some(1)),
+            "a fable session on a spent cap leaves at once, inside the dwell or not"
+        );
+    }
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut row = session_row("4243-1", "a");
+        row.current_member = Some("b".to_string());
+        row.intended_member = Some("b".to_string());
+        row.chain_cursor = Some(1);
+        row.last_swap_at = Some(crate::usage::now_ms());
+        let _marker = register_live_row(&row);
+        let config = session_config_models(&["a", "b"], &[], &[]);
+        default_dwell(&config);
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .preferred = true;
+        scan_sessions(
+            &config,
+            &credit_store(&["a", "b"], &[]),
+            &all_fresh(&["a", "b"]),
+        );
+        assert_eq!(
+            decision_of("4243-1"),
+            (Some("b".to_string()), Some(1)),
+            "control: the dwell holds the unforced walk home onto a clear preferred"
+        );
+        // And only the dwell holds it: with the dwell off the same row walks home.
+        config.lock().unwrap().state.walk_cooldown_mins = Some(0);
+        scan_sessions(
+            &config,
+            &credit_store(&["a", "b"], &[]),
+            &all_fresh(&["a", "b"]),
+        );
+        assert_eq!(decision_of("4243-1"), (Some("a".to_string()), Some(0)));
+    }
+}
+
+/// A known demand decides by its own families, whatever the gate says.
+#[test]
+fn a_fable_session_moves_off_a_capped_account_whose_credit_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &["a"]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// The target must not be capped either: `b` is skipped for `c`.
+#[test]
+fn a_fable_session_skips_a_capped_target_for_the_next_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("c".to_string()), Some(2)));
+}
+
+// ── the credit event: a member that refused the session ─────────────────────
+//
+// A member that answered a session with a credit-required 429 is spent for that
+// session's credit demand whatever its reading says, measured or probed: a
+// probe reading carries no credit figures, and a measured one can read uncapped
+// while Claude Code refuses. A member that never refused is judged by its
+// reading alone.
+
+/// `session_config_models` over `names` with every member on `launch`, the
+/// `probed` ones the accounts the usage probe reads (a setup token in place of
+/// the fixture's pair) and `home` as the preferred member.
+fn probed_session_config(
+    names: &[&str],
+    launch: &str,
+    probed: &[&str],
+    home: Option<&str>,
+) -> crate::profile::ConfigHandle {
+    let config = session_config_models(names, &[(names[0], launch)], &[]);
+    for p in config.lock().unwrap().profiles.iter_mut() {
+        if probed.contains(&p.name.as_str()) {
+            crate::testutil::make_probed_account(p);
+        }
+        p.preferred = home == Some(p.name.as_str());
+    }
+    config
+}
+
+/// A live row on `member` after a first swap, launched on `families`.
+fn row_on(member: &str, families: &str) -> crate::live_sessions::LiveSession {
+    let mut row = session_row("4242-0", "a");
+    row.current_member = Some(member.to_string());
+    row.launch_families = Some(vec![families.to_string()]);
+    row
+}
+
+/// A successful turn at exactly `ms` epoch ms, served under message id `id`.
+fn served_row_at(ms: u64, id: &str) -> String {
+    let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": ts,
+        "message": {"id": id, "model": "claude-opus-4", "role": "assistant",
+            "usage": {"input_tokens": 10, "output_tokens": 500}},
+    })
+    .to_string()
+}
+
+/// A successful turn `ms_ago` old, served under message id `id`. A test
+/// ordering this turn against another fixture stamp takes its own `now` and
+/// calls [`served_row_at`]: a stamp sampled here opens the pair to drift.
+fn served_row(ms_ago: u64, id: &str) -> String {
+    served_row_at(crate::usage::now_ms().saturating_sub(ms_ago), id)
+}
+
+/// Append `rows` to `conv`'s transcript and run the tailer over them.
+fn append_and_tail(home: &crate::testutil::HomeSandbox, conv: &str, rows: &[String]) {
+    use std::io::Write as _;
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(proj.join(format!("{conv}.jsonl")))
+        .unwrap();
+    for row in rows {
+        writeln!(f, "{row}").unwrap();
+    }
+    drop(f);
+    tail_transcripts();
+}
+
+/// Execute the move the decision leg asked of `session_id`, stamped past the
+/// in-flight grace so the next 429 on the new member latches.
+fn execute_move(session_id: &str, target: &str) {
+    let at = crate::usage::now_ms() - 40_000;
+    crate::live_sessions::update_as_session(session_id, |f| {
+        f.set_current_member(target.to_string());
+        f.set_last_swap_at(at);
+    })
+    .expect("execute the swap");
+}
+
+/// A fable session on its preferred home `a`, `a` probed or measured, its
+/// reading clear with no credit block. Each scan on `a` drains a fresh
+/// spend-cap 429; every move the decision leg asks for is executed. The moves
+/// over six scans.
+fn moves_off_a_home_that_refuses_credit(probed: bool) -> usize {
+    moves_off_a_home_that_refuses_credit_with(probed, 0, |_| None).0
+}
+
+/// [`moves_off_a_home_that_refuses_credit`] with each 429 stamped `ago` back,
+/// once `shape` set the sandbox up around the row; what it returns is held
+/// through the scans. The moves, and whether `a` holds a refusal after them.
+fn moves_off_a_home_that_refuses_credit_with(
+    probed: bool,
+    ago: u64,
+    shape: impl FnOnce(&crate::testutil::HomeSandbox) -> Option<std::fs::File>,
+) -> (usize, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let probed_names: &[&str] = if probed { &["a"] } else { &[] };
+    let config = probed_session_config(&["a", "b"], "fable", probed_names, Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8100-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8100-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    let _shaped = shape(&home);
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            append_and_tail(&home, "conv-a", &[spend_cap_row(ago)]);
+        }
+        scan_sessions(&config, &store, &status);
+        if let Some(target) = decision_of("8100-0").0.filter(|t| *t != on) {
+            execute_move("8100-0", &target);
+            on = target;
+            moves += 1;
+        }
+    }
+    (moves, refusal_on("a").is_some())
+}
+
+/// The base swing: a measured home whose `/usage` reads no credit block while
+/// Claude Code refuses the session. Its own 429 moves the session to `b` once;
+/// the refusal, not the reading, keeps every later home pass off `a`.
+#[test]
+fn a_measured_home_that_refuses_credit_moves_the_session_once() {
+    assert_eq!(moves_off_a_home_that_refuses_credit(false), 1);
+}
+
+/// The same for a probed home: its reading has no credit figures, and the
+/// refusal keeps the session off it as it does off a measured one.
+#[test]
+fn a_probed_home_that_refuses_credit_moves_the_session_once() {
+    assert_eq!(moves_off_a_home_that_refuses_credit(true), 1);
+}
+
+/// A second row whose record names the session's conversation leaves each
+/// 429 placed on no one, and such a 429 moves the session nowhere: nothing on
+/// record would keep the walk from bringing it back for the next one. The
+/// session stays on `a` through six scans.
+#[test]
+fn a_429_two_rows_join_moves_no_session() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        let mut other = session_row("8101-0", "b");
+        other.follows_chain = false;
+        other.claude_pid = Some(77_778);
+        seed_session_record(home, "conv-a", 77_778);
+        Some(register_live_row(&other))
+    });
+    assert_eq!(moved, (0, false));
+}
+
+/// A job store tollgate cannot read still lets the row join place the 429 of a
+/// session whose `claude` is gone: the session moves once, and the record
+/// keeps it off `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_beside_an_unreadable_job_store_moves_the_session_once() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        break_job_store(home);
+        None
+    });
+    assert_eq!(moved, (1, true));
+}
+
+/// A 429 at or under the floor on `a`'s record, as a takeover re-reads one a
+/// later turn disproved, goes on no record and moves no session.
+#[test]
+fn a_429_under_the_records_floor_moves_no_session() {
+    let moved = moves_off_a_home_that_refuses_credit_with(false, 120_000, |_| {
+        crate::profile_cache::clear_credit_refusal(
+            &crate::profile::ProfileName::from("a"),
+            crate::usage::now_ms() - 60_000,
+        );
+        None
+    });
+    assert_eq!(moved, (0, false));
+}
+
+/// The control of the floor case: the same 429s with no floor on record go on
+/// `a`'s record and move the session once.
+#[test]
+fn a_429_with_no_floor_on_record_moves_the_session_once() {
+    assert_eq!(
+        moves_off_a_home_that_refuses_credit_with(false, 120_000, |_| None),
+        (1, true)
+    );
+}
+
+/// A 429 the drain places on no one, two rows' records naming its
+/// conversation, latches nothing, though another session's later refusal
+/// stands on the row's member. With the second row gone, the next 429 is the
+/// session's own and latches.
+#[test]
+fn a_429_placed_on_no_one_latches_nothing_beside_a_later_refusal() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let _marker = spend_cap_order_row(&home);
+    let mut other = session_row("4243-0", "b");
+    other.follows_chain = false;
+    other.claude_pid = Some(77_778);
+    let other_marker = register_live_row(&other);
+    seed_session_record(&home, "conv-a", 77_778);
+    record_refusal("a", 60_000);
+    let held = refusal_on("a").expect("fixture control: another session's refusal");
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    scan_with_no_target();
+    assert!(
+        !order_row_latched(),
+        "a 429 placed on no one latches nothing"
+    );
+    drop(other_marker);
+    crate::live_sessions::unregister("4243-0").expect("unregister");
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    scan_with_no_target();
+    assert!(
+        order_row_latched(),
+        "control: the session's own 429 latches"
+    );
+    assert_eq!(refusal_on("a"), Some(held), "the later refusal stays");
+}
+
+/// A 429 a timed-out flock wait kept off the record latches nothing; the next
+/// one goes on record and latches.
+#[test]
+fn a_429_a_flock_wait_kept_off_the_record_latches_nothing() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = credit_store(&["a", "b"], &["a", "b"]);
+    let status = all_fresh(&["a", "b"]);
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    scan_sessions(&config, &store, &status);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the flock wait kept the 429 off the record"
+    );
+    assert!(!order_row_latched());
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    scan_sessions(&config, &store, &status);
+    assert!(
+        order_row_latched(),
+        "control: the next 429 goes on record and latches"
+    );
+}
+
+/// A probed home that never refused this session is judged by its reading like
+/// a measured one: its windows are read and clear, and nothing says its credits
+/// are spent, so a credit-billed session comes home to it.
+#[test]
+fn a_credit_billed_session_comes_home_to_a_probed_member_that_never_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["a"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// A fable session refused on its home `a` while `b` is spent, so it stays on
+/// `a`: `first`, holding the 429, lands in one read; `after`, when given, is
+/// appended to the same file and read by a scan of its own. The session then
+/// lands on `b` some other way and `b` reads clear again: the decision the
+/// next scan writes.
+fn decision_after_a_refusal_at_home(
+    first: &[String],
+    after: &[String],
+) -> (Option<String>, Option<usize>) {
+    decision_after_a_refusal_at_home_in(first, "conv-a", after)
+}
+
+/// [`decision_after_a_refusal_at_home`] with `after` written to `after_conv`'s
+/// transcript, the session record naming that conversation first: another one
+/// than `conv-a` is a `/clear` on the row.
+fn decision_after_a_refusal_at_home_in(
+    first: &[String],
+    after_conv: &str,
+    after: &[String],
+) -> (Option<String>, Option<usize>) {
+    let write_after = |home: &crate::testutil::HomeSandbox, child_pid: u32| {
+        seed_session_record(home, after_conv, child_pid);
+        append_and_tail(home, after_conv, after);
+    };
+    let then: RefusalStep<'_> = &write_after;
+    decision_after_a_refusal_at_home_then(first, (!after.is_empty()).then_some(then))
+}
+
+/// A step [`decision_after_a_refusal_at_home_then`] runs on the sandbox and the
+/// session's child pid.
+type RefusalStep<'a> = &'a dyn Fn(&crate::testutil::HomeSandbox, u32);
+
+/// [`decision_after_a_refusal_at_home`] with `then`, when given, run in place
+/// of `after`, before a scan of its own.
+fn decision_after_a_refusal_at_home_then(
+    first: &[String],
+    then: Option<RefusalStep<'_>>,
+) -> (Option<String>, Option<usize>) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = session_store(&[("a", 10.0), ("b", 100.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8200-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8200-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    append_and_tail(&home, "conv-a", first);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8200-0"),
+        (None, None),
+        "fixture control: no target while b is spent"
+    );
+    if let Some(then) = then {
+        then(&home, child_pid);
+        scan_sessions(&config, &store, &status);
+    }
+    execute_move("8200-0", "b");
+    store
+        .lock()
+        .unwrap()
+        .get_mut("b")
+        .and_then(|b| b.five_hour.as_mut())
+        .expect("b's 5h window")
+        .utilization = 10.0;
+    scan_sessions(&config, &store, &status);
+    decision_of("8200-0")
+}
+
+/// A refused home that serves the session again, a successful turn in the file
+/// of its 429 while the session runs on it, is home again: the refusal goes,
+/// while the credit demand stays.
+#[test]
+fn a_member_that_serves_the_session_again_is_home_again() {
+    assert_eq!(
+        decision_after_a_refusal_at_home(&[spend_cap_row(1_000)], &[served_row(0, "msg_ok")]),
+        (Some("a".to_string()), Some(0))
+    );
+}
+
+/// Run `f` on a thread of its own, whose transcript producer starts fresh: one
+/// that already read another sandbox finds a new sandbox's files only at its
+/// next discovery, seconds later, so a second sandbox in one test thread would
+/// drain nothing.
+fn on_a_fresh_producer<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| s.spawn(f).join().expect("the fresh producer's thread"))
+}
+
+/// Without that turn the refusal stands, and the session stays away from home.
+/// The control: with it, the session comes home.
+#[test]
+fn a_member_that_never_serves_the_session_again_stays_refused() {
+    assert_eq!(
+        on_a_fresh_producer(|| decision_after_a_refusal_at_home(
+            &[spend_cap_row(1_000)],
+            &[served_row(0, "msg_ok")]
+        )),
+        (Some("a".to_string()), Some(0)),
+        "control: a later turn brings the session home"
+    );
+    assert_eq!(
+        decision_after_a_refusal_at_home(&[spend_cap_row(1_000)], &[]),
+        (None, None)
+    );
+}
+
+/// A clock step back between the 429 and the session's next turn: the turn
+/// is written after the 429 but stamped 2 s below it. The line order says the
+/// member served the session again, so the refusal goes and the session is
+/// home again.
+#[test]
+fn a_turn_after_the_429_stamped_below_it_clears_the_refusal() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        decision_after_a_refusal_at_home(
+            &[spend_cap_row_uuid_at(now - 1_000, "cap-1")],
+            &[ok_row_at(now - 3_000)],
+        ),
+        (Some("a".to_string()), Some(0)),
+        "a turn after the 429 in its file clears the refusal whatever its stamp"
+    );
+}
+
+/// A turn written before the 429 but stamped above it, the 429 stamped low by
+/// a clock step back, lies before the refusal in the file: it proves nothing,
+/// and the session stays away from home. The 429 carries its `uuid`, as Claude
+/// Code writes one on every line: the record orders a turn in the 429's own
+/// file by the line the uuid pulls, and only a 429 without one by stamp. The
+/// control: the same two lines the other way round, the turn after the 429,
+/// clear it.
+#[test]
+fn a_turn_before_the_429_stamped_above_it_leaves_the_refusal() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        on_a_fresh_producer(|| decision_after_a_refusal_at_home(
+            &[
+                spend_cap_row_uuid_at(now - 1_000, "cap-low"),
+                ok_row_at(now - 500),
+            ],
+            &[],
+        )),
+        (Some("a".to_string()), Some(0)),
+        "control: a turn after the 429 in its file clears it"
+    );
+    assert_eq!(
+        decision_after_a_refusal_at_home(
+            &[
+                ok_row_at(now - 500),
+                spend_cap_row_uuid_at(now - 1_000, "cap-low"),
+            ],
+            &[],
+        ),
+        (None, None),
+        "a turn before the 429 in its file leaves the refusal whatever its stamp"
+    );
+}
+
+/// A `/clear` keeps the row but starts a new conversation. The latch goes with
+/// the old one, but the refusal is the member's, on record, and goes only with
+/// a later successful turn on the member: the clear alone drops nothing, and
+/// the session stays away from home. The control: the clear and a turn in the
+/// new conversation bring it home.
+#[test]
+fn a_clear_alone_drops_no_refusal() {
+    assert_eq!(
+        on_a_fresh_producer(|| {
+            let clear_and_turn = |home: &crate::testutil::HomeSandbox, child_pid: u32| {
+                seed_session_record(home, "conv-b", child_pid);
+                write_conv(home, "conv-b", &[served_row(0, "msg_ok")]);
+                // Past the 5 s discovery walk, so the new transcript is found.
+                super::tps_producer_tick(crate::usage::now_ms() + 6_000);
+            };
+            decision_after_a_refusal_at_home_then(&[spend_cap_row(1_000)], Some(&clear_and_turn))
+        }),
+        (Some("a".to_string()), Some(0)),
+        "control: a turn after the clear brings the session home"
+    );
+    let clear = |home: &crate::testutil::HomeSandbox, child_pid: u32| {
+        seed_session_record(home, "conv-b", child_pid);
+    };
+    assert_eq!(
+        decision_after_a_refusal_at_home_then(&[spend_cap_row(1_000)], Some(&clear)),
+        (None, None),
+        "the refusal outlives the conversation it came under"
+    );
+}
+
+/// The 429's line read again in a new life of its file, an in-place rewrite
+/// the tail hash catches: the refusal's position is pulled by the line's uuid
+/// before the judge, so a turn after it, stamped 2 s below it, still clears
+/// the member's refusal by line.
+#[test]
+fn a_turn_after_the_429_in_a_rewritten_file_clears_the_refusal() {
+    let now = crate::usage::now_ms();
+    let cap = spend_cap_row_uuid_at(now - 1_000, "cap-1");
+    let rewrite = |home: &crate::testutil::HomeSandbox, _child_pid: u32| {
+        write_conv(
+            home,
+            "conv-a",
+            &[cap.clone(), pad_row('y'), ok_row_at(now - 3_000)],
+        );
+        tail_transcripts();
+    };
+    assert_eq!(
+        decision_after_a_refusal_at_home_then(&[cap.clone(), pad_row('z')], Some(&rewrite)),
+        (Some("a".to_string()), Some(0)),
+        "a turn after the 429 in the file's new life clears the refusal"
+    );
+}
+
+/// A session that left the member that refused it has no latch left, and the
+/// refusal is the member's, on record: a `/clear` there starts a new
+/// conversation and drops nothing, and a turn the session gets on the member
+/// it moved to says nothing about the one that refused it, so it stays off
+/// that member.
+#[test]
+fn a_clear_after_the_move_keeps_the_refusal_on_record() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8210-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8210-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8210-0"),
+        (Some("b".to_string()), Some(1)),
+        "fixture control: the 429 moves the session off a"
+    );
+    execute_move("8210-0", "b");
+    scan_sessions(&config, &store, &status);
+    assert!(
+        !super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8210-0")),
+        "fixture control: the latch went with the move"
+    );
+    assert_ne!(
+        decision_of("8210-0").0.as_deref(),
+        Some("a"),
+        "fixture control: the refusal keeps the session off a"
+    );
+    seed_session_record(&home, "conv-b", child_pid);
+    append_and_tail(&home, "conv-b", &[served_row(0, "msg_new")]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "the clear dropped nothing");
+    assert_ne!(
+        decision_of("8210-0").0.as_deref(),
+        Some("a"),
+        "the session stays off the member on record"
+    );
+}
+
+/// The refusal is the member's, on record, not the session's: a new
+/// credit-billed session minted with the id of one `a` refused finds `a` on
+/// record and stays off it, while the latch and the mark, keyed by the row's
+/// `started_at`, pass nothing on.
+#[test]
+fn a_reused_id_finds_the_refusal_on_record() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut old = session_row("8300-0", "a");
+    old.claude_pid = Some(77_777);
+    old.launch_families = Some(vec!["fable".to_string()]);
+    let marker = register_live_row(&old);
+    seed_session_record(&home, "conv-a", 77_777);
+    append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8300-0"),
+        (Some("b".to_string()), Some(1)),
+        "fixture control: the 429 moves the old session off a"
+    );
+    assert!(refusal_on("a").is_some(), "the refusal is on record");
+    drop(marker);
+    crate::live_sessions::unregister("8300-0").expect("unregister");
+    let mut fresh = row_on("b", "fable");
+    fresh.session_id = "8300-0".to_string();
+    fresh.started_at = crate::usage::now_ms() + 1;
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8300-0"),
+        (None, None),
+        "the new session stays off the member on record"
+    );
+    assert!(
+        super::SPEND_CAP_LATCH.with(|l| l.borrow().is_empty()),
+        "the dead session's latch went with its life"
+    );
+}
+
+/// A successful turn right after the session is put back on a member that
+/// refused it may be the outgoing member's answer to a request in flight
+/// across the swap, so it clears nothing.
+#[test]
+fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8600-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8600-0",
+    )
+    .expect("hold b's liveness marker");
+    let now = crate::usage::now_ms();
+    seed_session_record(&home, "conv-a", child_pid);
+    append_and_tail(&home, "conv-a", &[spend_cap_row_at(now - 1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8600-0"),
+        (Some("b".to_string()), Some(1)),
+        "fixture control: the 429 moves the session off a"
+    );
+    // Put back on `a` by hand just now; a turn lands inside the grace.
+    crate::live_sessions::update_as_session("8600-0", |f| {
+        f.set_current_member("a".to_string());
+        f.set_last_swap_at(now);
+    })
+    .expect("swap back");
+    append_and_tail(&home, "conv-a", &[served_row_at(now, "msg_in_flight")]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "the refusal stands");
+    // The walk's pick off the record: back on `b`, the session is not walked
+    // home to `a`.
+    crate::live_sessions::update_as_session("8600-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(now - 600_000);
+    })
+    .expect("swap to b");
+    crate::live_sessions::update_as_daemon("8600-0", |f| {
+        f.set_intended_member("b");
+        f.set_chain_cursor(1);
+    })
+    .expect("settle the decision on b");
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8600-0"),
+        (Some("b".to_string()), Some(1)),
+        "the walk keeps the session off the member on record"
+    );
+    // The control: with the record gone, the same scan walks the session home.
+    crate::profile_cache::forget_credit_refusal(
+        &crate::profile::ProfileName::from("a"),
+        crate::usage::now_ms(),
+    );
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("8600-0"),
+        (Some("a".to_string()), Some(0)),
+        "control: with no record the walk takes the session home"
+    );
+}
+
+/// The refusal is the member's, not the session's: it outlives the session it
+/// came from, and a scan with no live row keeps it on record.
+#[test]
+fn a_refusal_outlives_the_session_that_was_refused() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8700-0", "a");
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: the session was refused"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8700-0").expect("unregister");
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "kept with no live row");
+}
+
+// ── the durable credit refusal ──────────────────────────────────────────────
+//
+// A spend-cap 429 writes the member that answered it a refusal on disk
+// (`credit_refusal.json`), placed off the conversation's one live claimant (its
+// row, an ancestor's row, the row whose tree a Claude Code job names, or, for a
+// bare `claude` session, the global active) and, with none live, off its job,
+// its isolated tree or the one live row whose own record names it. Every walk
+// reads it as a skip for a demand that may need credits, in any process and
+// across a restart; any later successful turn on the member clears it. A
+// claimant's process is matched on linux and macOS only, so the tests that
+// need one run there.
+
+/// The credit refusal on record for `name`.
+fn refusal_on(name: &str) -> Option<crate::profile_cache::CreditRefusal> {
+    crate::profile_cache::credit_refusal(&crate::profile::ProfileName::from(name))
+}
+
+/// Put a credit refusal on record for `name`, stamped exactly `at_ms`.
+fn record_refusal_at(name: &str, at_ms: u64) {
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from(name),
+        &crate::profile_cache::CreditRefusal {
+            at_ms,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
+        },
+    );
+}
+
+/// Put a credit refusal on record for `name`, `ago_ms` back. A test ordering
+/// this refusal against another fixture stamp takes its own `now` and calls
+/// [`record_refusal_at`].
+fn record_refusal(name: &str, ago_ms: u64) {
+    record_refusal_at(name, crate::usage::now_ms().saturating_sub(ago_ms));
+}
+
+/// A bare session's record: the live `child` holding `conv`, started at
+/// `started_at` (epoch ms, `None` for a record that names no start).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_bare_session_record(
+    home: &crate::testutil::HomeSandbox,
+    conv: &str,
+    child: &LiveChild,
+    started_at: Option<u64>,
+) {
+    seed_bare_record_in(
+        &home.home().join(".claude/sessions"),
+        conv,
+        child,
+        started_at,
+    );
+}
+
+/// [`seed_bare_session_record`] into the sessions dir `sessions`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_bare_record_in(
+    sessions: &std::path::Path,
+    conv: &str,
+    child: &LiveChild,
+    started_at: Option<u64>,
+) {
+    let mut record = serde_json::json!({ "sessionId": conv, "pid": child.pid() });
+    #[cfg(target_os = "linux")]
+    {
+        record["procStart"] = crate::testutil::proc_start_of(child.pid())
+            .expect("live child start")
+            .into();
+    }
+    if let Some(at) = started_at {
+        record["startedAt"] = at.into();
+    }
+    std::fs::create_dir_all(sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{}.json", child.pid())),
+        record.to_string(),
+    )
+    .unwrap();
+}
+
+/// Switch the global active to `name`, in this process's config and in
+/// `~/.tollgate/profiles.toml`, where the drain reads it, as a switch lands for
+/// both.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn switch_global_active(config: &crate::profile::ConfigHandle, name: &str) {
+    config.lock().unwrap().state.active_profile = Some(name.into());
+    let mut state = crate::profile::load_app_state().expect("profiles.toml");
+    state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&state).expect("save profiles.toml");
+}
+
+/// Let these scans have seen the global active for ten minutes, unless they
+/// saw one already: a 429 a test seeds then lands past the first scan's grace.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn active_seen_long_ago(config: &crate::profile::ConfigHandle) {
+    let active = config
+        .lock()
+        .unwrap()
+        .state
+        .active_profile
+        .as_ref()
+        .cloned();
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        seen.borrow_mut()
+            .get_or_insert((active, crate::usage::now_ms() - 600_000));
+    });
+}
+
+/// Run a credit-required 429 a second old of the live `child` on `conv`, its
+/// record in the global sessions dir and started a minute ago, through the
+/// session leg.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_bare_session(
+    home: &crate::testutil::HomeSandbox,
+    child: &LiveChild,
+    conv: &str,
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    let rows = [spend_cap_row(1_000)];
+    refuse_bare_session_with(home, child, conv, &rows, config, store, status);
+}
+
+/// [`refuse_bare_session`] deriving both the 429 and the record's start from
+/// the test's own `now`, so a turn the test stamps against them cannot drift.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_bare_session_at(
+    home: &crate::testutil::HomeSandbox,
+    child: &LiveChild,
+    conv: &str,
+    now: u64,
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    let rows = [spend_cap_row_at(now - 1_000)];
+    seed_bare_session_record(home, conv, child, Some(now - 60_000));
+    drain_bare_rows(home, conv, &rows, config, store, status);
+}
+
+/// [`refuse_bare_session`] with `rows`, holding the 429, as the one read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_bare_session_with(
+    home: &crate::testutil::HomeSandbox,
+    child: &LiveChild,
+    conv: &str,
+    rows: &[String],
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    seed_bare_session_record(home, conv, child, Some(crate::usage::now_ms() - 60_000));
+    drain_bare_rows(home, conv, rows, config, store, status);
+}
+
+/// The tail [`refuse_bare_session_at`] and [`refuse_bare_session_with`] share:
+/// mark the active seen, run the tailer over `rows`, then scan.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn drain_bare_rows(
+    home: &crate::testutil::HomeSandbox,
+    conv: &str,
+    rows: &[String],
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    active_seen_long_ago(config);
+    append_and_tail(home, conv, rows);
+    scan_sessions(config, store, status);
+}
+
+/// Create `convs`' transcripts empty, so the tailer's first pass knows every
+/// one of them: it looks for new files only every few seconds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_transcripts(home: &crate::testutil::HomeSandbox, convs: &[&str]) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    for conv in convs {
+        std::fs::write(proj.join(format!("{conv}.jsonl")), "").unwrap();
+    }
+}
+
+/// A successful turn at exactly `ms` epoch ms on `model`, served under message
+/// id `id`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn served_row_on_at(ms: u64, id: &str, model: &str) -> String {
+    let mut row: serde_json::Value = serde_json::from_str(&served_row_at(ms, id)).unwrap();
+    row["message"]["model"] = model.into();
+    row.to_string()
+}
+
+/// A successful turn `ms_ago` old on `model`, served under message id `id`. A
+/// test ordering this turn against another fixture stamp takes its own `now`
+/// and calls [`served_row_on_at`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn served_row_on(ms_ago: u64, id: &str, model: &str) -> String {
+    served_row_on_at(crate::usage::now_ms().saturating_sub(ms_ago), id, model)
+}
+
+/// The target the global scan queues off these stores, if any.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn global_switch(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) -> Option<String> {
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    super::scan_auto_switch(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &Arc::new(RankedMutex::new(false)),
+    );
+    pending
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|p| p.target.clone())
+}
+
+/// What the global scan decides off these stores: the target it queues, and
+/// whether it signs every session out.
+fn global_decision(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) -> (Option<String>, bool) {
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    super::scan_auto_switch(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &pending_off,
+    );
+    let target = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|p| p.target.clone());
+    let off = *pending_off.lock().unwrap();
+    (target, off)
+}
+
+/// The global walk passes a member on record as refusing a credit-billed
+/// request over in its headroom passes: another clear member is taken first.
+/// The record gives way once nothing else can take the active, so with the
+/// refusing member the only one with headroom and `switch_off_when_spent` on,
+/// the global account moves there rather than every session being signed out.
+/// A serving sink still comes first; a spend-armed member and a dead sink come
+/// after it, and an active armed to spend leaves for it: free quota ranks above
+/// spend.
+#[test]
+fn the_global_walk_takes_a_refusing_member_rather_than_signing_everyone_out() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let status = all_fresh(&["a", "b", "c"]);
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config.lock().unwrap().state.switch_off_when_spent = true;
+    record_refusal("b", 60_000);
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+            &status
+        ),
+        (Some("c".to_string()), false),
+        "control: the headroom passes skip the refusing member for a clear one"
+    );
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]),
+            &status
+        ),
+        (Some("b".to_string()), false)
+    );
+    // A dead sink serves nothing: the refusing member, which serves what its
+    // plan covers, comes ahead of parking there.
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("c"))
+        .unwrap()
+        .last_resort = true;
+    assert_eq!(
+        global_decision(
+            &config,
+            &session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]),
+            &status
+        ),
+        (Some("b".to_string()), false),
+        "the refusing member comes ahead of a dead sink"
+    );
+    // A sink that still serves every request comes ahead of it: c's week past
+    // the line keeps it out of the headroom passes, short of the hard cap.
+    let serving = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    serving.lock().unwrap().get_mut("c").unwrap().seven_day = Some(crate::usage::UsageWindow {
+        utilization: 99.0,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3 * 86_400,
+        )),
+    });
+    assert_eq!(
+        global_decision(&config, &serving, &status),
+        (Some("c".to_string()), false),
+        "a serving sink comes ahead of the refusing member"
+    );
+    // So does a member armed to spend: c with a budget, its 5h spent.
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        let c = cfg
+            .find_mut(&crate::profile::ProfileName::from("c"))
+            .unwrap();
+        c.last_resort = false;
+        c.max_auto_spend = Some(50.0);
+    }
+    let armed = session_store(&[("a", 100.0), ("b", 10.0), ("c", 100.0)]);
+    armed.lock().unwrap().get_mut("c").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        global_decision(&config, &armed, &status),
+        (Some("b".to_string()), false),
+        "the refusing member comes ahead of a spend-armed one: free quota ranks above spend"
+    );
+    // An active armed to spend leaves for the refusing member's free quota.
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .max_auto_spend = Some(50.0);
+    armed.lock().unwrap().get_mut("a").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        global_decision(&config, &armed, &status),
+        (Some("b".to_string()), false),
+        "an active armed to spend leaves for the refusing member: free quota ranks above spend"
+    );
+    // With no refusing member left with headroom, the active armed to spend
+    // stays put rather than move to another paying member.
+    armed
+        .lock()
+        .unwrap()
+        .get_mut("b")
+        .unwrap()
+        .five_hour
+        .as_mut()
+        .unwrap()
+        .utilization = 100.0;
+    assert_eq!(
+        global_decision(&config, &armed, &status),
+        (None, false),
+        "control: with no free quota left the active armed to spend stays"
+    );
+}
+
+/// Of two serving sinks the walk takes the first in chain order, on record as
+/// refusing or not: the pass serves every request and reads the chain's order.
+#[test]
+fn the_serving_sink_pass_takes_a_refusing_sink_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    for name in ["b", "c"] {
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .unwrap()
+            .last_resort = true;
+    }
+    record_refusal("b", 60_000);
+    // Each week past the line keeps both out of the headroom passes, short of
+    // the hard cap.
+    let store = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    for name in ["b", "c"] {
+        store.lock().unwrap().get_mut(name).unwrap().seven_day = Some(crate::usage::UsageWindow {
+            utilization: 99.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3 * 86_400,
+            )),
+        });
+    }
+    assert_eq!(
+        global_decision(&config, &store, &all_fresh(&["a", "b", "c"])),
+        (Some("b".to_string()), false)
+    );
+}
+
+/// The same for two members armed to spend, their 5h spent.
+#[test]
+fn the_spend_armed_pass_takes_a_refusing_member_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        for name in ["b", "c"] {
+            cfg.find_mut(&crate::profile::ProfileName::from(name))
+                .unwrap()
+                .max_auto_spend = Some(50.0);
+        }
+    }
+    record_refusal("b", 60_000);
+    let store = session_store(&[("a", 100.0), ("b", 100.0), ("c", 100.0)]);
+    for name in ["b", "c"] {
+        store.lock().unwrap().get_mut(name).unwrap().spend = Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(0.0),
+            limit: Some(100.0),
+            percent: Some(0.0),
+            currency: Some("USD".to_owned()),
+        });
+    }
+    assert_eq!(
+        global_decision(&config, &store, &all_fresh(&["a", "b", "c"])),
+        (Some("b".to_string()), false)
+    );
+}
+
+/// That pass takes a refusing member read fresh ahead of one whose reading is
+/// not, as the headroom passes do: a reading that is not current may no longer
+/// hold the headroom it shows. The control, both read fresh, takes the chain's
+/// first.
+#[test]
+fn the_global_walk_takes_a_fresh_refusing_member_before_a_stale_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config.lock().unwrap().state.switch_off_when_spent = true;
+    record_refusal("b", 60_000);
+    record_refusal("c", 60_000);
+    let store = session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    let status = all_fresh(&["a", "b", "c"]);
+    assert_eq!(
+        global_decision(&config, &store, &status),
+        (Some("b".to_string()), false),
+        "control: both read fresh, the chain's order takes b"
+    );
+    status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Cached);
+    assert_eq!(
+        global_decision(&config, &store, &status),
+        (Some("c".to_string()), false)
+    );
+}
+
+/// A session whose demand may need credits takes a member on record as
+/// refusing only after every other pass: a clear member comes first, and with
+/// none left it takes the refusing one with headroom, in chain order, rather
+/// than stay on a spent member and collect 429s. One with no headroom by its
+/// own lines it does not take.
+#[test]
+fn a_session_with_credit_demand_takes_a_refusing_member_after_every_other_pass() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b", "c"], "fable", &[], None);
+    let _marker = register_live_row(&row_on("a", "fable"));
+    let reset = || {
+        crate::live_sessions::update_as_daemon("4242-0", |f| {
+            f.set_intended_member("a");
+            f.set_chain_cursor(0);
+        })
+        .expect("reset the decision");
+    };
+    let decide = |b: f64, c: f64, status: &super::StatusStore| {
+        reset();
+        scan_sessions(
+            &config,
+            &session_store(&[("a", 100.0), ("b", b), ("c", c)]),
+            status,
+        );
+        decision_of("4242-0")
+    };
+    let status = all_fresh(&["a", "b", "c"]);
+    assert_eq!(
+        decide(10.0, 100.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "control: with no refusal the session leaves the spent member for b"
+    );
+    record_refusal("b", 60_000);
+    assert_eq!(
+        decide(10.0, 10.0, &status),
+        (Some("c".to_string()), Some(2)),
+        "a clear member comes ahead of the refusing one"
+    );
+    assert_eq!(
+        decide(10.0, 100.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "with every other pass spent, the session takes the refusing member"
+    );
+    assert_eq!(
+        decide(100.0, 100.0, &status),
+        (Some("a".to_string()), Some(0)),
+        "a refusing member with no headroom is no target"
+    );
+    record_refusal("c", 60_000);
+    status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Cached);
+    assert_eq!(
+        decide(10.0, 10.0, &status),
+        (Some("b".to_string()), Some(1)),
+        "that pass reads the chain's order, not freshness"
+    );
+}
+
+/// The target the wrap-off recovery queues off these stores, if any.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recovery_switch(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) -> Option<String> {
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    super::scan_recovery(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+    pending
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|p| p.target.clone())
+}
+
+/// A bare session running a credit-billed model is refused on the probed home
+/// `a`, and the spent 5h window moves the global account to `b`. Once `a`'s
+/// window resets, the home pass must not pull the account back, though `a`'s
+/// probe reading has no credit figures for a gate to fire on; and the refusal
+/// outlives the session, since nothing has served on `a` since.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_global_walk_keeps_the_account_off_a_member_that_refused_a_bare_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &["a"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let bare = LiveChild::spawn();
+    assert_eq!(
+        global_switch(&config, &store, &status),
+        Some("b".to_string()),
+        "fixture control: the spent 5h window moves the global account to b"
+    );
+    // The session leg drains the 429 on the same tick, as `tick` runs it.
+    refuse_bare_session(&home, &bare, "conv-g", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "the global active refused the bare session"
+    );
+    config.lock().unwrap().state.active_profile = Some("b".into());
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .and_then(|a| a.five_hour.as_mut())
+        .expect("a's 5h window")
+        .utilization = 10.0;
+    assert_eq!(
+        global_switch(&config, &store, &status),
+        None,
+        "a refused the bare session's credit-billed model"
+    );
+    drop(bare);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        global_switch(&config, &store, &status),
+        None,
+        "the refusal outlives the session"
+    );
+}
+
+/// The wrap-off recovery reads no credit refusal: with the global account
+/// switched off, the preferred home that refused a live bare session is taken
+/// once its windows read clear, rather than every session staying signed out
+/// until that process exits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_wrap_off_recovery_takes_a_member_whose_credit_refusal_is_on_record() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &["a"], Some("a"));
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let bare = LiveChild::spawn();
+    refuse_bare_session(&home, &bare, "conv-r", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: the refusal is on record before the recovery reads"
+    );
+    config.lock().unwrap().state.active_profile = None;
+    assert_eq!(
+        recovery_switch(&config, &store, &status),
+        Some("a".to_string())
+    );
+    drop(bare);
+}
+
+/// A refusal one lease holder recorded holds for the next: holder B, on a
+/// thread of its own whose scheduler memory starts empty as a new process's
+/// does, keeps the global account off the preferred member a bare session was
+/// refused on, though the member's reading reads clear.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_credit_refusal_outlives_a_lease_handover() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &["a"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let bare = LiveChild::spawn();
+    refuse_bare_session(&home, &bare, "conv-h", &config, &store, &status);
+    config.lock().unwrap().state.active_profile = Some("b".into());
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .and_then(|a| a.five_hour.as_mut())
+        .expect("a's 5h window")
+        .utilization = 10.0;
+    let next_holder = {
+        let (config, store, status) = (config.clone(), store.clone(), status.clone());
+        std::thread::spawn(move || global_switch(&config, &store, &status))
+            .join()
+            .expect("the next holder's scan")
+    };
+    assert_eq!(next_holder, None);
+    drop(bare);
+}
+
+/// The global walk reads a refusal as a skip only: a member whose reading alone
+/// shows its credit cap spent, with its credit gate off, stays a target as it
+/// is for any global walk, since the refusal never turns on the credit demand
+/// that would read every spent cap whatever its gate.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_global_walk_reads_a_refusal_without_widening_the_cap_check() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["x", "a", "c"], &[], &["c"]);
+    let store = credit_store(&["x", "a", "c"], &["c"]);
+    let status = all_fresh(&["x", "a", "c"]);
+    switch_global_active(&config, "a");
+    let bare = LiveChild::spawn();
+    refuse_bare_session(&home, &bare, "conv-w", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the bare session"
+    );
+    switch_global_active(&config, "x");
+    store
+        .lock()
+        .unwrap()
+        .get_mut("x")
+        .and_then(|x| x.five_hour.as_mut())
+        .expect("x's 5h window")
+        .utilization = 100.0;
+    assert_eq!(
+        global_switch(&config, &store, &status),
+        Some("c".to_string())
+    );
+    drop(bare);
+}
+
+/// Where a 429 from a live process a row holds lands: as a delegate's `pid`,
+/// which the delegate's row is re-keyed onto, or as a `tollgate start` row's
+/// `claude_pid`. The process's record sits in the global sessions dir, as a
+/// shared runtime's does. Returns whether the row's member `b` and the global
+/// active `a` carry a refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_from_a_row_held_process(delegate: bool) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8400-0", "b");
+    row.follows_chain = false;
+    if delegate {
+        row.is_delegate = true;
+        row.pid = child.pid();
+    } else {
+        row.claude_pid = Some(child.pid());
+    }
+    let _marker = register_live_row(&row);
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-d",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A 429 under the pid a delegate's row holds is the delegate's member's, not
+/// the global account's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_delegate_lands_on_the_delegates_member() {
+    assert_eq!(
+        refusals_after_a_429_from_a_row_held_process(true),
+        (true, false)
+    );
+}
+
+/// The same for the child a `tollgate start` row names as its `claude_pid`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_tollgate_start_child_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_a_row_held_process(false),
+        (true, false)
+    );
+}
+
+/// Where a 429 lands from a live process under `row_pid`, the `pid` a row holds
+/// while the row names no `claude_pid`: a `tollgate start` child whose pid write
+/// failed, or, `delegate`, a delegate's child whose re-key did not land, so the
+/// row still sits on its `tollgate mcp`. The process is this test process's
+/// child, so `row_pid` is this process for one level up and its parent for
+/// two. Returns whether the row's member `b` and the global active `a` carry a
+/// refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_from_under_a_rows_process(delegate: bool, row_pid: u32) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8450-0", "b");
+    row.follows_chain = false;
+    row.is_delegate = delegate;
+    row.pid = row_pid;
+    let _marker = register_live_row(&row);
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-p",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_tollgate_start_child_without_its_pid_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(false, std::process::id()),
+        (true, false)
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_delegate_left_on_its_mcp_pid_lands_on_the_delegates_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(true, std::process::id()),
+        (true, false)
+    );
+}
+
+/// A shell or a nested `claude` between a row's process and the one refused
+/// adds a level: two levels up still finds the row. The row sits on this test
+/// process's parent, so a test process started directly under init, whose
+/// parent the walk stops at, cannot pose it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_two_levels_under_a_rows_process_lands_on_the_rows_member() {
+    assert_eq!(
+        refusals_after_a_429_from_under_a_rows_process(false, std::os::unix::process::parent_id()),
+        (true, false)
+    );
+}
+
+/// A background row on `b` reading its fixed tree, the launcher's or with
+/// `hold` the daemon's, its marker held by this process as the running one
+/// holds it, and the Claude Code job record of a `tollgate start b -- --bg`
+/// session naming that tree as its `CLAUDE_CONFIG_DIR`, in the key set a live
+/// job wrote. Returns the job's conversation id and the marker's hold.
+fn seed_background_job(home: &crate::testutil::HomeSandbox, hold: bool) -> (String, std::fs::File) {
+    seed_background_job_with(home, hold, None)
+}
+
+/// [`seed_background_job`], the row's `claude` at `claude_pid`.
+fn seed_background_job_with(
+    home: &crate::testutil::HomeSandbox,
+    hold: bool,
+    claude_pid: Option<u32>,
+) -> (String, std::fs::File) {
+    let mut row = session_row("8460-0", "b");
+    row.follows_chain = false;
+    row.background = true;
+    row.background_hold = hold;
+    row.claude_pid = claude_pid;
+    let marker = crate::runtime::hold_background_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        &row.session_id,
+    )
+    .expect("hold b's background marker");
+    crate::live_sessions::register(&row).expect("register the background row");
+    let tree = crate::runtime::background_runtime_tree(&crate::profile::ProfileName::from("b"))
+        .expect("b's background tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    crate::testutil::write_claude_job(home.home(), "8a1c2d3e", &tree);
+    ("8a1c2d3e-0a6e-4b11-883e-fca3a218ae52".to_string(), marker)
+}
+
+/// A `claude --bg` job's process descends from Claude Code's own service, not
+/// from tollgate, and its record may sit in the global sessions dir: its 429
+/// lands on the member of the row whose tree the job names, not on the global
+/// account.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_bg_job_under_a_tollgate_runtime_lands_on_the_rows_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (conv, _marker) = seed_background_job(&home, false);
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        &conv,
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
+}
+
+/// The refusals, as `(on b, on the global active a)`, after a live bare
+/// `claude` reuses a pid of a dead row on `b` that `shape` sets up from the
+/// child's pid: registered with no liveness marker, the row's session is gone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_dead_rows_reused_pid(
+    shape: impl FnOnce(&mut crate::live_sessions::LiveSession, u32),
+) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8490-0", "b");
+    row.follows_chain = false;
+    shape(&mut row, child.pid());
+    crate::live_sessions::register(&row).expect("register the dead row");
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-z",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A row whose session is gone, a SIGKILLed `tollgate start` say, outlives it,
+/// and its pids may come back as other processes: a live bare `claude` that
+/// reuses the dead row's `claude_pid` is the bare session it is, and its 429
+/// lands on the global active, never on the dead row's member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_rows_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| row.claude_pid = Some(pid)),
+        (false, true)
+    );
+}
+
+/// A `tollgate start -- --bg` launcher's row outlives a SIGKILLed launcher the
+/// same way, and is probed by its marker as a session row is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_launcher_rows_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| {
+            row.background = true;
+            row.claude_pid = Some(pid);
+        }),
+        (false, true)
+    );
+}
+
+/// A daemon gone without teardown leaves its hold's row until the next GC,
+/// and the daemon's pid may come back as another process: the hold is probed
+/// by its marker too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_dead_daemon_holds_reused_pid_leaves_a_bare_429_to_the_global_active() {
+    assert_eq!(
+        refusals_after_a_dead_rows_reused_pid(|row, pid| {
+            row.background = true;
+            row.background_hold = true;
+            row.pid = pid;
+            row.claude_pid = None;
+        }),
+        (false, true)
+    );
+}
+
+/// The daemon probes its own hold from the process that holds the hold's
+/// flock: the probe opens the marker anew, and a flock on a second open file
+/// description conflicts with the first, so the hold reads live and its job's
+/// 429 still lands on its member.
+#[test]
+fn a_daemon_hold_this_process_holds_places_its_jobs_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (conv, _marker) = seed_background_job(&home, true);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
+}
+
+/// A job naming the tree of a session row whose session is gone places
+/// nothing: the row reads no account any more, and the job's process is no
+/// bare session to fall back on.
+#[test]
+fn a_job_naming_a_dead_rows_tree_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let mut row = session_row("8491-0", "b");
+    row.follows_chain = false;
+    crate::live_sessions::register(&row).expect("register the dead row");
+    let [tree, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from("b"),
+        row.isolated,
+        &row.session_id,
+    )
+    .expect("b's session trees");
+    std::fs::create_dir_all(&tree).unwrap();
+    crate::testutil::write_claude_job(home.home(), "9b2d3e4f", &tree);
+    let conv = "9b2d3e4f-0a6e-4b11-883e-fca3a218ae52";
+    append_and_tail(&home, conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (false, false)
+    );
+}
+
+/// The same job with no session record tollgate can see, as measured for a
+/// `tollgate start --bg` job: the job alone places the 429.
+#[test]
+fn a_429_from_a_bg_job_with_no_session_record_lands_on_the_rows_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (conv, _marker) = seed_background_job(&home, false);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("b").is_some(), refusal_on("a").is_some()),
+        (true, false)
+    );
+}
+
+/// A process whose record sits in a runtime tree's own sessions dir, not the
+/// global one, reads another account's credentials (here an isolated session's
+/// child under a pid its row does not name), so its 429 lands on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_record_outside_the_global_sessions_dir_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let mut row = session_row("8500-0", "a");
+    row.follows_chain = false;
+    row.isolated = true;
+    let _marker = register_live_row(&row);
+    let tree = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from("a"),
+        true,
+        "8500-0",
+    )
+    .expect("the row's runtime trees")[0]
+        .clone();
+    seed_bare_record_in(
+        &tree.join("sessions"),
+        "conv-i",
+        &child,
+        Some(crate::usage::now_ms() - 60_000),
+    );
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    active_seen_long_ago(&config);
+    append_and_tail(&home, "conv-i", &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+}
+
+/// Two live processes on one conversation make its 429 unattributable, as for
+/// a session's own: it lands on no one. The control: with the one process, the
+/// conversation's 429 lands on the global active.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_on_a_conversation_two_bare_processes_hold_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &child, "conv-2", now, &config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: one process's 429 lands on the active")
+        .at_ms;
+    let other = LiveChild::spawn();
+    seed_bare_session_record(&home, "conv-2", &other, Some(now - 60_000));
+    append_and_tail(&home, "conv-2", &[spend_cap_row_at(now - 500)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
+}
+
+/// Whether a 429 a minute old from a live bare session whose record names a
+/// start `started_ago` ms back puts a refusal on the global active. The start
+/// is taken once the sandbox is held, so a wait for it cannot move the 429
+/// past the start.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_minute_old_bare_429(started_ago: Option<u64>) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-h",
+        &child,
+        started_ago.map(|ago| crate::usage::now_ms() - ago),
+    );
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    active_seen_long_ago(&config);
+    append_and_tail(&home, "conv-h", &[spend_cap_row(60_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    refusal_on("a").is_some()
+}
+
+/// A 429 within the bare session's life is its own, on the global active.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_within_the_bare_session_lands_on_the_active() {
+    assert!(refused_after_a_minute_old_bare_429(Some(120_000)));
+}
+
+/// A 429 older than the bare session's start is a resumed conversation's
+/// history, not the session's own: it lands on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_older_than_the_bare_session_lands_on_no_one() {
+    assert!(!refused_after_a_minute_old_bare_429(Some(0)));
+}
+
+/// A record that names no start cannot vouch for a 429 either.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_a_bare_session_that_names_no_start_lands_on_no_one() {
+    assert!(!refused_after_a_minute_old_bare_429(None));
+}
+
+/// The scan itself sees the global active change from `a` to `b` and opens
+/// the grace: a 429 a second old is the outgoing account's answer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_switch_the_scan_sees_opens_the_grace() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let before = config.lock().unwrap().state.active_profile.clone();
+    assert_eq!(
+        before.as_ref().map(|n| n.to_string()),
+        Some("a".to_string()),
+        "fixture: a is the active"
+    );
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((before, crate::usage::now_ms() - 600_000));
+    });
+    switch_global_active(&config, "b");
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-s", &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false),
+        "a 429 from before a switch the scan just saw lands on no one"
+    );
+}
+
+/// After a global switch these scans saw, a bare session whose `claude`
+/// started before it is the new active's past the grace: inside it, its 429
+/// may answer a request sent before the switch and lands on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_session_started_before_a_switch_lands_on_the_new_active_past_the_grace() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-w"]);
+    switch_global_active(&config, "b");
+    let now = crate::usage::now_ms();
+    let seen_ago = |ago: u64| {
+        super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+            *seen.borrow_mut() = Some((Some("b".into()), now - ago));
+        });
+    };
+    let before = LiveChild::spawn();
+    seed_bare_session_record(&home, "conv-w", &before, Some(now - 60_000));
+    // The scans saw the switch to `b` ten seconds ago, so the second-old 429
+    // lands inside its grace.
+    seen_ago(10_000);
+    append_and_tail(&home, "conv-w", &[spend_cap_row_at(now - 1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("b").is_none(), "inside the grace");
+    seen_ago(40_000);
+    append_and_tail(&home, "conv-w", &[spend_cap_row_at(now)]);
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("b").is_some(),
+        "past the grace, the session started before the switch is the new active's"
+    );
+}
+
+/// A refused member that serves the bare session again, a successful turn on
+/// a credit-billed model in the file of its 429 while the global account is on
+/// it, loses its refusal; a turn from before the refusal proves nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_member_that_serves_a_bare_session_again_loses_its_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &child, "conv-v", now, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    // Within the session's life and past the grace, but stamped before the
+    // 429. That 429 carries no uuid, so it holds no position to order the
+    // turn by line, and the stamps decide.
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on_at(now - 30_000, "msg_old", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "a turn from before the refusal proves nothing"
+    );
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on_at(now, "msg_ok", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none());
+}
+
+/// Whether a's refusal stands after the refused bare session gets a turn on
+/// `model` served in the file of its own 429.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_turn_in_the_refusals_file(model: &str) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-v", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    append_and_tail(&home, "conv-v", &[served_row_on(0, "msg_ok", model)]);
+    scan_sessions(&config, &store, &status);
+    refusal_on("a").is_some()
+}
+
+/// Any later successful turn on the member clears its refusal, whatever model
+/// served it: a turn the plan covers in the refusal's own transcript too, the
+/// session switched to opus after the refusal say.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_plan_covered_turn_in_the_refusals_own_file_clears_it() {
+    assert!(!refused_after_a_turn_in_the_refusals_file("claude-opus-4"));
+}
+
+/// A model tollgate cannot place may be the one that was refused, so a turn on
+/// it in the refusal's own transcript clears the refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unplaceable_turn_in_the_refusals_own_file_clears_it() {
+    assert!(!refused_after_a_turn_in_the_refusals_file("mystery-model"));
+}
+
+/// A clock step back between the refusal and the session's next turn: a
+/// credit-billed turn written after the 429 in its own file but stamped 2 s
+/// below it. The line order puts the turn after the refusal, so the refusal
+/// goes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_turn_after_the_429_in_its_file_stamped_below_it_clears_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    let rows = [spend_cap_row_uuid_at(now - 1_000, "cap-v")];
+    refuse_bare_session_with(&home, &child, "conv-v", &rows, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    append_and_tail(
+        &home,
+        "conv-v",
+        &[served_row_on_at(now - 3_000, "msg_ok", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_none(),
+        "a turn after the 429 in its file clears the refusal whatever its stamp"
+    );
+}
+
+/// A credit-billed turn written before the 429 in its file but stamped above
+/// it, the 429 stamped low by a clock step back, proves nothing: one drain
+/// over both lines leaves the refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_turn_before_the_429_in_its_file_stamped_above_it_leaves_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    let rows = [
+        served_row_on_at(now - 500, "msg_early", "claude-fable-5"),
+        spend_cap_row_uuid_at(now - 1_000, "cap-v"),
+    ];
+    refuse_bare_session_with(&home, &child, "conv-v", &rows, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "a turn before the 429 in its file leaves the refusal whatever its stamp"
+    );
+}
+
+/// Whether a's refusal, a second old, stands after another bare session on `a`
+/// gets a turn on `model` served `served_ago` ms ago, in a file of its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_turn_in_another_bare_session(model: &str, served_ago: u64) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-x", "conv-y"]);
+    let first = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(&home, &first, "conv-x", now, &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused conv-x"
+    );
+    let second = LiveChild::spawn();
+    seed_bare_session_record(&home, "conv-y", &second, Some(now - 60_000));
+    append_and_tail(
+        &home,
+        "conv-y",
+        &[served_row_on_at(now - served_ago, "msg_y", model)],
+    );
+    scan_sessions(&config, &store, &status);
+    refusal_on("a").is_some()
+}
+
+/// A refusal and a later credit-billed turn from another session on the member,
+/// drained at once, leave no refusal: the turn's conversation is read for its
+/// claims although no refusal was on record before the drain, as after a
+/// takeover that reads the hot transcripts whole.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_and_a_later_turn_elsewhere_in_one_drain_leave_no_refusal() {
+    assert!(
+        refused_after_one_drain(false),
+        "control: without the turn the drain places the refusal"
+    );
+    assert!(!refused_after_one_drain(true));
+}
+
+/// An isolated runtime tree of `profile` for session `sid`, holding `rows` in
+/// conversation `conv`'s transcript, as an isolated `tollgate start` or delegate
+/// leaves it when its `claude` exits. Returns the tree.
+fn isolated_tree_with(profile: &str, sid: &str, conv: &str, rows: &[String]) -> std::path::PathBuf {
+    let [tree, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from(profile),
+        true,
+        sid,
+    )
+    .expect("the isolated layout");
+    let proj = tree.join("projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{conv}.jsonl")),
+        rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+    )
+    .unwrap();
+    tree
+}
+
+/// Tear an isolated run's tree down as `tollgate start` and a delegate do once
+/// their `claude` exits: a sessions dir with no live marker, so the rescue
+/// lifts the transcripts into the global store.
+fn tear_down_isolated(home: &crate::testutil::HomeSandbox, tree: &std::path::Path) {
+    let sessions = home.home().join("teardown-sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    crate::start::rescue_teardown(tree, &sessions, &home.home().join(".claude"));
+}
+
+/// An isolated `claude -p` that ends on a spend-cap 429 is gone before any
+/// scan reads its claim, and its teardown lifts the transcript into the global
+/// store where no tree names the account. The teardown records the refusal on
+/// the tree's profile first.
+#[test]
+fn an_isolated_run_ending_on_a_429_leaves_its_refusal_on_the_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let tree = isolated_tree_with("a", "9100-0", "conv-iso", &[spend_cap_row_at(at)]);
+    tear_down_isolated(&home, &tree);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("b").is_none());
+    assert!(
+        home.home()
+            .join(".claude/projects/-home-u-proj/conv-iso.jsonl")
+            .exists(),
+        "fixture control: the teardown lifted the transcript"
+    );
+}
+
+/// A 429 a successful turn followed in the same transcript is no refusal the
+/// run ended on: the teardown records nothing. The control: another member's
+/// run that ended on the same 429 leaves it on record, where on `a` the turn
+/// floored the record past it.
+#[test]
+fn an_isolated_run_whose_429_a_later_turn_followed_leaves_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let now = crate::usage::now_ms();
+    let at = now - 5_000;
+    let tree = isolated_tree_with(
+        "a",
+        "9101-0",
+        "conv-iso",
+        &[
+            spend_cap_row_at(at),
+            served_row_at(now - 1_000, "msg_after"),
+        ],
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_none());
+    record_refusal_at("a", now - 3_000);
+    assert!(refusal_on("a").is_none(), "the floor lies at the turn");
+    let ended_on = isolated_tree_with("b", "9118-0", "conv-end", &[spend_cap_row_at(at)]);
+    tear_down_isolated(&home, &ended_on);
+    assert!(
+        refusal_on("b").is_some(),
+        "control: a run that ended on the 429 records it"
+    );
+}
+
+/// A successful turn in another transcript of the run, stamped after its 429,
+/// was served by the account too: the run did not end on that refusal, and the
+/// teardown records nothing. The control, the same turn stamped before the
+/// 429, leaves the refusal recorded.
+#[test]
+fn an_isolated_run_served_after_its_429_in_another_transcript_leaves_no_refusal() {
+    let refused = |turn_ago: u64, sid: &str| {
+        let now = crate::usage::now_ms();
+        let home = crate::testutil::HomeSandbox::new();
+        let _config = session_config_models(&["a", "b"], &[], &[]);
+        let tree = isolated_tree_with("a", sid, "conv-iso", &[spend_cap_row_at(now - 3_000)]);
+        std::fs::write(
+            tree.join("projects/-home-u-proj/conv-sub.jsonl"),
+            format!("{}\n", served_row_at(now - turn_ago, "msg_sub")),
+        )
+        .unwrap();
+        tear_down_isolated(&home, &tree);
+        refusal_on("a").is_some()
+    };
+    assert!(
+        refused(5_000, "9105-0"),
+        "control: a turn before the 429 leaves it recorded"
+    );
+    assert!(!refused(1_000, "9106-0"));
+}
+
+/// A turn of the run stamped past the refusal another session left on record
+/// clears it at the lift, as a turn the drain reads does. The control, the
+/// turn stamped before that refusal, leaves it.
+#[test]
+fn an_isolated_run_served_past_the_refusal_on_record_clears_it() {
+    let held_after = |turn_ago: u64, sid: &str| {
+        let home = crate::testutil::HomeSandbox::new();
+        let _config = session_config_models(&["a", "b"], &[], &[]);
+        record_refusal("a", 5_000);
+        let held = refusal_on("a").expect("fixture control: another session's refusal");
+        let tree = isolated_tree_with("a", sid, "conv-iso", &[served_row(turn_ago, "msg_run")]);
+        tear_down_isolated(&home, &tree);
+        refusal_on("a").map(|now| now == held)
+    };
+    assert_eq!(
+        held_after(30_000, "9107-0"),
+        Some(true),
+        "control: a turn before the refusal leaves it"
+    );
+    assert_eq!(held_after(1_000, "9108-0"), None);
+}
+
+/// The drain recorded the run's 429 while the run lived, and the run went on
+/// to a successful turn no drain read before the lift: the lift clears the
+/// record and floors it at the turn, so a 429 stamped between the two is not
+/// recorded again.
+#[test]
+fn an_isolated_run_served_past_its_recorded_429_clears_it_at_the_lift() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let now = crate::usage::now_ms();
+    let at = now - 5_000;
+    let tree = isolated_tree_with(
+        "a",
+        "9109-0",
+        "conv-iso",
+        &[
+            spend_cap_row_at(at),
+            served_row_at(now - 1_000, "msg_after"),
+        ],
+    );
+    crate::profile_cache::write_credit_refusal(
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: at,
+            file: tree.join("projects/-home-u-proj/conv-iso.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: the drain's record"
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_none());
+    record_refusal_at("a", now - 2_000);
+    assert!(refusal_on("a").is_none(), "the floor lies at the turn");
+}
+
+/// A transcript of the run that ends on its 429 has each turn before it by
+/// line, one stamped later included: the lift records the refusal and clears
+/// nothing on that turn, as the write orders the transcript.
+#[test]
+fn a_turn_before_the_runs_429_by_line_clears_nothing_whatever_its_stamp() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with(
+        "a",
+        "9113-0",
+        "conv-iso",
+        &[served_row(1_000, "msg_first"), spend_cap_row(5_000)],
+    );
+    tear_down_isolated(&home, &tree);
+    assert!(refusal_on("a").is_some());
+}
+
+/// An isolated tree whose run exited without its teardown, as when its tollgate
+/// died first, with a marker dir that holds no live session.
+fn stranded_isolated_tree(
+    profile: &str,
+    sid: &str,
+    conv: &str,
+    rows: &[String],
+) -> std::path::PathBuf {
+    let tree = isolated_tree_with(profile, sid, conv, rows);
+    std::fs::create_dir_all(tree.with_file_name(format!("sessions-isolated-{sid}"))).unwrap();
+    tree
+}
+
+/// A run whose tollgate died before its teardown leaves its tree to the
+/// stale-runtime sweep, which lifts it into the global store under a rescue
+/// tombstone: the sweep records the refusal the run ended on first, off the
+/// tombstone's name.
+#[test]
+fn an_isolated_run_the_stale_sweep_lifts_leaves_its_refusal_on_the_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let tree = stranded_isolated_tree("a", "9110-0", "conv-iso", &[spend_cap_row_at(at)]);
+    crate::runtime::gc_stale_runtimes();
+    assert!(!tree.exists(), "fixture control: the sweep lifted the tree");
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("b").is_none());
+}
+
+/// The sweep may lift a tree long after its run, so the record's rules hold
+/// there as at teardown: a member whose record a later turn cleared, its floor
+/// past the run's 429, takes nothing, and one with a later refusal on record
+/// keeps that one.
+#[test]
+fn a_late_sweep_records_nothing_under_a_later_floor_or_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 60_000;
+    crate::profile_cache::clear_credit_refusal(
+        &crate::profile::ProfileName::from("a"),
+        at + 30_000,
+    );
+    record_refusal("b", 10_000);
+    let later = refusal_on("b")
+        .expect("fixture control: b's later refusal")
+        .at_ms;
+    let trees = [
+        stranded_isolated_tree("a", "9111-0", "conv-a", &[spend_cap_row_at(at)]),
+        stranded_isolated_tree("b", "9112-0", "conv-b", &[spend_cap_row_at(at)]),
+    ];
+    crate::runtime::gc_stale_runtimes();
+    assert!(
+        trees.iter().all(|tree| !tree.exists()),
+        "fixture control: the sweep lifted both trees"
+    );
+    assert!(refusal_on("a").is_none(), "a's floor lies past the 429");
+    assert_eq!(
+        refusal_on("b").map(|r| r.at_ms),
+        Some(later),
+        "b keeps the later refusal"
+    );
+}
+
+/// A rescue that could not move every file keeps the tree, and a later lift
+/// reads only what is left in it. A 429 a later turn of the run disproved,
+/// left behind while that turn's transcript moved, records nothing there: the
+/// first lift floored the record at the turn, as a drain reading both does.
+/// The control: a 429 of the run stamped past that turn, left the same way,
+/// goes on record.
+#[test]
+fn a_later_lift_that_finds_only_a_disproved_429_records_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with("a", "9119-0", "conv-iso", &[spend_cap_row(5_000)]);
+    let moved = tree.join("projects/-home-u-proj/conv-sub.jsonl");
+    std::fs::write(&moved, format!("{}\n", served_row(3_000, "msg_sub"))).unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the turn disproves the 429"
+    );
+    std::fs::remove_file(&moved).unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(refusal_on("a").is_none());
+    std::fs::write(
+        tree.join("projects/-home-u-proj/conv-late.jsonl"),
+        format!("{}\n", spend_cap_row(1_000)),
+    )
+    .unwrap();
+    super::note_isolated_credit_refusal(&tree);
+    assert!(
+        refusal_on("a").is_some(),
+        "control: a 429 past the turn goes on record"
+    );
+}
+
+/// The producer reads the lifted copy later, under the global path, with no
+/// claimant and no tree to name the account: that read records nothing twice,
+/// and the record keeps the teardown's instant, transcript and floor byte for
+/// byte. The tree's profile is not the global active, which takes nothing
+/// either.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_lifted_copy_of_an_isolated_429_records_nothing_twice() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let tree = isolated_tree_with("b", "9102-0", "conv-iso", &[spend_cap_row(1_000)]);
+    tear_down_isolated(&home, &tree);
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+        .expect("b's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let placed = std::fs::read(&record).expect("fixture control: the teardown placed it");
+    active_seen_long_ago(&config);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tail_transcripts();
+            scan_sessions(&config, &store, &status);
+        });
+    });
+    assert_eq!(std::fs::read(&record).expect("the record"), placed);
+    assert!(refusal_on("a").is_none(), "the global active takes nothing");
+}
+
+/// A shared run's tree names no account its transcripts could be placed on:
+/// they live in the global store from the start. The control: the same
+/// transcript in an isolated run's tree goes on the tree's profile.
+#[test]
+fn a_shared_runs_tree_places_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a", "b"], &[], &[]);
+    let [shared, _] = crate::runtime::session_runtime_trees(
+        &crate::profile::ProfileName::from("a"),
+        false,
+        "9103-0",
+    )
+    .expect("the shared layout");
+    let proj = shared.join("projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("conv-sh.jsonl"),
+        format!("{}\n", spend_cap_row(1_000)),
+    )
+    .unwrap();
+    super::note_isolated_credit_refusal(&shared);
+    assert!(refusal_on("a").is_none());
+    let isolated = isolated_tree_with("a", "9116-0", "conv-sh", &[spend_cap_row(1_000)]);
+    super::note_isolated_credit_refusal(&isolated);
+    assert!(
+        refusal_on("a").is_some(),
+        "control: an isolated tree places it"
+    );
+}
+
+/// A 429 the producer reads only after the lift moved it carries the global
+/// path, and with its process gone no stage of the attribution names an
+/// account for it: only the lift's own record places it, so this moves the
+/// transcript alone. The control: another run's 429 read in the same drain
+/// while it still sits in its tree lands on that tree's profile.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_read_only_after_the_lift_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let tree = isolated_tree_with("a", "9104-0", "conv-iso", &[spend_cap_row(1_000)]);
+    crate::sessions::rescue_transcripts(
+        &tree.join("projects"),
+        &home.home().join(".claude/projects"),
+    );
+    let _standing = isolated_tree_with("b", "9117-0", "conv-tree", &[spend_cap_row(1_000)]);
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(refusal_on("a").is_none());
+    assert!(
+        refusal_on("b").is_some(),
+        "control: a 429 read in its tree lands on its profile"
+    );
+}
+
+/// A 429 the producer reads while it still sits in the isolated tree, its
+/// process already gone, lands on the profile the tree names.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_read_in_its_tree_lands_on_the_trees_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let _tree = isolated_tree_with("b", "9105-0", "conv-iso", &[spend_cap_row_at(at)]);
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(refusal_on("b").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("a").is_none());
+}
+
+/// A session whose `claude` already exited claims its conversation no more,
+/// but its row's own record still joins it: the refusal lands on the row's
+/// member through that last stage, and a later successful turn the same join
+/// places on the member clears it again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_session_whose_claude_exited_places_its_refusal_through_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-d"]);
+    let mut row = session_row("9200-0", "a");
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-d", 77_777);
+    append_and_tail(&home, "conv-d", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "the row's join places it");
+    append_and_tail(&home, "conv-d", &[served_row(0, "msg_after")]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none(), "a later turn on a clears it");
+}
+
+/// Where a live process cannot be matched to its record — every platform but
+/// Linux and macOS, posed here by a record whose start names another process —
+/// no claim reads live, and the row's own record places the refusal.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_record_no_process_matches_places_its_refusal_through_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let child = LiveChild::spawn();
+    let mut row = session_row("9201-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{}.json", child.pid())),
+        serde_json::json!({ "sessionId": "conv-w", "pid": child.pid(), "procStart": "1" })
+            .to_string(),
+    )
+    .unwrap();
+    append_and_tail(&home, "conv-w", &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(refusal_on("a").is_some());
+}
+
+/// A live claimant is the first stage: its row places the refusal, once, and
+/// a fresh holder that re-reads the 429 writes the record no second time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_live_claimants_refusal_is_written_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("9202-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_live_session_record(&home, "conv-l", child.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+        .expect("a's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let written = std::fs::metadata(&record)
+        .and_then(|m| m.modified())
+        .expect("the refusal is on record");
+    let fresh_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    fresh_holder();
+    assert_eq!(
+        std::fs::metadata(&record).and_then(|m| m.modified()).ok(),
+        Some(written),
+        "a fresh holder re-reads the 429 and writes the record no second time"
+    );
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE,
+    );
+    fresh_holder();
+    assert!(
+        refusal_on("a").is_some(),
+        "control: a fresh holder places the 429 it re-reads"
+    );
+}
+
+/// A row whose launcher carries a login of its own joins nothing: the session
+/// runs on the account that login names, so its refusal lands on no member.
+/// The control: the same row under a launcher with no login of its own joins
+/// the 429 to `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_row_on_a_login_of_its_own_joins_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let plain = LiveChild::spawn();
+    let mut row = session_row("9203-0", "a");
+    row.pid = plain.pid();
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-o", 77_777);
+    append_and_tail(&home, "conv-o", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: a launcher with no login of its own joins it")
+        .at_ms;
+    let launcher = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    row.pid = launcher.pid();
+    crate::live_sessions::register(&row).expect("re-register the row");
+    append_and_tail(&home, "conv-o", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
+}
+
+/// A row's live `claude` that carries a login of its own, inherited from the
+/// shell that started `tollgate start`, runs on the account that login names,
+/// not on the row's member: its refusal lands on no one. The control: the same
+/// row's `claude` with no login of its own places the first 429 on `a`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_rows_claude_on_a_login_of_its_own_places_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let plain = LiveChild::spawn();
+    let mut row = session_row("9213-0", "a");
+    row.claude_pid = Some(plain.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    seed_live_session_record(&home, "conv-l", plain.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: a `claude` with no login of its own places it")
+        .at_ms;
+    let gone = plain.pid();
+    drop(plain);
+    std::fs::remove_file(home.home().join(format!(".claude/sessions/{gone}.json"))).unwrap();
+    let claude = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    row.claude_pid = Some(claude.pid());
+    crate::live_sessions::register(&row).expect("re-register the row");
+    seed_live_session_record(&home, "conv-l", claude.pid());
+    append_and_tail(&home, "conv-l", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
+}
+
+/// So does a `claude` under a row's process that carries one, found through
+/// its ancestor. The control: a child of the same process with no login of its
+/// own lands the first 429 on the row's member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_from_under_a_rows_process_on_a_login_of_its_own_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8451-0", "b");
+    row.follows_chain = false;
+    row.pid = std::process::id();
+    let _marker = register_live_row(&row);
+    let now = crate::usage::now_ms();
+    let plain = LiveChild::spawn();
+    refuse_bare_session_at(
+        &home,
+        &plain,
+        "conv-p",
+        now - 1_000,
+        &config,
+        &store,
+        &status,
+    );
+    let placed = refusal_on("b")
+        .expect("control: a child with no login of its own lands on the row's member")
+        .at_ms;
+    let gone = plain.pid();
+    drop(plain);
+    std::fs::remove_file(home.home().join(format!(".claude/sessions/{gone}.json"))).unwrap();
+    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    refuse_bare_session_at(&home, &child, "conv-p", now, &config, &store, &status);
+    assert_eq!(
+        (refusal_on("b").map(|r| r.at_ms), refusal_on("a").is_some()),
+        (Some(placed), false)
+    );
+}
+
+/// A stand-in for Claude Code's background service: `sh`, whose argv holds
+/// `daemon run`, and the `cat` it waits on, the job's process. Returns the
+/// service, to kill once done, and the job's pid. The job reads the service's
+/// stdin, so it ends once the service's handle drops, and neither holds the
+/// test's output open.
+#[cfg(target_os = "linux")]
+fn stand_in_service() -> (std::process::Child, u32) {
+    let service = std::process::Command::new("sh")
+        .args(["-c", "cat; :", "daemon", "run"])
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the stand-in service");
+    let children = format!("/proc/{}/task/{}/children", service.id(), service.id());
+    let job_pid = (0..200)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(&children)
+                .ok()
+                .and_then(|c| c.split_whitespace().next()?.parse::<u32>().ok());
+            if pid.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            pid
+        })
+        .expect("the job's process under the service");
+    (service, job_pid)
+}
+
+/// A row whose `claude` Claude Code's background service runs joins nothing,
+/// as the claimant stage reads such a process: the job's tree names its
+/// account, if anything does. The control: the same row with a `claude` of its
+/// own, gone, joins the 429 to `a`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_row_whose_claude_the_service_runs_joins_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let record = |claude: u32| {
+        std::fs::write(
+            sessions.join(format!("{claude}.json")),
+            serde_json::json!({ "sessionId": "conv-s", "pid": claude, "procStart": "1" })
+                .to_string(),
+        )
+        .unwrap();
+    };
+    let mut row = session_row("9207-0", "a");
+    row.claude_pid = Some(77_777);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    record(77_777);
+    append_and_tail(&home, "conv-s", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: a `claude` of its own joins it")
+        .at_ms;
+    let (mut service, claude) = stand_in_service();
+    row.claude_pid = Some(claude);
+    crate::live_sessions::register(&row).expect("re-register the row");
+    record(claude);
+    append_and_tail(&home, "conv-s", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    let _ = service.kill();
+    let _ = service.wait();
+    assert_eq!(refusal_on("a").map(|r| r.at_ms), Some(placed));
+}
+
+/// A bare `claude` started with `CLAUDE_CODE_OAUTH_TOKEN` writes its record
+/// into the global sessions dir like any other, but runs on the account that
+/// token names: its refusal lands on no one, never on the global active. The
+/// control: a bare session with no login of its own lands on the active.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_session_on_a_login_of_its_own_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-p", "conv-o"]);
+    let plain = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    refuse_bare_session_at(
+        &home,
+        &plain,
+        "conv-p",
+        now - 1_000,
+        &config,
+        &store,
+        &status,
+    );
+    let placed = refusal_on("a")
+        .expect("control: a session with no login of its own lands on the active")
+        .at_ms;
+    let child = LiveChild::spawn_with_env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-TEST-own");
+    refuse_bare_session_at(&home, &child, "conv-o", now, &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").map(|r| r.at_ms), refusal_on("b").is_some()),
+        (Some(placed), false)
+    );
+}
+
+/// Two delegates whose re-keys both failed sit on their `tollgate mcp`'s pid, and
+/// a 429 its record claims names neither for sure: it lands on no one. With
+/// one of them gone, a fresh holder's re-read places it on the other.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pid_two_rows_hold_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let mcp = LiveChild::spawn();
+    let mut first = session_row("9204-0", "b");
+    first.follows_chain = false;
+    first.claude_pid = Some(mcp.pid());
+    let first_marker = register_live_row(&first);
+    let mut second = session_row("9205-0", "a");
+    second.follows_chain = false;
+    second.claude_pid = Some(mcp.pid());
+    let _second_marker = register_live_row(&second);
+    refuse_bare_session(&home, &mcp, "conv-m", &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+    drop(first_marker);
+    crate::live_sessions::unregister("9204-0").expect("unregister");
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            active_seen_long_ago(&config);
+            tail_transcripts();
+            scan_sessions(&config, &store, &status);
+        });
+    });
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (true, false),
+        "control: one row on the pid takes it"
+    );
+}
+
+/// The same one level up: both rows hold the pid of the claimant's parent, as
+/// two delegates whose re-keys failed hold their `tollgate mcp` while its child
+/// is refused. The ancestor stage names neither, so the 429 lands on no one,
+/// though the claimant's record would name the global active. With one row
+/// gone, a fresh holder's re-read places it on the other.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_pid_two_rows_hold_above_the_claimant_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let mut first = session_row("9206-0", "b");
+    first.follows_chain = false;
+    first.pid = std::process::id();
+    let _first_marker = register_live_row(&first);
+    let mut second = session_row("9208-0", "a");
+    second.follows_chain = false;
+    second.pid = std::process::id();
+    let second_marker = register_live_row(&second);
+    refuse_bare_session(&home, &child, "conv-p", &config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+    drop(second_marker);
+    crate::live_sessions::unregister("9208-0").expect("unregister");
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            active_seen_long_ago(&config);
+            tail_transcripts();
+            scan_sessions(&config, &store, &status);
+        });
+    });
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, true),
+        "control: one row on the parent's pid takes it, not the global active"
+    );
+}
+
+/// Two rows whose own records name one conversation place nothing through the
+/// join: neither row is the session the 429 came from for sure. The control:
+/// with the first row alone, the join places it on that row's member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_conversation_two_rows_join_places_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-j"]);
+    let mut markers = Vec::new();
+    let mut join = |id: &str, member: &str, claude: u32| {
+        let mut row = session_row(id, member);
+        row.claude_pid = Some(claude);
+        row.launch_families = Some(vec!["fable".to_string()]);
+        markers.push(register_live_row(&row));
+        seed_session_record(&home, "conv-j", claude);
+    };
+    join("9208-0", "a", 77_781);
+    append_and_tail(&home, "conv-j", &[spend_cap_row(2_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: one row's join places it")
+        .at_ms;
+    join("9209-0", "b", 77_782);
+    append_and_tail(&home, "conv-j", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        (refusal_on("a").map(|r| r.at_ms), refusal_on("b").is_some()),
+        (Some(placed), false)
+    );
+}
+
+/// A claimant Claude Code's background service runs is a `claude --bg` job;
+/// with no job record for its conversation, the job's tree is unknown, and its
+/// 429 lands on no one rather than on the global active its record's place
+/// would name. The control: a claimant the service does not run, its record in
+/// the same place, lands on the active.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_claimant_with_no_job_record_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-plain", "conv-bg"]);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let record = |pid: u32, conv: &str| {
+        std::fs::write(
+            sessions.join(format!("{pid}.json")),
+            serde_json::json!({
+                "sessionId": conv,
+                "pid": pid,
+                "procStart": crate::testutil::proc_start_of(pid).expect("the process's start"),
+                "startedAt": crate::usage::now_ms() - 60_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let plain = LiveChild::spawn();
+    record(plain.pid(), "conv-plain");
+    active_seen_long_ago(&config);
+    append_and_tail(&home, "conv-plain", &[spend_cap_row(1_000)]);
+    scan_sessions(&config, &store, &status);
+    let placed = refusal_on("a")
+        .expect("control: a claimant the service does not run lands on the active")
+        .at_ms;
+    let (mut service, job_pid) = stand_in_service();
+    record(job_pid, "conv-bg");
+    append_and_tail(&home, "conv-bg", &[spend_cap_row(500)]);
+    scan_sessions(&config, &store, &status);
+    let _ = service.kill();
+    let _ = service.wait();
+    assert_eq!(
+        (refusal_on("a").map(|r| r.at_ms), refusal_on("b").is_some()),
+        (Some(placed), false)
+    );
+}
+
+/// A plain `claude --bg` on `~/.claude` names its conversation in its job
+/// record and no tree. Its process runs under the service like any job's, and
+/// its 429 lands on the global active it reads, as a bare session's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_429_from_a_plain_bg_job_on_the_global_tree_lands_on_the_active() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (mut service, job_pid) = stand_in_service();
+    let job =
+        crate::testutil::write_claude_job(home.home(), "7b2c4d5e", &home.home().join(".claude"));
+    let state = job.join("state.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove("providerEnv")
+        .expect("the record names a config dir before");
+    std::fs::write(&state, serde_json::to_vec(&record).unwrap()).unwrap();
+    let conv = record["sessionId"].as_str().unwrap().to_string();
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{job_pid}.json")),
+        serde_json::json!({
+            "sessionId": conv,
+            "pid": job_pid,
+            "procStart": crate::testutil::proc_start_of(job_pid).expect("the job's start"),
+            "startedAt": crate::usage::now_ms() - 60_000,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    active_seen_long_ago(&config);
+    append_and_tail(&home, &conv, &[spend_cap_row(1_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (true, false)
+    );
+}
+
+/// The global active is read off `~/.tollgate/profiles.toml` at the drain:
+/// another process's switch reaches this process's config only later, and a
+/// 429 from a session that runs on the new account lands on it, never on the
+/// old one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_refusal_lands_on_the_active_profiles_toml_names() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    assert_eq!(
+        config.lock().unwrap().state.active_profile.as_deref(),
+        Some("a"),
+        "fixture control: this process's config names a"
+    );
+    let mut on_disk = crate::profile::load_app_state().expect("profiles.toml");
+    on_disk.active_profile = Some("b".into());
+    crate::profile::save_app_state(&on_disk).expect("another process's switch");
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 600_000));
+    });
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-s",
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, true)
+    );
+}
+
+/// A session scan whose tick saw a flock wait time out records no refusal: the
+/// record's hold shares the tick's `timed_out` flag and skips the flock. The
+/// control: a later 429 drained by a scan with the flag down goes on record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_scan_after_a_timed_out_flock_wait_records_no_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-f",
+        &child,
+        Some(crate::usage::now_ms() - 300_000),
+    );
+    active_seen_long_ago(&config);
+    let scan = |timed_out: bool| {
+        let flag = std::sync::atomic::AtomicBool::new(timed_out);
+        super::scan_session_switches(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            Some(&flag),
+        );
+    };
+    append_and_tail(&home, "conv-f", &[spend_cap_row(120_000)]);
+    scan(true);
+    assert!(
+        refusal_on("a").is_none(),
+        "the timed-out tick recorded nothing"
+    );
+    append_and_tail(&home, "conv-f", &[spend_cap_row(60_000)]);
+    scan(false);
+    assert!(
+        refusal_on("a").is_some(),
+        "control: with the flag down the next 429 goes on record"
+    );
+}
+
+/// A clear floors the record at the later of the refusal's instant and the
+/// clearing turn's stamp: a second refusal stamped between the two and drained
+/// a tick after the clear is disproved by the same turn and never recorded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_stamped_before_the_clearing_turn_is_not_recorded_after_the_clear() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-x", "conv-y", "conv-z"]);
+    let now = crate::usage::now_ms();
+    let first = LiveChild::spawn();
+    refuse_bare_session_with(
+        &home,
+        &first,
+        "conv-x",
+        &[spend_cap_row_at(now - 3_000)],
+        &config,
+        &store,
+        &status,
+    );
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused conv-x"
+    );
+    let second = LiveChild::spawn();
+    let started = Some(now - 60_000);
+    seed_bare_session_record(&home, "conv-y", &second, started);
+    append_and_tail(
+        &home,
+        "conv-y",
+        &[served_row_on_at(now - 1_000, "msg_y", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the turn cleared it"
+    );
+    let third = LiveChild::spawn();
+    seed_bare_session_record(&home, "conv-z", &third, started);
+    append_and_tail(&home, "conv-z", &[spend_cap_row_at(now - 2_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none());
+}
+
+/// Whether a's refusal stands after one drain that carries a bare session's
+/// 429 and, `with_turn`, a later turn of another bare session on `a`. Each
+/// call runs on a fresh producer, so a test may call it twice.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_one_drain(with_turn: bool) -> bool {
+    on_a_fresh_producer(|| {
+        let home = crate::testutil::HomeSandbox::new();
+        let config = session_config_models(&["a", "b"], &[], &[]);
+        let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+        let status = all_fresh(&["a", "b"]);
+        seed_transcripts(&home, &["conv-x", "conv-y"]);
+        let first = LiveChild::spawn();
+        let second = LiveChild::spawn();
+        let started = Some(crate::usage::now_ms() - 60_000);
+        seed_bare_session_record(&home, "conv-x", &first, started);
+        seed_bare_session_record(&home, "conv-y", &second, started);
+        active_seen_long_ago(&config);
+        append_and_tail(&home, "conv-x", &[spend_cap_row(2_000)]);
+        if with_turn {
+            append_and_tail(
+                &home,
+                "conv-y",
+                &[served_row_on(0, "msg_y", "claude-fable-5")],
+            );
+        }
+        scan_sessions(&config, &store, &status);
+        refusal_on("a").is_some()
+    })
+}
+
+/// A plan-covered turn elsewhere on the member clears the refusal too: the
+/// member serves again, and a wrong clear costs one more refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_plan_covered_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
+        "claude-opus-4",
+        0
+    ));
+}
+
+/// So does a turn in another session on a model tollgate cannot place.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unplaceable_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
+        "mystery-model",
+        0
+    ));
+}
+
+/// A turn on a model Claude Code bills against usage credits proves they serve
+/// again, wherever it lands on the member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_credit_billed_turn_in_another_session_clears_a_refusal() {
+    assert!(!refused_after_a_turn_in_another_bare_session(
+        "claude-fable-5",
+        0
+    ));
+}
+
+/// Two transcripts share no line order, so only the stamps order a turn in
+/// another session against the refusal: a credit-billed turn there stamped
+/// before the 429 proves nothing, and the refusal stands.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_credit_billed_turn_in_another_session_stamped_before_the_refusal_leaves_it() {
+    assert!(refused_after_a_turn_in_another_bare_session(
+        "claude-fable-5",
+        3_000
+    ));
+}
+
+/// Whether a's refusal stands after one drain of a bare session's 429 and,
+/// `with_turn`, a later successful credit-billed turn in the same file. Each
+/// call runs on a fresh producer with its own sandbox, so a test may call it
+/// twice.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused_after_a_bare_drain(with_turn: bool) -> bool {
+    on_a_fresh_producer(|| {
+        let home = crate::testutil::HomeSandbox::new();
+        let config = session_config_models(&["a", "b"], &[], &[]);
+        let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+        let status = all_fresh(&["a", "b"]);
+        let child = LiveChild::spawn();
+        seed_bare_session_record(
+            &home,
+            "conv-o",
+            &child,
+            Some(crate::usage::now_ms() - 300_000),
+        );
+        active_seen_long_ago(&config);
+        let mut rows = vec![spend_cap_row(120_000)];
+        if with_turn {
+            rows.push(served_row_on(60_000, "msg_ok", "claude-fable-5"));
+        }
+        append_and_tail(&home, "conv-o", &rows);
+        scan_sessions(&config, &store, &status);
+        refusal_on("a").is_some()
+    })
+}
+
+/// A refusal past the grace and a successful credit-billed turn after it in
+/// the same file, drained at once, leave no refusal: the turn shows the member
+/// serves the session again. The control: the refusal drained alone, on its
+/// own producer and sandbox, goes on record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_refusal_and_a_later_turn_in_one_drain_leave_no_refusal() {
+    assert!(
+        refused_after_a_bare_drain(false),
+        "control: the refusal alone goes on record"
+    );
+    assert!(!refused_after_a_bare_drain(true));
+}
+
+/// A refusal from before these scans first saw the global active, plus the
+/// grace, lands on no one: a fresh lease holder reads hot transcripts whole, and
+/// an old refusal may have answered an account active before it started. One
+/// past that grace is the active's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bare_429_from_before_the_first_scan_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    seed_bare_session_record(
+        &home,
+        "conv-c",
+        &child,
+        Some(crate::usage::now_ms() - 120_000),
+    );
+    append_and_tail(&home, "conv-c", &[spend_cap_row(60_000)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_none(), "drained on the first scan");
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((Some("a".into()), crate::usage::now_ms() - 40_000));
+    });
+    append_and_tail(&home, "conv-c", &[spend_cap_row(0)]);
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some(), "past the first scan's grace");
+}
+
+/// Where a 429 lands from the `tollgate start` child of a session now on `b`,
+/// which swapped there `swapped_ago_ms` back and, `reads_a`, still reads `a`'s
+/// store. Returns whether `b` and `a` carry a refusal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refusals_after_a_429_on_a_swapped_session(swapped_ago_ms: u64, reads_a: bool) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("8470-0", "a");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - swapped_ago_ms);
+    if reads_a {
+        row.launch_store = Some(
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+                .expect("a's profile dir")
+                .join("credentials.json"),
+        );
+    }
+    let _marker = register_live_row(&row);
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-s",
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A 429 past the grace of the session's last swap is its member's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_past_a_sessions_swap_grace_lands_on_its_member() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(60_000, false),
+        (true, false)
+    );
+}
+
+/// One inside it may answer a request in flight across the swap, so it lands
+/// on no one, as the latch reads it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_inside_a_sessions_swap_grace_lands_on_no_one() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(5_000, false),
+        (false, false)
+    );
+}
+
+/// One while the session still reads the outgoing member's store answered
+/// that member's credentials, not the new member's: it lands on no one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_while_a_session_reads_the_outgoing_store_lands_on_no_one() {
+    assert_eq!(
+        refusals_after_a_429_on_a_swapped_session(60_000, true),
+        (false, false)
+    );
+}
+
+/// A turn clears a refusal only on the member it was served on: the same bare
+/// session, served on a credit-billed model in the file of the 429 once the
+/// global account is on `b`, says nothing about `a`'s credits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_turn_served_on_another_member_leaves_a_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    refuse_bare_session(&home, &child, "conv-m", &config, &store, &status);
+    assert!(
+        refusal_on("a").is_some(),
+        "fixture control: a refused the session"
+    );
+    switch_global_active(&config, "b");
+    super::GLOBAL_ACTIVE_SEEN.with(|seen| {
+        *seen.borrow_mut() = Some((Some("b".into()), crate::usage::now_ms() - 600_000));
+    });
+    append_and_tail(
+        &home,
+        "conv-m",
+        &[served_row_on(0, "msg_b", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(refusal_on("a").is_some());
+}
+
+/// A re-login drops the old login's refusal, and the lease holder that takes
+/// over next does not bring it back: it re-reads the hot transcripts whole,
+/// and the refused session still runs on its row, but the drop left a floor
+/// no refusal from before it passes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_a_relogin_dropped_stays_dropped_for_the_next_holder() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let child = LiveChild::spawn();
+    let mut row = session_row("8492-0", "b");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    let _marker = register_live_row(&row);
+    refuse_bare_session(&home, &child, "conv-r", &config, &store, &status);
+    assert!(
+        refusal_on("b").is_some(),
+        "fixture control: b refused the session"
+    );
+    let b = crate::profile::ProfileName::from("b");
+    let next_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    crate::profile_cache::remove_profile_cache(&b, crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    next_holder();
+    assert!(
+        refusal_on("b").is_some(),
+        "control: with no floor on record the next holder places the re-read 429 again"
+    );
+    crate::usage::forget_account_disk(&b);
+    assert!(refusal_on("b").is_none(), "the re-login dropped it");
+    next_holder();
+    assert!(refusal_on("b").is_none());
+    drop(child);
+}
+
+/// A refusal a later credit-billed turn cleared stays cleared for the lease
+/// holder that takes over next: it re-reads the hot transcripts whole and the
+/// refused session still runs on its row, but the session whose turn cleared
+/// it has ended, so nothing in that read clears it again, and the floor keeps
+/// the 429 it re-reads off the record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refusal_a_turn_disproved_stays_cleared_for_the_next_holder() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = session_store(&[("a", 10.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    seed_transcripts(&home, &["conv-r", "conv-p"]);
+    let child = LiveChild::spawn();
+    let now = crate::usage::now_ms();
+    let mut row = session_row("8493-0", "b");
+    row.follows_chain = false;
+    row.claude_pid = Some(child.pid());
+    let _marker = register_live_row(&row);
+    refuse_bare_session_at(&home, &child, "conv-r", now, &config, &store, &status);
+    assert!(
+        refusal_on("b").is_some(),
+        "fixture control: b refused the session"
+    );
+    let prover = LiveChild::spawn();
+    let mut prover_row = session_row("8494-0", "b");
+    prover_row.follows_chain = false;
+    prover_row.claude_pid = Some(prover.pid());
+    let prover_marker = register_live_row(&prover_row);
+    seed_bare_session_record(&home, "conv-p", &prover, Some(now - 60_000));
+    append_and_tail(
+        &home,
+        "conv-p",
+        &[served_row_on_at(now, "msg_p", "claude-fable-5")],
+    );
+    scan_sessions(&config, &store, &status);
+    assert!(
+        refusal_on("b").is_none(),
+        "fixture control: the credit-billed turn cleared it"
+    );
+    drop(prover);
+    drop(prover_marker);
+    crate::live_sessions::unregister("8494-0").expect("unregister");
+    let next_holder = || {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tail_transcripts();
+                scan_sessions(&config, &store, &status);
+            });
+        });
+    };
+    let record = crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+        .expect("b's dir")
+        .join(crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE);
+    let cleared = std::fs::read(&record).expect("the cleared record");
+    std::fs::remove_file(&record).expect("drop the record");
+    next_holder();
+    assert!(
+        refusal_on("b").is_some(),
+        "control: with no floor on record the next holder places the re-read 429 again"
+    );
+    std::fs::write(&record, &cleared).expect("restore the cleared record");
+    next_holder();
+    assert!(
+        refusal_on("b").is_none(),
+        "the re-read 429 is no refusal again"
+    );
+    drop(child);
+}
+
+/// A record that carries only the floor a re-login left is no refusal to any
+/// reader: the walks, `tollgate start --auto`, the TUI's mirror and the scan that
+/// decides whether to read turns all see none, and a refusal from after the
+/// floor still lands. A clear floors the record at the later of the refusal it
+/// cleared and the clearing turn's stamp, and keeps a higher floor.
+#[test]
+fn a_floor_alone_is_no_refusal_and_a_later_refusal_still_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let now = crate::usage::now_ms();
+    crate::profile_cache::forget_credit_refusal(&name, now);
+    assert!(crate::profile_cache::credit_refusal(&name).is_none());
+    let snapshot = crate::fallback::snapshot_chain(&config.lock().unwrap(), &HashSet::new())
+        .expect("the chain snapshot");
+    assert!(crate::fallback::credit_refused_members(&snapshot).is_empty());
+    assert!(!super::any_credit_refusal(&config));
+    let mut watch = crate::profile_cache::CreditRefusalWatch::default();
+    assert!(watch.refresh(std::slice::from_ref(&name)).is_empty());
+    assert!(watch.refusals().is_empty());
+
+    let refusal = |at_ms| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+        uuid: None,
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now - 1_000));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a refusal from before the floor answered the old login"
+    );
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 1_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(now + 1_000))
+    );
+    crate::profile_cache::clear_credit_refusal(&name, now + 1_000);
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 1_000));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "the refusal a turn disproved never lands again"
+    );
+    crate::profile_cache::clear_credit_refusal(&name, now);
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 500));
+    assert!(
+        crate::profile_cache::credit_refusal(&name).is_none(),
+        "a clear keeps a higher floor"
+    );
+    crate::profile_cache::write_credit_refusal(&name, &refusal(now + 2_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(now + 2_000)),
+        "a refusal after the cleared one still lands"
+    );
+}
+
+/// Two sessions refused on one member keep the later 429: an older refusal
+/// drained late moves neither the record's instant nor its transcript back.
+#[test]
+fn a_later_refusal_on_record_outlasts_an_older_one_drained_late() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let refusal = |at_ms, file: &str| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from(file),
+        uuid: None,
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(2_000, "/p/new.jsonl"));
+    crate::profile_cache::write_credit_refusal(&name, &refusal(1_000, "/p/old.jsonl"));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(2_000, "/p/new.jsonl"))
+    );
+}
+
+/// A drain reads the refusal on record, another session records a later one,
+/// then the drain clears the one it read on a turn between the two: the
+/// clear's floor lies before the later refusal, which stays on record. The
+/// control: a clear floored at its instant drops it.
+#[test]
+fn a_clear_leaves_a_refusal_recorded_past_its_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["b"], &[], &[]);
+    let name = crate::profile::ProfileName::from("b");
+    let refusal = |at_ms| crate::profile_cache::CreditRefusal {
+        at_ms,
+        file: std::path::PathBuf::from("/p/conv.jsonl"),
+        uuid: None,
+    };
+    crate::profile_cache::write_credit_refusal(&name, &refusal(1_000));
+    let read = crate::profile_cache::credit_refusal(&name)
+        .expect("fixture control: the refusal the drain reads");
+    crate::profile_cache::write_credit_refusal(&name, &refusal(3_000));
+    crate::profile_cache::clear_credit_refusal(&name, read.at_ms.max(2_000));
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        Some(refusal(3_000))
+    );
+    crate::profile_cache::clear_credit_refusal(&name, 3_000);
+    assert_eq!(
+        crate::profile_cache::credit_refusal(&name),
+        None,
+        "control: a clear floored at its instant drops it"
+    );
+}
+
+/// A job store tollgate cannot read may hold the job a 429 came from, so the
+/// 429 lands on no one rather than on the global active its process's record
+/// would otherwise name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_429_beside_an_unreadable_job_store_lands_on_no_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let job = home.home().join(".claude/jobs/0badf00d");
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::write(job.join("state.json"), "not json").unwrap();
+    let child = LiveChild::spawn();
+    refuse_bare_session(
+        &home,
+        &child,
+        "conv-u",
+        &session_config_models(&["a", "b"], &[], &[]),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        (refusal_on("a").is_some(), refusal_on("b").is_some()),
+        (false, false)
+    );
+}
+
+/// Break `home`'s Claude Code job store: a job dir whose `state.json` does not
+/// parse leaves every conversation's tree unknown.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn break_job_store(home: &crate::testutil::HomeSandbox) {
+    let job = home.home().join(".claude/jobs/0badf00d");
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::write(job.join("state.json"), "not json").unwrap();
+}
+
+/// With no live claimant, a store tollgate cannot read stops none of the stages
+/// after the job's: a 429 still in an isolated tree lands on the tree's
+/// profile.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_isolated_429_beside_an_unreadable_job_store_lands_on_the_trees_profile() {
+    let home = crate::testutil::HomeSandbox::new();
+    break_job_store(&home);
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let at = crate::usage::now_ms() - 1_000;
+    let _tree = isolated_tree_with("b", "9114-0", "conv-iso", &[spend_cap_row_at(at)]);
+    active_seen_long_ago(&config);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(refusal_on("b").map(|r| r.at_ms), Some(at));
+    assert!(refusal_on("a").is_none());
+}
+
+/// The refusals, as `(on b, on a)`, after a 429 in a `claude --bg` job's
+/// conversation that no live process claims: the background row on `b` reads
+/// the job's tree, and its `claude` is the job's process under Claude Code's
+/// service, whose record names the conversation but no longer matches it.
+/// `unreadable` breaks the job store beside the job's record.
+#[cfg(target_os = "linux")]
+fn refusals_after_an_unclaimed_bg_jobs_429(unreadable: bool) -> (bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let (mut service, claude) = stand_in_service();
+    let (conv, _marker) = seed_background_job_with(&home, true, Some(claude));
+    if unreadable {
+        break_job_store(&home);
+    }
+    let sessions = crate::runtime::background_runtime_tree(&crate::profile::ProfileName::from("b"))
+        .expect("b's background tree")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{claude}.json")),
+        serde_json::json!({ "sessionId": conv, "pid": claude, "procStart": "1" }).to_string(),
+    )
+    .unwrap();
+    active_seen_long_ago(&config);
+    append_and_tail(&home, &conv, &[spend_cap_row(2_000)]);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    let _ = service.kill();
+    let _ = service.wait();
+    (refusal_on("b").is_some(), refusal_on("a").is_some())
+}
+
+/// A readable store names the job's tree, and the 429 lands on the member of
+/// the row reading it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unclaimed_bg_jobs_429_lands_on_the_row_reading_its_tree() {
+    assert_eq!(
+        refusals_after_an_unclaimed_bg_jobs_429(false),
+        (true, false)
+    );
+}
+
+/// A store tollgate cannot read names no job's tree, and the stages after it
+/// place no `claude --bg` job: its tree is no isolated one, and the row join
+/// admits no `claude` Claude Code's service runs. The job's 429 lands on no
+/// one. The control, on a producer of its own: with the store readable, the
+/// same job's 429 lands on the member of the row reading its tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unclaimed_bg_jobs_429_beside_an_unreadable_job_store_joins_no_row() {
+    assert_eq!(
+        on_a_fresh_producer(|| refusals_after_an_unclaimed_bg_jobs_429(false)),
+        (true, false),
+        "control: a readable store places it"
+    );
+    assert_eq!(
+        refusals_after_an_unclaimed_bg_jobs_429(true),
+        (false, false)
+    );
+}
+
+/// The OAuth half's forget alone keeps a credit refusal, since a change of the
+/// half may be the same account; a plan that moves the half to another account,
+/// whose credits may not be spent, drops it with the kick block.
+#[test]
+fn only_a_forget_for_another_account_drops_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config = session_config_models(&["a"], &[], &[]);
+    let name = crate::profile::ProfileName::from("a");
+    record_refusal("a", 60_000);
+    assert!(refusal_on("a").is_some(), "fixture control");
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    assert!(refusal_on("a").is_some(), "the half alone keeps it");
+    crate::usage::forget_disk_plan(
+        &name,
+        crate::usage::ForgetPlan {
+            oauth: true,
+            oauth_account: true,
+            ..crate::usage::ForgetPlan::default()
+        },
+    );
+    assert!(refusal_on("a").is_none(), "another account drops it");
+}
+
+/// A session whose demand is known and plan-covered still comes home to a
+/// member on record as refusing a credit-billed request: an account whose
+/// credits are spent serves what the plan covers.
+#[test]
+fn a_plan_covered_session_comes_home_to_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let _marker = register_live_row(&row_on("b", "opus"));
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// A session launched on models the plan covers that was itself refused for
+/// credits has shown its demand needs them, a model switched mid-session say:
+/// a member on record as refusing a credit-billed request is no target for it.
+/// The control: a session on the same models that was never refused comes
+/// home to it in the same scan.
+#[test]
+fn a_plan_covered_session_refused_for_credits_stays_off_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let row = row_on("b", "opus");
+    super::SPEND_CAP_CREDIT_SEEN.with(|seen| {
+        seen.borrow_mut()
+            .insert(row.session_id.clone(), row.started_at);
+    });
+    let _marker = register_live_row(&row);
+    let mut unrefused = row_on("b", "opus");
+    unrefused.session_id = "4243-0".to_string();
+    let _unrefused_marker = register_live_row(&unrefused);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4243-0"),
+        (Some("a".to_string()), Some(0)),
+        "control: a session never refused comes home"
+    );
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// The skip holds while the session's credit demand does: a session whose
+/// launch names no credit-billed family and that was never refused for credits
+/// comes home to a member on record as refusing them.
+#[test]
+fn a_session_with_no_credit_demand_comes_home_to_a_member_with_a_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    record_refusal("a", 60_000);
+    let mut row = row_on("b", "opus");
+    row.launch_families = None;
+    let _marker = register_live_row(&row);
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// Drop what the scheduler remembers of each session's credit event, as a
+/// restart or a lease handover drops it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forget_the_sessions_credit_events() {
+    super::SPEND_CAP_LATCH.with(|l| l.borrow_mut().clear());
+    super::SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow_mut().clear());
+}
+
+/// The base swing again, a fable session on its measured home `a` that Claude
+/// Code refuses while `a`'s reading shows no credit block, with the
+/// scheduler's memory of the session dropped after every scan, as a restart or
+/// a lease handover drops it. The moves over six scans.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn moves_off_a_home_that_refuses_credit_across_handovers() -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let child = LiveChild::spawn();
+    let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
+    let store = credit_store(&["a", "b"], &[]);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8150-0", "a");
+    row.claude_pid = Some(child.pid());
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8150-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_live_session_record(&home, "conv-a", child.pid());
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
+        }
+        scan_sessions(&config, &store, &status);
+        if let Some(target) = decision_of("8150-0").0.filter(|t| *t != on) {
+            execute_move("8150-0", &target);
+            on = target;
+            moves += 1;
+        }
+        forget_the_sessions_credit_events();
+    }
+    moves
+}
+
+/// The refusal on record, not the scheduler's memory, keeps every later home
+/// pass off `a`: the session moves once.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_measured_home_that_refuses_credit_moves_the_session_once_across_handovers() {
+    assert_eq!(moves_off_a_home_that_refuses_credit_across_handovers(), 1);
+}
+
+#[test]
+fn an_opus_session_stays_on_an_account_whose_credit_cap_is_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["opus".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "opus bills the subscription; a spent credit cap never stops it"
+    );
+}
+
+/// A credit-cap leave may land on a member whose `[models]` differ (cloudy,
+/// 2026-10-20, F7): a swap moves credentials only, so the session keeps running
+/// fable on `b`, whose cap is clear.
+#[test]
+fn a_credit_cap_leave_lands_on_a_member_whose_models_differ() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    row.credit_leave_aware = true;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// A credit leave's relaxed member is judged fresh like any other: with a, b, c
+/// all fresh and clear and b differing only on `[models]`, the leave takes the
+/// FIRST eligible member in chain order — b, not the later models-equal c.
+#[test]
+fn a_credit_leave_takes_the_first_relaxed_member_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    row.credit_leave_aware = true;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// A row the launcher did not mark credit-leave-aware keeps the strict chain:
+/// the daemon never writes a relaxed intent for a session whose older binary
+/// would refuse it, so the models-equal `c` is the target, not the differing
+/// `b`.
+#[test]
+fn a_row_without_the_credit_leave_flag_keeps_the_strict_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    // `credit_leave_aware` stays false: an older launcher's row.
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("c".to_string()), Some(2)));
+}
+
+/// Every other leave keeps the models-equal rule: an exhausted window moves a
+/// session only onto a member whose `[models]` match its launch.
+#[test]
+fn an_exhaustion_leave_never_lands_on_a_member_whose_models_differ() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable"), ("b", "opus")], &[]),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits: a fable session there stays put on a spent cap.
+#[test]
+fn a_fable_session_stays_on_a_capped_account_serving_its_own_endpoint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        // Both members share the endpoint, so `b` stays a swap-eligible
+        // target: only the exemption keeps the session on `a`.
+        let mut cfg = config.lock().unwrap();
+        for p in &mut cfg.profiles {
+            p.env.insert(
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "http://127.0.0.1:9".to_owned(),
+            );
+            p.env
+                .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+            assert!(
+                crate::claude::has_own_inference_endpoint(p),
+                "fixture control: {} serves from its own endpoint",
+                p.name
+            );
+        }
+    }
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// No `[models] default`: tollgate cannot tell the session's model, so the cap
+/// alone moves nothing; only the session's own 429 row does.
+#[test]
+fn a_session_with_no_known_model_stays_until_its_own_spend_cap_429() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+// ── trigger b: the session's own spend-cap 429 row ──────────────────────────
+
+/// The child's `sessions/<pid>.json` record, naming the conversation id the
+/// transcript stem keys on — trigger b's join reads this, never the account.
+fn seed_session_record(home: &crate::testutil::HomeSandbox, conv: &str, child_pid: u32) {
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{child_pid}.json")),
+        serde_json::json!({ "sessionId": conv, "pid": child_pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A session record for a live child whose `procStart` carries that process's
+/// real field-22 start, so the ambiguity scan's identity compare (linux) counts
+/// it as the process it names. On non-linux unix the scan compares liveness
+/// only, so the plain record is equivalent.
+#[cfg(unix)]
+fn seed_live_session_record(home: &crate::testutil::HomeSandbox, conv: &str, child_pid: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let start = crate::testutil::proc_start_of(child_pid).expect("live child start");
+        let sessions = home.home().join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{child_pid}.json")),
+            serde_json::json!({ "sessionId": conv, "pid": child_pid, "procStart": start })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        seed_session_record(home, conv, child_pid);
+    }
+}
+
+/// The measured spend-cap 429 row at exactly `ms` epoch ms.
+fn spend_cap_row_at(ms: u64) -> String {
+    let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": ts,
+        "isApiErrorMessage": true,
+        "error": "rate_limit",
+        "apiError": "model_requires_usage_credits",
+        "message": {"model": "<synthetic>", "role": "assistant"},
+    })
+    .to_string()
+}
+
+/// The measured spend-cap 429 row: `timestamp`, `isApiErrorMessage`, `error`,
+/// `apiError`, `message.model == "<synthetic>"`. `ms_ago` ages the fact so a
+/// stale-row test can age it out.
+fn spend_cap_row(ms_ago: u64) -> String {
+    spend_cap_row_at(crate::usage::now_ms().saturating_sub(ms_ago))
+}
+
+/// A transcript holding the spend-cap 429 row (conversation id = its stem).
+fn seed_spend_cap_transcript(home: &crate::testutil::HomeSandbox, conv: &str) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{conv}.jsonl")),
+        format!("{}\n", spend_cap_row(0)),
+    )
+    .unwrap();
+}
+
+/// A transcript whose 429 is HISTORY: the spend-cap row two hours ago, then a
+/// successful turn an hour ago. A cold-start reread latches the 429, then the
+/// drained same-file success drops the latch in the same scan; the session does
+/// not move.
+fn seed_history(home: &crate::testutil::HomeSandbox, conv: &str) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cap = spend_cap_row(7_200_000);
+    let ok_ts = {
+        let ms = crate::usage::now_ms().saturating_sub(3_600_000);
+        chrono::DateTime::from_timestamp_millis(ms as i64)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let ok = serde_json::json!({
+        "type": "assistant",
+        "timestamp": ok_ts,
+        "message": {"id": "msg_ok", "model": "claude-opus-4", "role": "assistant",
+            "usage": {"input_tokens": 10, "output_tokens": 500}},
+    })
+    .to_string();
+    std::fs::write(proj.join(format!("{conv}.jsonl")), format!("{cap}\n{ok}\n")).unwrap();
+}
+
+/// Run the tps tailer once so the spend-cap row lands in the producer's drain
+/// set, exactly as a lease-holder tick would before the scan consumes it.
+fn tail_transcripts() {
+    super::tps_producer_tick(crate::usage::now_ms());
+}
+
+/// A live OS process whose pid a session record can be seeded under, so the
+/// ambiguity scan counts it as a second live claimant on a conversation (seed
+/// it with [`seed_live_session_record`] so the linux start compare matches).
+/// Unix-only: a `sleep` child, and the scan's check is false off linux and
+/// macOS by design, so the scan there finds nothing ambiguous (the accepted
+/// degraded case).
+#[cfg(unix)]
+struct LiveChild(std::process::Child);
+
+#[cfg(unix)]
+impl LiveChild {
+    /// The child carries no login of its own, whatever the test run's
+    /// environment holds: one would keep its refusals off the global active.
+    fn spawn() -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .spawn()
+            .expect("spawn a live claude child");
+        let live = Self(child);
+        live.await_exec();
+        live
+    }
+
+    /// [`LiveChild::spawn`] with `key` set to `value` in its environment.
+    fn spawn_with_env(key: &str, value: &str) -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .env(key, value)
+            .spawn()
+            .expect("spawn a live claude child");
+        let live = Self(child);
+        live.await_exec();
+        live
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// `spawn` can return before the child's exec: until then it shows the
+    /// test's own argv and environment, and mid-exec an empty environment;
+    /// either passes for a process with no login of its own. Wait until the
+    /// `sleep` image is in place; the deadline turns a child that never gets
+    /// there into a loud failure instead of a hang.
+    fn await_exec(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.exec_done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {} never finished its exec",
+                self.pid()
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// The `sleep` image is in place: its argv0 is `sleep` and its environ
+    /// reads non-empty.
+    #[cfg(target_os = "linux")]
+    fn exec_done(&self) -> bool {
+        let pid = self.pid();
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|argv| argv.split(|b| *b == 0).next() == Some(b"sleep".as_slice()))
+            && crate::runtime::process_environ(pid).is_some_and(|env| !env.is_empty())
+    }
+
+    /// Off linux the environ reader is the only probe: an unreadable environ
+    /// ends the wait, an empty one keeps it going.
+    #[cfg(not(target_os = "linux"))]
+    fn exec_done(&self) -> bool {
+        crate::runtime::process_environ(self.pid()).is_none_or(|env| !env.is_empty())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LiveChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_session_moves_on_its_own_spend_cap_429_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session's own 429 joins through the child pid, not the account"
+    );
+}
+
+#[test]
+fn a_429_in_a_different_conversation_does_not_move_the_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    // The child's record names `conv-a`; the 429 lands in another conversation.
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-other");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 must join THIS session's conversation, never the account"
+    );
+}
+
+#[test]
+fn a_row_without_a_child_pid_ignores_429s() {
+    let home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    assert!(row.claude_pid.is_none(), "fixture: no recorded child pid");
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an unjoined row moves on trigger a only"
+    );
+}
+
+#[test]
+fn a_credit_billed_launch_does_not_move_on_a_stale_cap_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    // `a`'s reading is Cached, not Fresh: trigger a joins the freshness gate.
+    let status: super::StatusStore = Arc::new(RankedMutex::new(
+        [
+            ("a".to_string(), super::FetchStatus::Cached),
+            ("b".to_string(), super::FetchStatus::Fresh),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &status,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a stale cap reading may be last month's; trigger a must not fire on it"
+    );
+}
+
+#[test]
+fn a_429_latched_while_no_target_exists_moves_once_a_member_frees() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // Every member's cap is spent: the walk has no target, so the tick must not
+    // drop the fact.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "no moveable target yet"
+    );
+
+    // `b`'s cap clears; the latched 429 must now land the move.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the latch holds the 429 past the tick that had no target"
+    );
+}
+
+/// A `--model fable` passthrough on a member with no `[models] default` is a
+/// credit-billed launch demand: the row records fable, so trigger a moves.
+#[test]
+fn a_fable_passthrough_launch_moves_off_a_capped_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a credit-billed passthrough launch moves at once, like a known start demand"
+    );
+}
+
+/// Trigger b bypasses the freshness gate: the 429 row is direct evidence, so a
+/// `Cached` reading of the member still moves.
+#[test]
+fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    let status: super::StatusStore = Arc::new(RankedMutex::new(
+        [
+            ("a".to_string(), super::FetchStatus::Cached),
+            ("b".to_string(), super::FetchStatus::Fresh),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &status,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the 429 row is direct evidence; a Cached reading does not gate it"
+    );
+}
+
+/// A latched 429 must not re-fire after the session moves: latch on `a` with no
+/// target, then the member changes to `b`, and the next scan must not move the
+/// session off `b`.
+#[test]
+fn a_latched_429_does_not_re_fire_after_the_member_changes() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // Every member's cap is spent: the 429 latches under `a`, with no target.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b", "c"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "no moveable target yet"
+    );
+
+    // The session swaps to `b`.
+    crate::live_sessions::update_as_session("4242-0", |f| f.set_current_member("b".to_string()))
+        .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    // Only `a` stays capped: the 429 was for the stint on `a`, and must not
+    // move the session off `b` toward `c`.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a latched 429 must not re-fire after a member change"
+    );
+}
+
+/// A cold-start reread of the whole transcript must not move a session off a
+/// healthy member: the 429 (from an earlier stint) is followed by a successful
+/// turn, so it is history.
+#[test]
+fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_history(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 from the session's stint on `a` must not move it off healthy `b`"
+    );
+}
+
+/// A 429 followed by a successful turn on an uncapped member is history: the
+/// session recovered, so the fact must not latch.
+#[test]
+fn a_429_followed_by_a_successful_turn_is_history() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_history(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// Two capped members with their credit gates off: a fable session must not hop
+/// between them every tick. A credit-forced leave excludes every capped member
+/// as a target whatever the gate.
+#[test]
+fn a_fable_session_does_not_hop_between_two_capped_gate_off_members() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut r1 = session_row("4242-0", "a");
+    r1.launch_families = Some(vec!["fable".to_string()]);
+    let mut r2 = session_row("4243-0", "b");
+    r2.launch_families = Some(vec!["fable".to_string()]);
+    let _m1 = register_live_row(&r1);
+    let _m2 = register_live_row(&r2);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &["a", "b"]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        (decision_of("4242-0"), decision_of("4243-0")),
+        ((None, None), (None, None)),
+        "a fable session must not hop between two capped members"
+    );
+}
+
+/// The globally active profile `x` (not in the chain) pins `ANTHROPIC_MODEL`
+/// fable in its `[env]`, so the shared `~/.claude/settings.json` carries it. A
+/// `tollgate start a` session strips `x`'s keys (`outgoing_env_keys`) and runs
+/// opus, so the row records opus — the daemon must not read fable off the
+/// outgoing profile's env.
+#[test]
+fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).unwrap();
+    std::fs::write(
+        home.home().join(".claude/settings.json"),
+        r#"{"env":{"ANTHROPIC_MODEL":"fable"}}"#,
+    )
+    .unwrap();
+    let mk = |n: &str| {
+        let mut p = Profile::new(n.to_string(), None, None);
+        p.credentials = Some(crate::testutil::oauth_pair(n));
+        p.models.default = Some("opus".to_string());
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let mut x = Profile::new("x".to_string(), None, None);
+    x.env
+        .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("x".into()),
+            profiles: vec!["a".into(), "b".into(), "x".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![mk("a"), mk("b"), x],
+    }));
+    // Control: the real launch strips x's keys, so its demand is opus alone.
+    let stale = crate::actions::outgoing_env_keys(&config.lock().unwrap());
+    let launch = crate::fallback::demand_from(crate::start::member_launch_models(
+        config.lock().unwrap().find(&"a".into()).unwrap(),
+        crate::runtime::Isolation::Shared,
+        &stale,
+        &[],
+        None,
+        crate::start::EnvLeg::Process,
+        None,
+        |_| None,
+    ));
+    assert_eq!(
+        launch,
+        vec!["opus".to_string()],
+        "control: the launch runs opus only"
+    );
+
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(launch);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an opus launch must not move on the outgoing profile's env model"
+    );
+}
+
+// ── spend-cap recovery, home passes and sinks ────────────────────────────────
+
+/// A successful assistant turn at exactly `ms` epoch ms: the success a latch
+/// judge pulls for its file.
+fn ok_row_at(ms: u64) -> String {
+    let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": ts,
+        "message": {"id": "msg_ok", "model": "claude-opus-4", "role": "assistant",
+            "usage": {"input_tokens": 10, "output_tokens": 500}},
+    })
+    .to_string()
+}
+
+/// A successful assistant turn `ms_ago` old: the success a latch judge pulls
+/// for its file.
+fn ok_row(ms_ago: u64) -> String {
+    ok_row_at(crate::usage::now_ms().saturating_sub(ms_ago))
+}
+
+/// (Re)write one conversation transcript from whole lines, so a test can append
+/// a recovery row after the first tail already consumed the file.
+fn write_conv(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[String]) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut body = String::new();
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    std::fs::write(proj.join(format!("{conv}.jsonl")), body).unwrap();
+}
+
+/// A subagent transcript: its `session_key` folds `subagents/` into the parent
+/// conversation, so its rows share the parent's key but a DIFFERENT file.
+fn write_subagent(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[String]) {
+    let dir = home
+        .home()
+        .join(".claude/projects/-home-u-proj")
+        .join(conv)
+        .join("subagents")
+        .join("agent-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut body = String::new();
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    std::fs::write(dir.join("task.jsonl"), body).unwrap();
+}
+
+/// A 429 older than the session's last swap must not move it: the row's
+/// timestamp compare ages the fact out, so a cold-start reread of an old 429
+/// cannot latch against the member the session moved to.
+#[test]
+fn a_429_older_than_the_last_swap_does_not_move_the_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    let now = crate::usage::now_ms();
+    row.last_swap_at = Some(now - 3_600_000);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row_at(now - 7_200_000)]);
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 from before the swap onto `b` is history"
+    );
+}
+
+/// A 429 latched with no target, then the session recovers on `a` (a later
+/// successful turn; the cap is lifted). Once `b` frees, the stale latch must
+/// not move the recovered session off `a`.
+#[test]
+fn a_latched_429_is_cleared_by_a_later_successful_turn() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    let cap = spend_cap_row(600_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "control: no target yet"
+    );
+
+    write_conv(&home, "conv-a", &[cap, ok_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "the session recovered on `a`; the latch must not outlive that"
+    );
+}
+
+/// One pin scenario: a success and a 429 in the same file, the success stamped
+/// `ok_ago` ms ago and the 429 `cap_ago` ms ago, both built from one clock
+/// snapshot so the relative offset is exact. Returns the scan's decision.
+fn same_file_success_pin(ok_ago: u64, cap_ago: u64) -> (Option<String>, Option<usize>) {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok_row_at(now - ok_ago), spend_cap_row_at(now - cap_ago)],
+    );
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// A drained same-file success drops the latch only when its line lies after
+/// the latched 429's line in the same file life; the stamps are not compared.
+/// Each pin here writes the success BEFORE the 429, so every one keeps the
+/// latch and the session moves, whatever the success's stamp: 100 s older,
+/// the same millisecond, 1 ms older, and 1 ms newer (a clock step back that
+/// stamped the 429 below the earlier success).
+#[test]
+fn an_older_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(700_000, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a success line before the 429 keeps the latch and the session moves"
+    );
+}
+
+/// A success line before the 429 stamped at the 429's exact millisecond keeps
+/// the latch: the session still moves.
+#[test]
+fn a_same_millisecond_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(600_000, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a success line before the 429 keeps the latch"
+    );
+}
+
+/// A success line before the 429 stamped 1 ms older keeps the latch.
+#[test]
+fn a_one_ms_older_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(600_001, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a success line before the 429 keeps the latch"
+    );
+}
+
+/// A success line before the 429 stamped 1 ms NEWER (the 429 stamped below
+/// it by a clock step back) still lies before the 429 in the file: it keeps
+/// the latch and the session moves.
+#[test]
+fn an_earlier_success_line_stamped_after_the_429_does_not_drop_the_latch() {
+    assert_eq!(
+        same_file_success_pin(599_999, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "file order decides: a success line before the 429 keeps the latch whatever its stamp"
+    );
+}
+
+/// The spend-cap 429 row at exactly `ms` epoch ms carrying its transcript line
+/// `uuid`, as Claude Code writes a real one: a re-read of it is deduped.
+fn spend_cap_row_uuid_at(ms: u64, uuid: &str) -> String {
+    let mut row: serde_json::Value = serde_json::from_str(&spend_cap_row_at(ms)).unwrap();
+    row["uuid"] = serde_json::Value::String(uuid.to_owned());
+    row.to_string()
+}
+
+/// A line the tailer ignores (no timestamp), so a test can grow and then
+/// shrink a transcript without adding a fact.
+fn filler_row() -> String {
+    serde_json::json!({"type": "progress", "pad": "filler"}).to_string()
+}
+
+/// The scan with `a` capped and `b` free: a live latch moves the session to
+/// `b`, a dropped one leaves it on `a`.
+fn scan_with_b_free() -> (Option<String>, Option<usize>) {
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// Whether the order tests' row holds a live spend-cap latch: a "no move"
+/// decision alone reads the same with no latch at all.
+fn order_row_latched() -> bool {
+    super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("4242-0"))
+}
+
+/// The scan with both members capped: a latch lands but has no target.
+fn scan_with_no_target() -> (Option<String>, Option<usize>) {
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// A live row on `a` joined to `conv-a` through its child pid.
+fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let marker = register_live_row(&row);
+    seed_session_record(home, "conv-a", child_pid);
+    marker
+}
+
+/// A clock step back between a 429 and the session's next successful turn: the
+/// success line comes AFTER the 429 in the transcript but is stamped 2 s below
+/// it. The session recovered, so one scan over both lines drops the latch and
+/// the session stays on `a`.
+#[test]
+fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    let ok = ok_row_at(now - 602_000);
+    write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success line after the 429 is a recovery whatever its stamp"
+    );
+
+    // Positive tail: a 429 line after the success does latch and move the
+    // session, so the stay above was a drop, not a 429 that never latched. It
+    // is stamped past the floor the success left at the first 429's instant:
+    // one at or under it goes on no record and latches nothing.
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, ok, spend_cap_row_uuid_at(now - 599_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 line after the success latches"
+    );
+}
+
+/// The same step back across two scans: the 429 latches with no target, then
+/// the success appended after it (stamped 2 s below it) drops the latch, so
+/// the session stays on `a` once `b` frees.
+#[test]
+fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: no target yet"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let ok = ok_row_at(now - 602_000);
+    write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success appended after the latched 429 drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+
+    // Positive tail: a 429 line appended after the success latches and moves
+    // the session, stamped past the floor the success left, as above.
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, ok, spend_cap_row_uuid_at(now - 599_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 line after the success latches"
+    );
+}
+
+/// Two 429 lines in one drain, the later line stamped below the earlier one
+/// and a success line between them: the later 429 sits after the success, so
+/// the latch holds and the session moves. A latch that kept the higher-stamped
+/// (earlier) 429 would read the success as after it and drop.
+#[test]
+fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    write_conv(
+        &home,
+        "conv-a",
+        &[
+            spend_cap_row_uuid_at(now - 600_000, "cap-1"),
+            ok_row_at(now - 700_000),
+            spend_cap_row_uuid_at(now - 800_000, "cap-2"),
+        ],
+    );
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the last 429 line follows the success, so the latch holds"
+    );
+}
+
+/// The mirror case through a shrink: a success, then a 429 stamped below it (a
+/// clock step back) latches with no target. The transcript then shrinks, which
+/// re-reads it from byte 0 and replays the old success; the success lies
+/// before the 429, so the latch holds and the session moves once `b` frees.
+#[test]
+fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[ok.clone(), cap.clone(), filler_row()]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[ok, cap]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success lies before the 429, so the latch holds"
+    );
+}
+
+/// The mirror case through a walk miss: the transcript leaves one store walk
+/// and returns, re-entering at byte 0 and replaying the old success that lies
+/// before the latched 429 (stamped below it by a clock step back); the latch
+/// holds and the session moves once `b` frees.
+#[test]
+fn a_success_replayed_by_a_walk_miss_does_not_drop_a_later_429s_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[ok, cap]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    super::tps_producer_tick(now + 7_000);
+    std::fs::rename(&away, &path).unwrap();
+    super::tps_producer_tick(now + 13_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success lies before the 429, so the latch holds"
+    );
+}
+
+/// A progress line `parse_line` ignores, its pad one repeated character, so a
+/// rewrite can change bytes before the read offset at equal length.
+fn pad_row(c: char) -> String {
+    serde_json::json!({"type": "progress", "pad": c.to_string().repeat(40)}).to_string()
+}
+
+/// A latched uuid 429, then the transcript REPLACED at its path (a new file,
+/// the 429 line kept, longer than the old offset) with a success after the
+/// 429 stamped 2 s below it. The new life still holds the 429's line, so the
+/// success compares by position and drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{cap}\n{}\n", ok_row_at(now - 602_000))).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the replaced file drops the latch"
+    );
+}
+
+/// The same through an in-place rewrite: a byte before the read offset
+/// changes (the tail hash fails, so a new life), the 429 line kept, and a
+/// success after it stamped 2 s below it drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[cap.clone(), pad_row('z')]);
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, pad_row('y'), ok_row_at(now - 602_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the rewritten file drops the latch"
+    );
+}
+
+/// A latched uuid 429 whose transcript turns cold (mtime three days back),
+/// leaves one store walk and re-enters: the cold re-entry is a new life. A
+/// success appended after the 429 but stamped 2 s below it still lies after
+/// the 429's line, so it drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400),
+    );
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    super::tps_producer_tick(now + 6_000);
+    std::fs::rename(&away, &path).unwrap();
+    super::tps_producer_tick(now + 12_000);
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
+    super::tps_producer_tick(now + 18_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the cold re-entered file drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+}
+
+/// A latched 429, then a success after it read on a scan that cannot join the
+/// row to its conversation (the session record is gone): the latch was set for
+/// that conversation, so the success still drops it and the session stays on
+/// the member that recovered, that scan and the next.
+#[test]
+fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
+    let record = home.home().join(".claude/sessions/77777.json");
+    assert!(record.exists(), "control: the fixture's session record");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the latched 429 keeps the session on its member"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the next scan still leaves the session on its member"
+    );
+}
+
+/// A latched 429, then `/clear`: the row's session record now names a new
+/// conversation. The latch belonged to the old one, so it drops and the
+/// session stays on its member once `b` frees; a 429 in the new conversation
+/// latches again and moves it.
+#[test]
+fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    seed_session_record(&home, "conv-b", 77_777);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the old conversation's latch does not move the session"
+    );
+    assert!(
+        !order_row_latched(),
+        "the new conversation dropped the latch"
+    );
+
+    write_conv(
+        &home,
+        "conv-b",
+        &[spend_cap_row_uuid_at(now - 590_000, "cap-b")],
+    );
+    // Past the 5 s discovery walk, so the new transcript is found.
+    super::tps_producer_tick(now + 6_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 in the new conversation latches and moves the session"
+    );
+}
+
+/// A latched 429 whose row's session record cannot be read on a scan: an
+/// unreadable record is no new conversation, so the latch holds and the
+/// session moves once `b` frees.
+#[test]
+fn an_unreadable_session_record_keeps_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let record = home.home().join(".claude/sessions/77777.json");
+    assert!(record.exists(), "control: the fixture's session record");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "an unreadable record keeps the latch and the session moves"
+    );
+}
+
+/// The stamp fallback of the rule above, on its dropping side: a uuid-less 429
+/// latches, then a shrink drops its line and replays a success in a NEW life
+/// of the file. No recorded position can place the 429 there, so the stamps
+/// decide; the replayed success is newer and drops the latch.
+#[test]
+fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    // A uuid-less 429 appended after the success latches with no target.
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok.clone(), spend_cap_row_at(now - 600_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // The shrink drops the 429 line and replays the success in a new life.
+    write_conv(&home, "conv-a", &[ok]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the replayed success's newer stamp drops the latch"
+    );
+    assert!(
+        !order_row_latched(),
+        "the replayed success dropped the latch"
+    );
+}
+
+/// The stamp fallback's keeping side: the same uuid-less 429 and shrink, with
+/// the replayed success stamped below the 429, so the latch holds and the
+/// session moves once `b` frees.
+#[test]
+fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 700_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok.clone(), spend_cap_row_at(now - 600_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[ok]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success's older stamp keeps the latch"
+    );
+    assert!(order_row_latched(), "the older stamp kept the latch");
+}
+
+/// A scan that skips the latch block loses nothing: the 429's position lives
+/// in the producer, not in a one-shot drain event. The file shrinks into a new
+/// life while the session record is unreadable (so the scan never joins the
+/// conversation), and a success appended after the 429 in that life still
+/// drops the latch.
+#[test]
+fn a_scan_that_skips_the_latch_loses_no_position() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[cap.clone(), filler_row()]);
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // The shrink re-reads the line in a new life, and this scan never joins
+    // the conversation, so it cannot touch the latch.
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    let record = home.home().join(".claude/sessions/77777.json");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(
+        order_row_latched(),
+        "control: the skipped scan kept the latch"
+    );
+
+    // The record returns and a success lands after the 429 in its new life,
+    // stamped below it: line order still drops the latch.
+    seed_session_record(&home, "conv-a", 77_777);
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in its new life drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+}
+
+/// One conversation's 429s in two files: each file's later line first, then the
+/// highest stamp across files latches. The main file's later 429 is stamped
+/// below the subagent file's, so the subagent's latches — and the main file's
+/// success after its own 429 cannot clear it (another file).
+#[test]
+fn the_highest_stamp_across_files_latches_its_429() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    // Main file: the higher-stamped 429 first, the later line (lower stamp)
+    // second, then a success after both.
+    write_conv(
+        &home,
+        "conv-a",
+        &[
+            spend_cap_row_uuid_at(now - 500_000, "main-high"),
+            spend_cap_row_uuid_at(now - 700_000, "main-later"),
+            ok_row_at(now - 690_000),
+        ],
+    );
+    // Subagent transcript, same conversation key, middle stamp.
+    write_subagent(
+        &home,
+        "conv-a",
+        &[spend_cap_row_uuid_at(now - 600_000, "sub")],
+    );
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    let latched = super::SPEND_CAP_LATCH.with(|l| {
+        l.borrow()
+            .get("4242-0")
+            .map(|latch| latch.fact.uuid.clone())
+    });
+    assert_eq!(
+        latched,
+        Some(Some("sub".to_owned())),
+        "the highest stamp across files latched, not the main file's later line"
+    );
+}
+
+/// A subagent's success shares the parent's conversation key but a different
+/// transcript file: it must NOT clear the main loop's 429, or one more failed
+/// fable turn is needed before the session moves.
+#[test]
+fn a_subagent_success_does_not_clear_the_main_loops_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(600_000)]);
+    write_subagent(&home, "conv-a", &[ok_row(60_000)]);
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a subagent's success must not clear the main loop's 429"
+    );
+}
+
+/// `a` is the preferred home, capped, its credit gate off; a fable launch
+/// leaves it. Once on `b`, the return-to-preferred pass must read `a` as raw-
+/// capped (its gate ignored) and NOT walk the session home — otherwise it
+/// flips back every other tick.
+#[test]
+fn a_fable_session_does_not_return_to_a_capped_gate_off_preferred_home() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: trigger a leaves the capped home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fable session must not be walked home onto the capped account it just left"
+    );
+}
+
+/// The soonest-weekly-reset home pass is the same class: with no `preferred`
+/// member, a capped gate-off member whose weekly reset is soonest must not
+/// pull the credit-billed session back.
+#[test]
+fn a_fable_session_does_not_walk_home_to_a_capped_soonest_reset_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &["a"]);
+    config.lock().unwrap().state.walk_order = Some(crate::profile::WalkOrder::SoonestWeeklyReset);
+
+    // `a` (capped, gate off) resets sooner than `b`, so it ranks as home.
+    let store = credit_store(&["a", "b"], &["a"]);
+    {
+        use crate::usage::{UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+        let mut map = store.lock().unwrap();
+        map.get_mut("a").unwrap().seven_day = Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 2 * 3600)),
+        });
+        map.get_mut("b").unwrap().seven_day = Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3 * 86_400)),
+        });
+    }
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: trigger a leaves the capped soonest-reset home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the soonest-reset home pass must not walk the session back onto the capped member"
+    );
+}
+
+/// An unknown-demand session (no `launch_families`) moved off a capped gate-off
+/// preferred home by its OWN spend-cap 429 must stay off it: the per-session
+/// credit-seen mark survives the member change, so the return-to-preferred pass
+/// keeps reading the raw cap against the member it just left — one swap per
+/// failed turn would be the alternative.
+#[test]
+fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // The session's own 429 latches and moves it off capped `a` to `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the session's own 429 leaves the capped home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    // The 429 is drained and no new one lands: the per-member latch is pruned
+    // on the member change, but the credit-seen mark must keep the home pass
+    // from walking the session back onto capped gate-off `a`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "an unknown-demand session moved by its own 429 must not walk home onto the capped account"
+    );
+}
+
+/// A later subagent success in the same scan must not mask the main loop's
+/// recovery: the success record keys by FILE, so the main file's own success
+/// still clears the main loop's 429 even when a subagent success is newer.
+#[test]
+fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(600_000), ok_row(120_000)]);
+    write_subagent(&home, "conv-a", &[ok_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "the main loop recovered after its 429; a subagent's later success must not undo that"
+    );
+}
+
+/// The credit-seen mark must survive the session's life, but a scan in which
+/// the session's member is briefly out of the chain drops the row from the
+/// walk, never inserts it into the live map, and prunes the mark — so the next
+/// scan walks the session back onto its capped gate-off home.
+#[test]
+fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the 429 moves it"
+    );
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+    // Control: with the chain intact, the mark holds the session on `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the mark holds the session on b"
+    );
+    // One scan with `b` out of the chain (an operator edit), then back in.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    config.lock().unwrap().state.fallback_chain = vec!["a".into(), "b".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session is still live; its credit-seen mark must not be pruned"
+    );
+}
+
+/// A scheduler restart (a lease change: daemon restart, self-update, TUI <->
+/// daemon handover) starts with empty thread-locals. The cold re-read of the
+/// still-hot transcript redelivers the session's own 429, which still proves a
+/// credit-billed model, but the mark is only set inside the `ts > last_change`
+/// latch branch, so it is not rebuilt and the home pass walks the session back.
+/// A fresh thread stands in for the fresh process: every thread-local is new.
+#[test]
+fn the_credit_seen_mark_is_rebuilt_after_a_scheduler_restart() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the 429 moves it"
+    );
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+    // Control: same process, the mark holds it on `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the mark holds the session on b"
+    );
+    let cfg = config.clone();
+    std::thread::spawn(move || {
+        tail_transcripts();
+        scan_sessions(
+            &cfg,
+            &credit_store(&["a", "b"], &["a"]),
+            &all_fresh(&["a", "b"]),
+        );
+    })
+    .join()
+    .expect("restarted scheduler thread");
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "after a restart the redelivered 429 must still mark the session credit-billed"
+    );
+}
+
+/// A credit-forced leave must not park on a capped `last_resort` sink: `s` is
+/// gate-off and capped, and every other member is exhausted, so the sink pass
+/// would be the only target — but the raw cap excludes it.
+#[test]
+fn a_fable_session_does_not_park_on_a_capped_gate_off_sink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b", "s"], &[("a", "fable")], &["s"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("s"))
+        .unwrap()
+        .last_resort = true;
+
+    // `a` and `s` are capped (s's gate is off); `b` is exhausted.
+    let store = session_store(&[("a", 10.0), ("b", 100.0), ("s", 10.0)]);
+    {
+        let mut map = store.lock().unwrap();
+        for n in ["a", "s"] {
+            let info = map.get_mut(n).unwrap();
+            info.spend = Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            });
+        }
+    }
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b", "s"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a credit-forced leave must not park on a capped gate-off sink"
+    );
+}
+
+/// A session whose demand needs credits takes a dead sink on record as
+/// refusing a credit-billed request only after every other pass: the dead-sink
+/// pass takes a sink not on record first, and the last pass takes the refusing
+/// one rather than leave the session on a spent member. A sink whose own
+/// reading shows its credits spent stays out even there. The control: with no
+/// record, the first dead sink takes it.
+#[test]
+fn a_credit_demand_takes_a_refusing_dead_sink_after_every_other_pass() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b", "s", "t"], &[("a", "fable")], &[]);
+    for n in ["s", "t"] {
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from(n))
+            .unwrap()
+            .last_resort = true;
+    }
+    // `a`'s credits are spent; `b` and the sinks `s` and `t` have no headroom
+    // left.
+    let store = credit_store(&["a", "b", "s", "t"], &["a"]);
+    for n in ["b", "s", "t"] {
+        store
+            .lock()
+            .unwrap()
+            .get_mut(n)
+            .and_then(|i| i.five_hour.as_mut())
+            .expect("a 5h window")
+            .utilization = 100.0;
+    }
+    let status = all_fresh(&["a", "b", "s", "t"]);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(2)),
+        "control: with no record the first dead sink takes it"
+    );
+    record_refusal("s", 60_000);
+    assert_eq!(
+        decide(),
+        (Some("t".to_string()), Some(3)),
+        "the dead-sink pass takes the sink not on record first"
+    );
+    record_refusal("t", 60_000);
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(2)),
+        "with every sink on record, the last pass takes the first"
+    );
+    let spent = credit_store(&["s"], &["s"]);
+    let mut spent_s = spent
+        .lock()
+        .unwrap()
+        .get("s")
+        .cloned()
+        .expect("s's reading");
+    spent_s.five_hour.as_mut().expect("a 5h window").utilization = 100.0;
+    store.lock().unwrap().insert("s".to_string(), spent_s);
+    assert_eq!(
+        decide(),
+        (Some("t".to_string()), Some(3)),
+        "a sink whose reading shows its credits spent stays out of the last pass"
+    );
+}
+
+/// In that last pass a refusing member with headroom comes ahead of a refusing
+/// dead sink, whatever the chain's order: the member serves what its plan
+/// covers, the sink serves nothing. The control: with the member's headroom
+/// gone, the sink takes it.
+#[test]
+fn a_credit_demand_takes_a_refusing_member_with_headroom_before_a_refusing_dead_sink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "s", "b"], &[("a", "fable")], &[]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("s"))
+        .unwrap()
+        .last_resort = true;
+    // `a`'s credits are spent, the sink `s` has no headroom, `b` has 60% left.
+    let store = credit_store(&["a", "s", "b"], &["a"]);
+    for (n, pct) in [("s", 100.0), ("b", 40.0)] {
+        store
+            .lock()
+            .unwrap()
+            .get_mut(n)
+            .and_then(|i| i.five_hour.as_mut())
+            .expect("a 5h window")
+            .utilization = pct;
+    }
+    record_refusal("s", 60_000);
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "s", "b"]);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (Some("b".to_string()), Some(2)),
+        "the refusing member with headroom comes ahead of the refusing dead sink"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("b")
+        .and_then(|i| i.five_hour.as_mut())
+        .expect("a 5h window")
+        .utilization = 100.0;
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(1)),
+        "control: with no member left with headroom the refusing dead sink takes it"
+    );
+}
+
+/// A session that must leave its active, a dead sink whose credits are spent,
+/// for a credit-billed demand takes a refusing member with headroom in the last
+/// pass rather than stay on the sink and collect 429s: a sink active stays put
+/// only when it can still serve the demand. The control: with the sink's credits
+/// not spent it can pay for the demand, so the session stays on it.
+#[test]
+fn a_session_that_must_leave_a_dead_sink_takes_a_refusing_member_with_headroom() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .last_resort = true;
+    // `a` is a dead sink with its credits spent; `b` has 60% left.
+    let store = credit_store(&["a", "b"], &["a"]);
+    for (n, pct) in [("a", 100.0), ("b", 40.0)] {
+        store
+            .lock()
+            .unwrap()
+            .get_mut(n)
+            .and_then(|i| i.five_hour.as_mut())
+            .expect("a 5h window")
+            .utilization = pct;
+    }
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "b"]);
+    let decide = |store: &UsageStore| {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(&store),
+        (Some("b".to_string()), Some(1)),
+        "a session that must leave the sink takes the refusing member"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .expect("a's reading")
+        .spend = None;
+    assert_eq!(
+        decide(&store),
+        (None, None),
+        "control: a sink whose credits are not spent keeps the session"
+    );
+}
+
+/// A session that must leave a serving sink whose credits are spent, for a
+/// credit-billed demand, takes a serving sibling sink ahead of a dead one: the
+/// serving sink still serves every request. The control: with the active's
+/// credits not spent nothing forces a leave, so the session stays on it.
+#[test]
+fn a_session_that_must_leave_a_serving_sink_takes_a_serving_sibling_before_a_dead_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "d", "s"], &[("a", "fable")], &[]);
+    for n in ["a", "d", "s"] {
+        config
+            .lock()
+            .unwrap()
+            .find_mut(&crate::profile::ProfileName::from(n))
+            .unwrap()
+            .last_resort = true;
+    }
+    let week = |pct: f64| crate::usage::UsageWindow {
+        utilization: pct,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3 * 86_400,
+        )),
+    };
+    // `a` and `s` serve (week past the line, short of the hard cap), `d` is
+    // dead; only `a`'s credits are spent.
+    let store = credit_store(&["a", "d", "s"], &["a"]);
+    {
+        let mut m = store.lock().unwrap();
+        m.get_mut("a").unwrap().seven_day = Some(week(99.0));
+        m.get_mut("d")
+            .unwrap()
+            .five_hour
+            .as_mut()
+            .unwrap()
+            .utilization = 100.0;
+        m.get_mut("s").unwrap().seven_day = Some(week(99.0));
+    }
+    let status = all_fresh(&["a", "d", "s"]);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (Some("s".to_string()), Some(2)),
+        "the serving sibling sink comes ahead of the dead one"
+    );
+    store
+        .lock()
+        .unwrap()
+        .get_mut("a")
+        .expect("a's reading")
+        .spend = None;
+    assert_eq!(
+        decide(),
+        (None, None),
+        "control: a serving sink whose credits are not spent keeps the session"
+    );
+}
+
+/// A session whose own spend-cap 429 says it must leave an active still armed
+/// to spend takes a member on record as refusing a credit-billed request with
+/// headroom rather than keep paying: free quota ranks above spend. The control:
+/// with no 429 to leave for, the active stays.
+#[test]
+fn a_session_that_must_leave_a_spend_armed_active_takes_a_refusing_member_with_headroom() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        cfg.find_mut(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .max_auto_spend = Some(50.0);
+    }
+    // `a`'s 5h is spent with its budget open; `b` has 60% left and refused once.
+    let store = session_store(&[("a", 100.0), ("b", 40.0)]);
+    store.lock().unwrap().get_mut("a").unwrap().spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(0.0),
+        limit: Some(100.0),
+        percent: Some(0.0),
+        currency: Some("USD".to_owned()),
+    });
+    record_refusal("b", 60_000);
+    let status = all_fresh(&["a", "b"]);
+    seed_session_record(&home, "conv-a", child_pid);
+    let decide = || {
+        crate::live_sessions::register(&row).expect("reset the decision");
+        scan_sessions(&config, &store, &status);
+        decision_of("4242-0")
+    };
+    assert_eq!(
+        decide(),
+        (None, None),
+        "control: with no 429 on the active it stays put"
+    );
+    append_and_tail(&home, "conv-a", &[spend_cap_row(1_000)]);
+    assert_eq!(
+        decide(),
+        (Some("b".to_string()), Some(1)),
+        "the session that must leave takes the refusing member's free quota"
+    );
+}
+
+/// A session whose demand needs credits spends on no member on record as
+/// refusing a credit-billed request, armed to spend as it is. The control:
+/// with no record, the spend-armed member takes it.
+#[test]
+fn a_credit_demand_spends_on_no_member_on_record_as_refusing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.spend_budget_switching = true;
+        cfg.find_mut(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .max_auto_spend = Some(50.0);
+    }
+    // `a`'s credits are spent; `b`'s 5h is spent, its budget open.
+    let store = credit_store(&["a", "b"], &["a"]);
+    {
+        let mut map = store.lock().unwrap();
+        let b = map.get_mut("b").expect("b in the store");
+        b.five_hour.as_mut().expect("b's 5h window").utilization = 100.0;
+        b.spend = Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(0.0),
+            limit: Some(100.0),
+            percent: Some(0.0),
+            currency: Some("USD".to_owned()),
+        });
+    }
+    let status = all_fresh(&["a", "b"]);
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: with no record the spend-armed member takes it"
+    );
+    record_refusal("b", 60_000);
+    crate::live_sessions::register(&row).expect("reset the decision");
+    scan_sessions(&config, &store, &status);
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// Probe C's missing half: with an uncapped third member, a credit-forced
+/// leave skips both capped gate-off members and lands there.
+#[test]
+fn a_fable_session_skips_two_capped_gate_off_members_for_the_uncapped_third() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable")], &["a", "b"]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "a credit-forced leave skips both capped gate-off members for the uncapped third"
+    );
+}
+
+/// A session that ends with its 429 latched and marked — no target to move to,
+/// so the decision writes nothing — leaves both in the thread-local maps once
+/// no chain row is live: the per-row prunes never run with zero rows, only the
+/// empty scan's clear drops them. A later session minted with the same
+/// `<pid>-<seq>` id must not inherit the mark through the empty scan (the
+/// reused row keeps the same `started_at`, so only the clear separates it).
+#[test]
+fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    // A current stint start: the 429 seeded a beat later postdates it, and the
+    // reused row below keeps the SAME stint so the `started_at` key matches —
+    // only the empty-scan clear then separates the dead session's mark from
+    // the new one.
+    let started_at = crate::usage::now_ms().saturating_sub(1_000);
+    let mut row = session_row("8021-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = started_at;
+    let marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8021-0"),
+        (None, None),
+        "control: no target yet"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8021-0").expect("unregister");
+    // Zero live chain rows: the scan must clear the dead session's mark.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    // A new opus session reusing the id, on the non-preferred member with a
+    // capped gate-off preferred home. Unmarked, the home pass walks it back
+    // onto the home — the mark did not leak through the empty scan.
+    let mut fresh = session_row("8021-0", "a");
+    fresh.started_at = started_at;
+    fresh.current_member = Some("b".to_string());
+    fresh.intended_member = Some("b".to_string());
+    fresh.chain_cursor = Some(1);
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8021-0"),
+        (Some("a".to_string()), Some(0)),
+        "the dead session's mark must not leak through an empty scan; the unmarked session returns home"
+    );
+}
+
+/// Control: with another live chain row present, the scan prunes the dead
+/// session's latch, so the new session stays.
+#[test]
+fn a_non_empty_scan_prunes_the_dead_sessions_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8022-0", "a");
+    row.claude_pid = Some(child_pid);
+    let marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8022-0"),
+        (None, None),
+        "control: no target yet"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8022-0").expect("unregister");
+    let _other = register_live_row(&session_row("8023-0", "b"));
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    let mut fresh = session_row("8022-0", "a");
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("8022-0"), (None, None));
+}
+
+/// Two live sessions resumed onto ONE conversation id (CC reuses the id on
+/// `--resume` unless `--fork-session`): one 429 row joins both rows. The 429
+/// names no process, so the conversation is ambiguous and neither row latches
+/// or marks — an opus session must never move on the other session's 429.
+/// Unix-only: the claimants are live `sleep` children.
+#[cfg(unix)]
+#[test]
+fn an_opus_session_does_not_move_on_another_sessions_429_in_a_shared_conversation() {
+    let home = crate::testutil::HomeSandbox::new();
+    let fable_child = LiveChild::spawn();
+    let opus_child = LiveChild::spawn();
+    let mut fable = session_row("8024-0", "a");
+    fable.claude_pid = Some(fable_child.pid());
+    let _m1 = register_live_row(&fable);
+    let mut opus = session_row("8025-0", "a");
+    opus.claude_pid = Some(opus_child.pid());
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&opus);
+    seed_live_session_record(&home, "conv-a", fable_child.pid());
+    seed_live_session_record(&home, "conv-a", opus_child.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8024-0"),
+        (None, None),
+        "a shared 429 is ambiguous; neither claimant latches it"
+    );
+    assert_eq!(
+        decision_of("8025-0"),
+        (None, None),
+        "an opus session must not move on the other session's 429"
+    );
+}
+
+/// Control for the shared-conversation rule: a second live row on a DIFFERENT
+/// conversation leaves the 429 unambiguous, so the row it joins still moves and
+/// the other row stays.
+#[test]
+fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut first = session_row("8026-0", "a");
+    first.claude_pid = Some(77_777);
+    let _m1 = register_live_row(&first);
+    let mut second = session_row("8027-0", "a");
+    second.claude_pid = Some(88_888);
+    let _m2 = register_live_row(&second);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-b", 88_888);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8026-0"),
+        (Some("b".to_string()), Some(1)),
+        "one live row on the conversation: the 429 is unambiguous and moves it"
+    );
+    assert_eq!(
+        decision_of("8027-0"),
+        (None, None),
+        "the other row's conversation has no 429"
+    );
+}
+
+/// A row whose `started_at` is now, a joined 429 one minute earlier, and a
+/// capped gate-off preferred home that would pull an unmarked session back: the
+/// 429 predates the session's stint, so it must not mark the session — the
+/// session returns home (unmarked).
+#[test]
+fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8028-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.started_at = crate::usage::now_ms();
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8028-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 from before the session's start must not mark it; the home pass pulls it back"
+    );
+}
+
+/// A 429 drained in a scan where the member is out of the chain still marks the
+/// session: the mark insert runs over the live rows before the chain filter, so
+/// once the member is re-added a capped gate-off home does not pull it back.
+#[test]
+fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8029-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    // The 429 lands while `b` is out of the chain: the row is dropped from the
+    // walk, but the mark insert must still run over the live rows.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into()];
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    // `b` is re-added. The session is marked, so the capped gate-off home `a`
+    // must not pull it back.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into(), "b".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8029-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session is marked; the capped gate-off home must not pull it back"
+    );
+}
+
+/// A 429 drained while the row still names the OUTGOING member's store is that
+/// member's, not the incoming one's: the latch insert must refuse it outright.
+/// The decision shows no move either way (no reachable target), so the test
+/// pins the refusal on the latch map directly.
+#[test]
+fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8030-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8030-0"),
+        (None, None),
+        "the refused latch leaves the decision at no move"
+    );
+    let latched = super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8030-0"));
+    assert!(
+        !latched,
+        "a 429 must not latch against the member whose store the row no longer names"
+    );
+}
+
+/// A landed swap on linux repoints `launch_store` at the incoming member's
+/// store, so a 429 after the swap is that member's and must still move the
+/// session: the `reads_member_store` gate must not suppress it.
+#[test]
+fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8031-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8031-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 on the incoming member's store must still move the session off it"
+    );
+}
+
+/// The `reads_member_store` gate matches by PROFILE DIR, never exact file: a
+/// landed swap whose `launch_store` names `session-token.json` while no sidecar
+/// is on disk (so `install_source_path` still resolves `credentials.json`) must
+/// still read as the incoming member's store and let trigger b fire. An
+/// exact-file narrowing would suppress the 429 here.
+#[test]
+fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8033-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("session-token.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8033-0"),
+        (Some("a".to_string()), Some(0)),
+        "a store under the member's profile dir must read as that member's, sidecar or not"
+    );
+}
+
+/// A 429 landing within the in-flight grace after the swap stamp must not
+/// latch: a request in flight across the hold answers after it, and its 429
+/// belongs to the outgoing member.
+#[test]
+fn a_429_within_the_in_flight_grace_does_not_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8034-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8034-0"),
+        (None, None),
+        "no move: the 429 is inside the grace"
+    );
+}
+
+/// A 429 past the grace is the incoming member's own: it latches and moves the
+/// session. (A genuine 429 on the new member re-latches on the next turn, so
+/// the grace only delays it.)
+#[test]
+fn a_429_past_the_in_flight_grace_latches_and_moves() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8035-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 40_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8035-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 past the grace is the incoming member's and still moves the session off it"
+    );
+}
+
+/// A latched 429 with no target, then a same-member convergence re-stamps
+/// `last_swap_at` without a member change: the latch is keyed by the row's
+/// `started_at`, never the swap stamp, so the re-stamp must NOT age it out —
+/// a credit cap is per account, and the convergence keeps the same account.
+/// When a target frees, the session still moves.
+#[test]
+fn a_latched_429_survives_a_same_member_convergence_restamp() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8032-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    // All capped: the 429 latches against "b" but has no target.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b", "c"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(decision_of("8032-0"), (None, None), "no target yet");
+    // A same-member convergence re-stamps last_swap_at past the 429, without a
+    // member change. The latch must survive: its `started_at` key is unchanged.
+    crate::live_sessions::update_as_session("8032-0", |f| {
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("re-stamp");
+    // "c" frees: the surviving latch still moves the session off "b".
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("8032-0"),
+        (Some("c".to_string()), Some(2)),
+        "a same-member re-stamp must not drop the standing latch"
     );
 }
 
@@ -4225,6 +11476,133 @@ fn a_session_walks_past_a_member_the_executor_would_refuse() {
         decision_of("4242-0"),
         (Some("c".to_string()), Some(2)),
         "b has headroom but a different endpoint, so the walk must reach c"
+    );
+}
+
+/// `a`'s `[env]` edited mid-session, the edit written to disk the way an
+/// operator's config edit lands, with `b` given the same edit and `c` left as
+/// `a` booted. The child still runs the boot env (`settings.json` env reaches
+/// `process.env` at startup only), and the executor judges against that boot
+/// snapshot: it refuses `b` and takes `c`. So the leg must name `c`.
+fn edit_env_mid_session(config: &crate::profile::ConfigHandle, names: &[&str]) {
+    let mut cfg = config.lock().unwrap();
+    for name in names {
+        let p = cfg
+            .find_mut(&crate::profile::ProfileName::from(*name))
+            .expect("member");
+        p.env.insert("EDITED_MID_SESSION".into(), "1".into());
+        crate::profile::save_profile(p).expect("save the edit");
+    }
+}
+
+#[test]
+fn a_session_decides_off_the_transport_it_booted_with() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    let boot = config
+        .lock()
+        .unwrap()
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("member a")
+        .clone();
+    let mut row = session_row("4242-0", "a");
+    row.boot_transport = Some(crate::runtime::LaunchTransport::of(&boot));
+    let _marker = register_live_row(&row);
+    edit_env_mid_session(&config, &["a", "b"]);
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "b matches the edited env the child never received; c matches the boot env"
+    );
+}
+
+/// A row an older tollgate wrote carries no boot transport. The leg keeps
+/// deciding for it, off the start profile as it reads now.
+#[test]
+fn a_row_without_a_boot_transport_decides_off_the_start_profile_as_it_reads_now() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    let row = session_row("4242-0", "a");
+    assert!(row.boot_transport.is_none(), "fixture: an older row");
+    let _marker = register_live_row(&row);
+    edit_env_mid_session(&config, &["a", "b"]);
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// Delete `name` through the real `actions::delete_profile`, so the fixture
+/// poses exactly the state `tollgate delete` leaves. The leg's reconstruct path
+/// reads the in-memory config, so a fixture that removed only part of the
+/// delete would not pose the real failure.
+fn delete_profile_like_tollgate(config: &crate::profile::ConfigHandle, name: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    let rotation =
+        crate::actions::rotation_guard_for_mutation(&name).expect("uncontended rotation lock");
+    let mut cfg = config.lock().unwrap();
+    crate::actions::delete_profile(&mut cfg, &name, false, &rotation).expect("delete");
+}
+
+/// A row this tollgate wrote records its boot transport, and the leg judges
+/// candidates against that record — never against the start profile as it reads
+/// now. A session that swapped off its start profile and then had that profile
+/// deleted still decides, because the record alone drives the walk. An OLDER
+/// row (no `boot_transport`) must reconstruct from the start profile, which is
+/// gone, so its `?` drops it before the walk and it gets no decision.
+#[test]
+fn a_deleted_start_profile_still_lets_a_recorded_boot_transport_decide_but_not_an_older_row() {
+    let run = |recorded: bool| -> (Option<String>, Option<usize>) {
+        let _home = crate::testutil::HomeSandbox::new();
+        let config = session_config(&["a", "b", "c"], Some("a"));
+        let mut row = session_row("4242-0", "a");
+        row.current_member = Some("b".to_string());
+        if recorded {
+            let boot = config
+                .lock()
+                .unwrap()
+                .find(&crate::profile::ProfileName::from("a"))
+                .expect("member a")
+                .clone();
+            row.boot_transport = Some(crate::runtime::LaunchTransport::of(&boot));
+        }
+        assert_eq!(
+            row.boot_transport.is_some(),
+            recorded,
+            "fixture: a recorded row carries its boot transport, an older row does not"
+        );
+        let _marker = register_live_row(&row);
+        delete_profile_like_tollgate(&config, "a");
+        scan_sessions(
+            &config,
+            &session_store(&[("b", 100.0), ("c", 10.0)]),
+            &all_fresh(&["b", "c"]),
+        );
+        decision_of("4242-0")
+    };
+
+    assert_eq!(
+        run(true),
+        (Some("c".to_string()), Some(1)),
+        "a recorded boot transport survives the deleted start profile and \
+         still points the session at the next viable member"
+    );
+    assert_eq!(
+        run(false),
+        (None, None),
+        "an older row must reconstruct from the deleted start profile and \
+         drops out of the decision"
     );
 }
 
@@ -4380,12 +11758,15 @@ fn a_batch_of_session_decisions_takes_the_state_flock_once() {
     let _b_marker = register_live_row(&on_b);
     let _d_marker = register_live_row(&on_d);
 
+    // Build the on-disk fixtures OUTSIDE the measured window: `session_config`
+    // writes each profile to disk, which takes the state flock, and the pin
+    // below measures the decision leg's flock cost alone.
+    let config = session_config(&["a", "b", "c", "d"], Some("a"));
+    let store = session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]);
+    let status = all_fresh(&["a", "b", "c", "d"]);
+
     crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
-    scan_sessions(
-        &session_config(&["a", "b", "c", "d"], Some("a")),
-        &session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]),
-        &all_fresh(&["a", "b", "c", "d"]),
-    );
+    scan_sessions(&config, &store, &status);
     let flocks = crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get());
 
     assert_eq!(
@@ -4547,6 +11928,328 @@ fn an_isolated_session_gets_no_decision() {
     );
 }
 
+// ── per-session decision leg: the unreadable-member re-read ───────────────────
+//
+// The second half of P1: the leg re-reads its CHOSEN candidate's `stored_login`
+// before writing `intended_member`, exactly like the drains. A member whose
+// in-memory profile still holds a login while its committed store is torn or
+// empty is refused by the executor every poll, so the leg must step past it —
+// otherwise the intent never changes and the session wedges.
+
+#[test]
+fn a_session_decision_passes_over_a_torn_credentials_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's credentials.json");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose credentials store it cannot \
+         read and names the one after it"
+    );
+}
+
+/// `gamma` is a key-only member whose `config.toml` is torn, so its stored
+/// login reads `Unknown`; `delta` holds the same api key beside a stored pair,
+/// so the swap can install it. A key-only `delta` would be refused by the
+/// swap (`NoCredentialStore`: no store to install), and naming it every tick is
+/// the wedge the leg's shared target check exists to prevent.
+#[test]
+fn a_session_decision_passes_over_a_torn_config_store() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name != "gamma" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_config = crate::profile::profile_dir(&ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&gamma_config, "base_url = \"").expect("tear gamma's config.toml");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose config it cannot read and \
+         names the one after it"
+    );
+}
+
+/// A key-only member reads `HoldsLogin` (its api key is inference auth), yet the
+/// swap refuses it `NoCredentialStore`: there is no store to install. The leg
+/// asks the swap's own target check, so a chain whose only members past the
+/// current one are key-only yields no decision at all, rather than one naming a
+/// member the executor refuses every tick.
+#[test]
+fn a_session_decision_names_no_key_only_member_the_swap_cannot_install() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name == "alpha" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    assert_eq!(
+        crate::profile::stored_login(&ProfileName::from("delta")),
+        crate::profile::StoredLogin::HoldsLogin,
+        "precondition: a key-only member reads as holding a login"
+    );
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (None, None),
+        "the decision leg names no member the swap would refuse for want of a store"
+    );
+}
+
+/// `gamma` is an INTACT key-only member (readable config, an api key, no pair):
+/// the swap refuses it `NoCredentialStore` (no store to install), but the leg
+/// must step PAST that refusal — not stop at its first one — and name the pair
+/// member `delta` after it, whose api-key presence matches the launch's. The
+/// sibling `a_session_decision_names_no_key_only_member_the_swap_cannot_install`
+/// pins the all-key-only floor; this pins the re-walk over one intact key-only
+/// member.
+#[test]
+fn a_session_decision_steps_past_an_intact_key_only_member_to_a_pair_member() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name != "gamma" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg steps past an intact key-only member the swap refuses \
+         for want of a store and names the pair member after it"
+    );
+}
+
+#[test]
+fn a_session_decision_passes_over_a_torn_sidecar_store() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<crate::profile::Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&ProfileName::from(*name));
+            if *name == "gamma" {
+                p.has_long_lived_sidecar = true;
+            } else {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            if *name == "gamma" {
+                crate::testutil::write_long_lived_sidecar(&ProfileName::from(*name));
+            }
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_sidecar = crate::profile::profile_dir(&ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("session-token.json");
+    std::fs::write(&gamma_sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's session-token.json");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose sidecar it cannot read and \
+         names the one after it"
+    );
+}
+
+/// The first half of P1: the session walk reads the skip set and never names a
+/// skipped member as the intent, even while that member's store reads fine on
+/// disk — the set is read-only here, so the member stays passed over until the
+/// next healing scan drops it.
+#[test]
+fn a_session_decision_never_points_at_a_skipped_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let skipped: super::SkippedUnreadable =
+        Arc::new(RankedMutex::new(HashSet::from(["gamma".to_string()])));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the session walk honours the skip set and never names a skipped member as the intent"
+    );
+}
+
+/// The leg steps past an `Unknown` pick WITHOUT marking the shared skip store
+/// (round-7 Q2): it re-reads the pick's store every tick, so it needs no memory
+/// of the rejection, and the daemon keeps its own ruled defer/give-up lines for
+/// a member whose store stays unreadable. The skip set the walk honours stays
+/// read-only.
+#[test]
+fn a_session_decision_leaves_the_skip_store_unmarked_after_an_unreadable_pick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's credentials.json");
+    let skipped: super::SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose store it cannot read and names the one after it"
+    );
+    assert!(
+        skipped.lock().expect("skip store lock").is_empty(),
+        "the session leg writes nothing into the shared skip store"
+    );
+}
+
+/// A pick the executor refuses for a load failure past a readable login (a pair
+/// member whose `credentials.json` reads fine but whose `config.toml` is torn)
+/// is stepped past by the leg through the SAME gate the executor's install
+/// branch runs — the leg's `stored_login` re-read alone reads `HoldsLogin` and
+/// would accept it, writing the intent every tick and wedging the session.
+/// Neither rejection marks the shared skip store.
+#[test]
+fn a_session_decision_steps_past_a_pick_the_executor_refuses_for_a_load_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_config = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&gamma_config, "base_url = \"").expect("tear gamma's config.toml");
+    let skipped: super::SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg steps past a member the executor refuses for a load \
+         failure and names the one after it"
+    );
+    assert!(
+        skipped.lock().expect("skip store lock").is_empty(),
+        "the session leg writes nothing into the shared skip store"
+    );
+}
+
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.
@@ -4667,6 +12370,7 @@ fn retry_after_defers_next_fetch_slot() {
         apply_outcome, now_ms,
     };
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -4681,6 +12385,15 @@ fn retry_after_defers_next_fetch_slot() {
         login_gone: false,
         plan_override: None,
         retry_after,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     let stamp = |name: &str| {
         last_fetched
@@ -4714,7 +12427,7 @@ fn retry_after_defers_next_fetch_slot() {
     );
     // partition_due: not due just before now + retry_after, due at it.
     let snapshot = vec![token("a")];
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let (due, next) = partition_due(
         &snapshot,
         a + REFRESH_INTERVAL_MS - 1,
@@ -4832,6 +12545,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         StatusStore, apply_outcome, now_ms,
     };
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -4847,6 +12561,15 @@ fn consecutive_rate_limits_back_off_exponentially() {
         rotated: None,
         from_fetch,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("a"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     let stamp = || {
         last_fetched
@@ -4930,6 +12653,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         StatusStore, apply_outcome, now_ms,
     };
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -4947,6 +12671,15 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         login_gone: false,
         plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("a"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     let stamp = || {
         last_fetched
@@ -4991,6 +12724,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         StatusStore, apply_outcome, now_ms,
     };
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -5006,6 +12740,15 @@ fn transient_errors_preserve_rate_limit_streak() {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("a"),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
     let apply = |kind: FetchStatus| {
         apply_outcome(
@@ -5345,6 +13088,109 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     );
 }
 
+/// A probed account lands on the tick after its next probe falls due, an
+/// interval past the cadence stamp its last landing wrote, and the history
+/// writer stamps the old figure 1 ms before each changed one, so an equal pair
+/// spans a whole landing gap. Once every gap passes `BURN_GAP_CUT_MS` the
+/// series is cut to two points and the 5h window never gets a burn rate; at
+/// the probe's interval cap it still has to.
+///
+/// Driven through the probe leg's own landings: each one is a real probe
+/// through `tick`, and both what it stamps (its next due time) and what it
+/// writes to the history are the leg's. With no clock to move, the landings
+/// run back to back and their lines are then laid out, each landing at the
+/// time the previous one's stamp makes due, plus the tick it waits for.
+#[test]
+fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
+    let home = crate::testutil::HomeSandbox::new();
+    let landings = 24;
+    let rate_at = |name: &str, interval_ms: u64| {
+        let pn = crate::profile::ProfileName::from(name);
+        let state = probe_state(name, interval_ms, true);
+        let now_secs = crate::usage::now_epoch_secs();
+        // Rising one point a landing, so every landing writes a line.
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(landings, {
+            move |_, i| {
+                let headers = vec![
+                    (
+                        "anthropic-ratelimit-unified-5h-utilization".to_string(),
+                        format!("{:.2}", i as f64 / 100.0),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-5h-reset".to_string(),
+                        (now_secs + 3600).to_string(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-status".to_string(),
+                        "allowed".to_string(),
+                    ),
+                ];
+                (200, headers, "{}".into())
+            }
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        // Per landing: the history lines it wrote, and the gap to the next one
+        // off the stamp it wrote.
+        type Lines = Vec<(u64, crate::usage::UsageInfo)>;
+        let mut written: Vec<(Lines, u64)> = Vec::new();
+        for _ in 0..landings {
+            crate::usage::reset_request_slots();
+            let seen = crate::profile::load_usage_history(&pn).len();
+            let landed_at = crate::usage::now_ms();
+            super::tick(&state);
+            let stamp = state
+                .last_fetched
+                .lock()
+                .unwrap()
+                .remove(&oauth_key(name))
+                .expect("the landing stamps its cadence");
+            let next_due = stamp.due.as_millis() + interval_ms;
+            let lines = crate::profile::load_usage_history(&pn).split_off(seen);
+            written.push((lines, next_due - landed_at + 1_000));
+        }
+        assert_eq!(server.join().expect("listener").len(), landings);
+        // Lay the landings out back from now, each one gap after the last.
+        let span: u64 = written.iter().map(|(_, gap)| gap).sum();
+        let mut at = crate::usage::now_ms() - span;
+        let mut series = Vec::new();
+        for (lines, gap) in &written {
+            // Each line keeps its place against the landing's newest one.
+            let newest = lines.iter().map(|(ts, _)| *ts).max().expect("a line");
+            series.extend(
+                lines
+                    .iter()
+                    .map(|(ts, info)| (at - (newest - ts), info.clone())),
+            );
+            at += gap;
+        }
+        crate::testutil::write_usage_history(&pn, &series);
+        let current = series
+            .last()
+            .and_then(|(_, info)| info.five_hour.clone())
+            .expect("a last reading");
+        let pair = ("5h", &current);
+        crate::usage::compute_burn_rates_from_history(
+            &crate::profile::load_usage_history(&pn),
+            std::slice::from_ref(&pair),
+            crate::usage::BURN_LOOKBACK_MS,
+            crate::usage::BURN_MIN_SAMPLES,
+            crate::usage::BURN_GAP_CUT_MS,
+        )
+        .remove("5h")
+        .flatten()
+    };
+
+    assert_eq!(
+        rate_at("ten", 600_000),
+        None,
+        "at 10 min every gap passes the cut"
+    );
+    assert!(
+        rate_at("cap", crate::profile::MAX_USAGE_PROBE_INTERVAL_MS).is_some(),
+        "the cap leaves the series a rate"
+    );
+}
+
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
 /// map (the steady state for healthy profiles) is a no-op fast path.
@@ -5423,7 +13269,144 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
             base_url: "https://example.com".to_string(),
         },
         api_key: "key".to_string(),
+        identity: crate::usage::third_party_identity(
+            None,
+            Some("key"),
+            None,
+            Some("https://example.com"),
+        ),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::ThirdParty,
+        ),
     }
+}
+
+/// `credential_fingerprint` is the key of the persisted dead-credential record
+/// (`third_party_auth.json`), so its bytes are a format: a change silently
+/// retires every record on disk. Every encoding branch is pinned: the
+/// `Known`+console arm, the `Known`+`None` (no-console) arm, each provider
+/// literal, and the generic arm. The values below were computed outside the
+/// crate — Python `hashlib.sha256` over each field as a little-endian `u64`
+/// byte length then its UTF-8 bytes, in call order, the first 8 digest bytes
+/// read little-endian:
+///
+/// ```python
+/// import hashlib, struct
+/// def f(b): return struct.pack("<Q", len(b)) + b
+/// def known(key, provider, console=None):
+///     parts = [f(key), f(b"known"), f(provider)]
+///     if console is None:
+///         parts.append(f(b"no-console"))
+///     else:
+///         parts += [f(b"console"), f(console[0]), f(console[1]), f(console[2])]
+///     return int.from_bytes(hashlib.sha256(b"".join(parts)).digest()[:8], "little")
+/// generic = b"".join([f(b"key-generic"), f(b"generic"), f(b"https://example.com")])
+/// print(known(b"key-ds", b"deepseek", (b"console-token", b"domestic", b"cn-beijing")))
+/// print(known(b"key-zai", b"zai"))
+/// print(known(b"key-alibaba", b"alibaba"))
+/// print(known(b"key-openrouter", b"openrouter"))
+/// print(known(b"key-minimax", b"minimax"))
+/// print(int.from_bytes(hashlib.sha256(generic).digest()[:8], "little"))
+/// ```
+#[test]
+fn the_credential_fingerprint_is_byte_stable() {
+    let known = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-known"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::DeepSeek,
+            console: Some(crate::profile::ConsoleCredential {
+                token: "console-token".into(),
+                site: crate::profile::ConsoleSite::Domestic,
+                region: "cn-beijing".into(),
+            }),
+            billing_key_env: None,
+        },
+        api_key: "key-ds".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let zai = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-zai"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Zai,
+            console: None,
+            billing_key_env: None,
+        },
+        api_key: "key-zai".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let alibaba = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-alibaba"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Alibaba,
+            console: None,
+            billing_key_env: None,
+        },
+        api_key: "key-alibaba".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let openrouter = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-openrouter"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::OpenRouter,
+            console: None,
+            billing_key_env: None,
+        },
+        api_key: "key-openrouter".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let minimax = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-minimax"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::MiniMax,
+            console: None,
+            billing_key_env: None,
+        },
+        api_key: "key-minimax".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let generic = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-generic"),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: "https://example.com".into(),
+        },
+        api_key: "key-generic".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+
+    assert_eq!(known.credential_fingerprint(), 13154461245473617918);
+    assert_eq!(zai.credential_fingerprint(), 17658913403931444822);
+    assert_eq!(alibaba.credential_fingerprint(), 9721452606494246625);
+    assert_eq!(openrouter.credential_fingerprint(), 2700516531537418038);
+    assert_eq!(minimax.credential_fingerprint(), 12723206617646663265);
+    assert_eq!(generic.credential_fingerprint(), 5156188025442888900);
+}
+
+/// A pairless account's setup-token digest keys the same persisted record
+/// (`third_party_auth.json`) once the usage probe finds the token refused, so
+/// its bytes are a format too: a change silently retires every refused
+/// token's verdict, and with the probe switched off nothing learns it again.
+/// The value below was computed outside the crate, as for the fingerprint
+/// above: the token as a little-endian `u64` byte length then its UTF-8 bytes,
+/// the first 8 digest bytes read little-endian:
+///
+/// ```python
+/// import hashlib, struct
+/// t = b"sk-ant-oat01-golden"
+/// print(int.from_bytes(hashlib.sha256(struct.pack("<Q", len(t)) + t).digest()[:8], "little"))
+/// ```
+#[test]
+fn the_setup_token_digest_is_byte_stable() {
+    assert_eq!(
+        crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-golden").setup_token,
+        Some(7565047476024611048)
+    );
 }
 
 /// A provider store entry whose provider publishes one live 5h bar at `pct`.
@@ -5439,6 +13422,7 @@ fn tp_stats_with_bar(pct: f64) -> crate::providers::ThirdPartyStats {
             )),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -5477,7 +13461,48 @@ fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
             billing_key_env: None,
         },
         api_key: String::new(),
+        identity: crate::usage::third_party_identity(
+            Some(crate::providers::Provider::Alibaba),
+            None,
+            Some(&crate::profile::ConsoleCredential {
+                token: token.to_string(),
+                site: crate::profile::ConsoleSite::International,
+                region: "ap-southeast-1".to_string(),
+            }),
+            None,
+        ),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::ThirdParty,
+        ),
     }
+}
+
+/// Save a `config.toml` whose stored identity matches [`tp_entry`]'s, so a
+/// landing's section-1 compare matches (a synthetic entry with no disk store
+/// reads as a change and writes nothing).
+fn save_tp_entry_profile(name: &str) {
+    let profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+}
+
+/// Save a `config.toml` whose stored identity matches [`alibaba_entry`]'s.
+fn save_alibaba_entry_profile(name: &str, token: &str) {
+    let mut profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        None,
+    );
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
 }
 
 fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
@@ -5500,7 +13525,7 @@ fn third_party_state_at_interval(
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(interval_ms)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -5514,13 +13539,15 @@ fn third_party_state_at_interval(
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(super::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     }
 }
 
@@ -5584,16 +13611,14 @@ fn stub_ok_stats(
     })
 }
 
-fn stamped_gap_ms(state: &super::SchedulerState, name: &str, before: u64) -> u64 {
-    stamped_gap_ms_at(state, name, before, REFRESH_INTERVAL_MS)
+/// `name`'s next-refresh stamp: `last_fetched` + `interval_ms`, absolute. A
+/// test asserting it against its own `before`/`after` samples brackets it
+/// `(before + interval..=after + interval)`, so a slow run cannot flip it.
+fn stamped_next_ms(state: &super::SchedulerState, name: &str) -> u64 {
+    stamped_next_ms_at(state, name, REFRESH_INTERVAL_MS)
 }
 
-fn stamped_gap_ms_at(
-    state: &super::SchedulerState,
-    name: &str,
-    before: u64,
-    interval_ms: u64,
-) -> u64 {
+fn stamped_next_ms_at(state: &super::SchedulerState, name: &str, interval_ms: u64) -> u64 {
     state
         .last_fetched
         .lock()
@@ -5603,13 +13628,13 @@ fn stamped_gap_ms_at(
         .unwrap()
         .as_millis()
         .saturating_add(interval_ms)
-        .saturating_sub(before)
 }
 
 #[test]
 fn fetch_third_party_due_inserts_generic_auth_expired() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-dead"]);
+    save_tp_entry_profile("generic-dead");
     let entry = tp_entry("generic-dead");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5627,10 +13652,11 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
     // Suppression, not the no-data floor: the stamp keeps the bare cadence.
-    let gap = stamped_gap_ms(&state, "generic-dead", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-dead");
     assert!(
-        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
-        "AuthExpired must not take the generic no-data floor, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "AuthExpired must not take the generic no-data floor, got stamp {stamp}"
     );
 }
 
@@ -5638,6 +13664,7 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
 fn fetch_third_party_due_inserts_known_auth_expired() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["qwen-dead"]);
+    save_alibaba_entry_profile("qwen-dead", "console-token");
     let entry = alibaba_entry("qwen-dead", "console-token");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5655,6 +13682,167 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
+/// A generic fetch authenticates with the api key, so its `AuthExpired` writes
+/// the dead-key record: the account is refused for its key.
+#[test]
+fn fetch_third_party_due_writes_a_dead_key_record_for_a_generic_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-dead-key"]);
+    save_tp_entry_profile("generic-dead-key");
+    let entry = tp_entry("generic-dead-key");
+    let name = entry.name.clone();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    assert!(
+        crate::fallback::third_party_key_rejected(&profile, &name),
+        "an AuthExpired outcome of a fetch that sent the key marks the key rejected"
+    );
+}
+
+/// Alibaba's console lapse is usage-only: it records the dead usage credential
+/// and never the key.
+#[test]
+fn fetch_third_party_due_records_an_alibaba_console_lapse_as_a_usage_verdict_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-lapse"]);
+    let profile = alibaba_keyed_profile("qwen-lapse");
+    let mut entry = super::third_party_entry_for(&profile).expect("an Alibaba entry");
+    entry.epoch_at_spawn = crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_console_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "a ConsoleExpired outcome records the dead usage credential"
+    );
+    assert!(
+        !crate::fallback::third_party_key_rejected(&profile, &profile.name),
+        "a ConsoleExpired outcome never marks the api key rejected"
+    );
+}
+
+/// A saved Alibaba profile carrying an api key and a captured console session,
+/// read back so its provider resolves the way the loader derives it.
+fn alibaba_keyed_profile(name: &str) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-ali".to_string()),
+    );
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+    let p = crate::profile::load_profile(&p.name).expect("load profile");
+    assert_eq!(
+        p.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "fixture control: the base url resolves to Alibaba"
+    );
+    p
+}
+
+/// Record a dead key on `profile` (as a delegate's 401 does), then land one
+/// fetch on it through the real leg; returns the predicate before and after.
+fn land_on_a_dead_key(
+    profile: &crate::profile::Profile,
+    fetcher: ThirdPartyFetcher,
+) -> (bool, bool) {
+    let key = crate::usage::profile_key_fingerprint(profile).expect("a keyed profile");
+    crate::profile_cache::write_dead_key(&profile.name, key);
+    let before = crate::fallback::third_party_key_rejected(profile, &profile.name);
+    let mut entry = super::third_party_entry_for(profile).expect("a third-party entry");
+    entry.epoch_at_spawn = crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+    let state = third_party_state(fetcher);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    (
+        before,
+        crate::fallback::third_party_key_rejected(profile, &profile.name),
+    )
+}
+
+/// Alibaba's usage fetch reads the console session alone, so a live console
+/// body proves nothing about the api key: a dead key stays rejected.
+#[test]
+fn an_alibaba_dead_key_survives_a_live_console_fetch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali-ok"]);
+    let profile = alibaba_keyed_profile("ali-ok");
+    let (before, after) = land_on_a_dead_key(&profile, stub_ok_stats);
+    assert!(before, "fixture control: the dead key reads rejected");
+    assert!(
+        after,
+        "a console-only usage fetch never sent the api key, so its live body cannot clear the dead key"
+    );
+}
+
+/// A console lapse says nothing about the api key: a dead key stays rejected.
+#[test]
+fn an_alibaba_dead_key_survives_a_console_lapse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ali-lapse"]);
+    let profile = alibaba_keyed_profile("ali-lapse");
+    let (before, after) = land_on_a_dead_key(&profile, stub_console_expired);
+    assert!(before, "fixture control: the dead key reads rejected");
+    assert!(after, "a console lapse cannot clear the dead key");
+}
+
+/// A typed provider's balance fetch sends the api key: its 401 writes the
+/// dead-key record, and a later live body under the same key clears it.
+#[test]
+fn a_typed_providers_balance_401_writes_the_dead_key_record_and_a_live_body_clears_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-dead"]);
+    let profile = crate::profile::Profile::new(
+        "ds-dead".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-ds".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    let profile = crate::profile::load_profile(&profile.name).expect("load profile");
+    assert_eq!(
+        profile.provider,
+        Some(crate::providers::Provider::DeepSeek),
+        "fixture control: the base url resolves to DeepSeek"
+    );
+    let record = crate::profile_cache::profile_cache_path(
+        &profile.name,
+        crate::profile_cache::DEAD_KEY_FILE,
+    )
+    .expect("record path");
+    let land = |fetcher: ThirdPartyFetcher| {
+        let mut entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+        entry.epoch_at_spawn =
+            crate::usage::epoch_value(&profile.name, crate::usage::Half::ThirdParty);
+        let state = third_party_state(fetcher);
+        crate::usage::reset_request_slots();
+        fetch_third_party_due(&state, vec![entry]);
+    };
+
+    land(stub_auth_expired);
+    assert!(record.exists(), "the 401 writes the dead-key record");
+    assert!(
+        crate::fallback::third_party_key_rejected(&profile, &profile.name),
+        "the 401 marks the key rejected"
+    );
+
+    land(stub_ok_stats);
+    assert!(
+        !record.exists(),
+        "a live body from a fetch that sent the same key clears the record"
+    );
+    assert!(!crate::fallback::third_party_key_rejected(
+        &profile,
+        &profile.name
+    ));
+}
+
 // --- wallet_history.jsonl: the balance series the wallet-burn rate replays ---
 
 fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
@@ -5666,6 +13854,7 @@ fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
                 label: label.to_string(),
                 value: value.to_string(),
                 kind: crate::providers::StatRowKind::Body,
+                raw: None,
             })
             .collect(),
         bars: vec![],
@@ -5772,6 +13961,7 @@ fn wallet_series_prunes_past_retention_but_keeps_the_bridge() {
 fn fetch_third_party_due_appends_the_wallet_series_beside_the_stats_cache() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ds-live"]);
+    save_tp_entry_profile("ds-live");
     let state = third_party_state(stub_wallet_stats);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![tp_entry("ds-live")]);
@@ -5807,6 +13997,7 @@ fn a_failed_third_party_fetch_appends_no_wallet_readings() {
 fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-no-data"]);
+    save_tp_entry_profile("generic-no-data");
     let entry = tp_entry("generic-no-data");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5818,13 +14009,17 @@ fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
         state.suppressed_auth_expired.lock().unwrap().is_empty(),
         "a generic no-data result must not suppress — it rescans on the cadence"
     );
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a no-data rescan proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
 fn fetch_third_party_due_does_not_insert_rate_limited() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-limited"]);
+    save_tp_entry_profile("generic-limited");
     let entry = tp_entry("generic-limited");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5833,13 +14028,17 @@ fn fetch_third_party_due_does_not_insert_rate_limited() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a 429 proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
 fn fetch_third_party_due_does_not_insert_cached() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-cached"]);
+    save_tp_entry_profile("generic-cached");
     let entry = tp_entry("generic-cached");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5861,13 +14060,17 @@ fn fetch_third_party_due_does_not_insert_cached() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a network failure served from cache proves nothing about the key: the verdict stands"
+    );
 }
 
 #[test]
 fn fetch_third_party_due_does_not_insert_known_failed() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["qwen-failed"]);
+    save_alibaba_entry_profile("qwen-failed", "console-token");
     let entry = alibaba_entry("qwen-failed", "console-token");
     let name = entry.name.clone();
     let fp = entry.credential_fingerprint();
@@ -5876,7 +14079,10 @@ fn fetch_third_party_due_does_not_insert_known_failed() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
-    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, fp),
+        "a network failure proves nothing about the credential: the verdict stands"
+    );
     assert_eq!(
         state.third_party_status.lock().unwrap().get("qwen-failed"),
         Some(&super::FetchStatus::Failed)
@@ -5895,15 +14101,12 @@ fn fetch_third_party_due_generic_no_data_defers_to_floor() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-floor", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-floor");
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
     assert!(
-        gap >= floor,
-        "generic no-data must defer to the 5-minute floor, gap {gap}ms"
-    );
-    assert!(
-        gap < floor + 2_000,
-        "the floor is the exact gap, got {gap}ms"
+        (before + floor..=after + floor).contains(&stamp),
+        "generic no-data must defer to the 5-minute floor, stamp {stamp}"
     );
 }
 
@@ -5918,14 +14121,11 @@ fn fetch_third_party_due_typed_no_data_keeps_cadence() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "qwen-nodata", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "qwen-nodata");
     assert!(
-        gap >= REFRESH_INTERVAL_MS,
-        "typed no-data must keep the normal cadence, gap {gap}ms"
-    );
-    assert!(
-        gap < REFRESH_INTERVAL_MS + 2_000,
-        "typed no-data must not floor, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "typed no-data must keep the normal cadence and not floor, stamp {stamp}"
     );
 }
 
@@ -5937,11 +14137,12 @@ fn fetch_third_party_due_generic_no_hint_429_uses_the_floor() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![tp_entry("generic-limited")]);
-    let gap = stamped_gap_ms(&state, "generic-limited", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-limited");
     let expected = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
     assert!(
-        (expected..expected + 2_000).contains(&gap),
-        "generic no-hint 429 uses the rescan floor, got {gap}ms"
+        (before + expected..=after + expected).contains(&stamp),
+        "generic no-hint 429 uses the rescan floor, got stamp {stamp}"
     );
 }
 
@@ -5954,11 +14155,12 @@ fn fetch_third_party_due_typed_no_hint_429_keeps_the_flat_rung() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "qwen-limited", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "qwen-limited");
     let expected = REFRESH_INTERVAL_MS + super::RATE_LIMIT_MIN_BACKOFF_MS;
     assert!(
-        (expected..expected + 2_000).contains(&gap),
-        "typed no-hint 429 keeps its flat rung, got {gap}ms"
+        (before + expected..=after + expected).contains(&stamp),
+        "typed no-hint 429 keeps its flat rung, got stamp {stamp}"
     );
 }
 
@@ -5974,10 +14176,11 @@ fn fetch_third_party_due_generic_429_hint_stays_unfloored() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-hint", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-hint");
     assert!(
-        (240_000..242_000).contains(&gap),
-        "a server hint must stay unfloored, got gap {gap}ms"
+        (before + 240_000..=after + 240_000).contains(&stamp),
+        "a server hint must stay unfloored, got stamp {stamp}"
     );
 }
 
@@ -5992,10 +14195,11 @@ fn fetch_third_party_due_a_live_body_keeps_the_bare_cadence() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms(&state, "generic-live", before);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms(&state, "generic-live");
     assert!(
-        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
-        "a live body must keep the bare cadence, got gap {gap}ms"
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp),
+        "a live body must keep the bare cadence, got stamp {stamp}"
     );
 }
 
@@ -6011,10 +14215,11 @@ fn fetch_third_party_due_no_data_at_a_wide_interval_adds_nothing() {
     crate::usage::reset_request_slots();
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
-    let gap = stamped_gap_ms_at(&state, "generic-wide", before, interval);
+    let after = super::now_ms();
+    let stamp = stamped_next_ms_at(&state, "generic-wide", interval);
     assert!(
-        (interval..interval + 2_000).contains(&gap),
-        "a wide interval must not be extended, got gap {gap}ms"
+        (before + interval..=after + interval).contains(&stamp),
+        "a wide interval must not be extended, got stamp {stamp}"
     );
 }
 
@@ -6077,6 +14282,7 @@ fn bootstrap_third_party_seeds_any_cache() {
             resets_at: None,
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -6084,7 +14290,7 @@ fn bootstrap_third_party_seeds_any_cache() {
         observed: None,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
-    crate::testutil::register_names(&["cached", "stale", "windowless"]);
+    crate::testutil::register_names(&["cached", "stale", "windowless", "display"]);
     write_profile_cache(
         &crate::profile::ProfileName::from("cached"),
         THIRD_PARTY_CACHE_FILE,
@@ -6114,18 +14320,50 @@ fn bootstrap_third_party_seeds_any_cache() {
         SystemTime::now() - Duration::from_secs(2 * 3600),
     );
 
+    // `display` is a seed name outside the work list (a disabled or keyless
+    // account): its reading is seeded, its status and stamp are not.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("display"),
+        THIRD_PARTY_CACHE_FILE,
+        &stats(30.0),
+    );
     let entries = vec![
         tp_entry("cached"),
         tp_entry("stale"),
         tp_entry("windowless"),
         tp_entry("missing"),
     ];
+    let names = vec![
+        "cached".to_string(),
+        "stale".to_string(),
+        "windowless".to_string(),
+        "missing".to_string(),
+        "display".to_string(),
+    ];
     bootstrap_third_party(
         &store,
         &status,
         &last_fetched,
+        &names,
         &entries,
         REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        store.lock().unwrap().contains_key("display"),
+        "a display-only name's cached reading is seeded"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("display").copied(),
+        None,
+        "nothing polls a display-only name, so it carries no status"
+    );
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("display")),
+        "a display-only name is left unstamped"
     );
 
     assert!(
@@ -6622,13 +14860,32 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
+    // A stale entry the daemon's cache no longer backs (another process removed
+    // the cache): the stand-down mirror must remove it, not keep it.
+    store
+        .lock()
+        .unwrap()
+        .insert("cacheless".to_string(), info.clone());
+    status
+        .lock()
+        .unwrap()
+        .insert("cacheless".to_string(), super::FetchStatus::Fresh);
+    last_fetched.lock().unwrap().insert(
+        oauth_key("cacheless"),
+        super::FetchStamp::at(super::EpochMs::from_millis(super::now_ms())),
+    );
+
     super::hydrate_from_daemon_caches(
         &store,
         &status,
         &tp_store,
         &tp_status,
         &last_fetched,
-        &["kitty".to_string(), "cacheless".to_string()],
+        &[
+            ("kitty".to_string(), REFRESH_INTERVAL_MS),
+            ("cacheless".to_string(), REFRESH_INTERVAL_MS),
+        ],
+        &[],
         &[],
         REFRESH_INTERVAL_MS,
     );
@@ -6656,8 +14913,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         "last_fetched stamped at the cache mtime: {stamp:?} vs now {now}"
     );
 
-    // No cache → left untouched (the daemon publishes it shortly); never a
-    // synthetic entry that would render as data.
+    // No cache → the stale entry is REMOVED, never a synthetic entry that
+    // would render as data.
     assert!(store.lock().unwrap().get("cacheless").is_none());
     assert!(status.lock().unwrap().get("cacheless").is_none());
     assert!(
@@ -6665,6 +14922,57 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
             .lock()
             .unwrap()
             .get(&oauth_key("cacheless"))
+            .is_none()
+    );
+}
+
+/// A cacheless third-party seed name drops its stale provider entries (store,
+/// status and cadence leg) — the mirror's third-party half.
+#[test]
+fn standdown_hydrate_removes_a_cacheless_third_party_name() {
+    use crate::testutil::{bar, stats_with_bars};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["tp-cacheless"]);
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    tp_store.lock().unwrap().insert(
+        "tp-cacheless".to_string(),
+        stats_with_bars(vec![bar("5h", 47.0)]),
+    );
+    tp_status
+        .lock()
+        .unwrap()
+        .insert("tp-cacheless".to_string(), super::FetchStatus::Fresh);
+    last_fetched.lock().unwrap().insert(
+        tp_key("tp-cacheless"),
+        super::FetchStamp::at(super::EpochMs::from_millis(super::now_ms())),
+    );
+
+    super::hydrate_from_daemon_caches(
+        &store,
+        &status,
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &[],
+        &["tp-cacheless".to_string()],
+        &[],
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(tp_store.lock().unwrap().get("tp-cacheless").is_none());
+    assert!(tp_status.lock().unwrap().get("tp-cacheless").is_none());
+    assert!(
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(&tp_key("tp-cacheless"))
             .is_none()
     );
 }
@@ -6689,7 +14997,7 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
     let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let hydrate = |seed_names: &[String]| {
+    let hydrate = |seed_names: &[(String, u64)]| {
         super::hydrate_from_daemon_caches(
             &store,
             &status,
@@ -6697,6 +15005,7 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
             &tp_status,
             &last_fetched,
             seed_names,
+            &[],
             &[],
             REFRESH_INTERVAL_MS,
         )
@@ -6708,19 +15017,81 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
         USAGE_CACHE_FILE,
         &at(10.0),
     );
-    hydrate(&["kitty".to_string()]);
+    hydrate(&[("kitty".to_string(), REFRESH_INTERVAL_MS)]);
     write_profile_cache(
         &crate::profile::ProfileName::from("kitty"),
         USAGE_CACHE_FILE,
         &at(55.0),
     );
-    hydrate(&["kitty".to_string()]);
+    hydrate(&[("kitty".to_string(), REFRESH_INTERVAL_MS)]);
 
     let seeded = store.lock().unwrap().get("kitty").cloned();
     assert_eq!(
         seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
         Some(55.0),
         "the daemon's newer write wins on the next hydrate"
+    );
+}
+
+/// A cache that exists but won't parse leaves the entries (a transient read
+/// must not blank a reading), and a name absent from the seed list is never
+/// touched by hydration.
+#[test]
+fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, profile_cache_path};
+    use crate::usage::UsageInfo;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["kitty"]);
+    let path = profile_cache_path(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+
+    let info = UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    store
+        .lock()
+        .unwrap()
+        .insert("kitty".to_string(), info.clone());
+    store
+        .lock()
+        .unwrap()
+        .insert("stranger".to_string(), info.clone());
+
+    super::hydrate_from_daemon_caches(
+        &store,
+        &status,
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
+        &[],
+        &[],
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        store.lock().unwrap().contains_key("kitty"),
+        "an unparseable cache leaves the reading as it is"
+    );
+    assert!(
+        store.lock().unwrap().contains_key("stranger"),
+        "a name absent from the seed list is never touched by hydration"
     );
 }
 
@@ -6757,7 +15128,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -6771,13 +15142,15 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(true),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -6852,7 +15225,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -6866,13 +15239,15 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(true),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -6902,6 +15277,131 @@ fn standdown_sweeps_bootstrap_queued_marks() {
     );
 }
 
+/// A stood-down TUI hydrates the third-party display superset off the daemon's
+/// caches: the DISABLED `off` (never on the work list) shows its cached
+/// reading, with no status or stamp since nothing polls it, while the work
+/// list's `on` gets both.
+#[test]
+fn standdown_hydrates_a_disabled_provider_accounts_reading_only() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let deepseek = |name: &str, disabled: bool| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        p.api_key = Some("k".to_string());
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+        p.disabled = disabled;
+        p
+    };
+    let profiles = vec![deepseek("on", false), deepseek("off", true)];
+    crate::testutil::register_names(&["on", "off"]);
+    write_profile_cache(
+        &ProfileName::from("on"),
+        THIRD_PARTY_CACHE_FILE,
+        &tp_stats_with_bar(30.0),
+    );
+    write_profile_cache(
+        &ProfileName::from("off"),
+        THIRD_PARTY_CACHE_FILE,
+        &tp_stats_with_bar(47.0),
+    );
+    let mut state = third_party_state(crate::providers::fetch_third_party_usage);
+    state.display_reader = true;
+    *state.third_party_tokens.lock().unwrap() = super::collect_third_party_entries(&profiles);
+    *state.config.lock().unwrap() = AppConfig {
+        state: AppState::default(),
+        profiles,
+    };
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let pct = |name: &str| {
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.bars.iter().map(|b| b.pct).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        (pct("on"), pct("off")),
+        (Some(vec![30.0]), Some(vec![47.0])),
+        "both cached readings are hydrated"
+    );
+    let status = state.third_party_status.lock().unwrap().clone();
+    assert_eq!(
+        (status.get("on").copied(), status.get("off").copied()),
+        (Some(super::FetchStatus::Fresh), None),
+        "only the polled account carries a status"
+    );
+    let lf = state.last_fetched.lock().unwrap();
+    assert_eq!(
+        (
+            lf.contains_key(&tp_key("on")),
+            lf.contains_key(&tp_key("off"))
+        ),
+        (true, false),
+        "only the polled account is stamped"
+    );
+}
+
+/// A stood-down DAEMON has no display reader of its provider store
+/// (`status.json` reads off disk), so its stand-down hydration seeds the work
+/// list, never the display superset: a DISABLED provider account's cache never
+/// enters the store, exactly as its boot seed already does.
+#[test]
+fn standdown_without_a_display_reader_hydrates_the_work_list_only() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let deepseek = |name: &str, disabled: bool| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        p.api_key = Some("k".to_string());
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+        p.disabled = disabled;
+        p
+    };
+    let profiles = vec![deepseek("on", false), deepseek("off", true)];
+    crate::testutil::register_names(&["on", "off"]);
+    write_profile_cache(
+        &ProfileName::from("on"),
+        THIRD_PARTY_CACHE_FILE,
+        &tp_stats_with_bar(30.0),
+    );
+    write_profile_cache(
+        &ProfileName::from("off"),
+        THIRD_PARTY_CACHE_FILE,
+        &tp_stats_with_bar(47.0),
+    );
+    // `display_reader` stays false (the `third_party_state` default): a daemon.
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.third_party_tokens.lock().unwrap() = super::collect_third_party_entries(&profiles);
+    *state.config.lock().unwrap() = AppConfig {
+        state: AppState::default(),
+        profiles,
+    };
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let pct = |name: &str| {
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.bars.iter().map(|b| b.pct).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        (pct("on"), pct("off")),
+        (Some(vec![30.0]), None),
+        "only the work-list reading is hydrated; the disabled account's cache never enters the store"
+    );
+}
+
 /// Single-fetcher lease (#27): when another instance already holds
 /// `usage-fetch.lock`, `tick` must take the stand-down path. Driven through the
 /// real `tick` (not `standdown_tick`) so the lease branch itself is pinned: an
@@ -6924,7 +15424,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     use crate::profile::{AppConfig, AppState};
     use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
     use crate::usage::UsageInfo;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     let _home = crate::testutil::HomeSandbox::new();
 
     // Another instance wins the lease first; its `File` must stay alive so the
@@ -6951,7 +15451,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -6965,15 +15465,17 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -7003,8 +15505,8 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         "stood down: the store is hydrated from the shared cache"
     );
     assert!(
-        state.standdown_active.load(Ordering::Relaxed),
-        "the stand-down edge is recorded"
+        !state.fetch_lease.fetches_here(),
+        "the lease records the stand-down"
     );
     drop(other);
 }
@@ -7037,6 +15539,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     profile.base_url = Some(base.clone());
     profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
@@ -7047,6 +15550,11 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
             base_url: base.clone(),
         },
         api_key: "key".to_string(),
+        identity: crate::usage::third_party_identity(None, Some("key"), None, Some(base.as_str())),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::ThirdParty,
+        ),
     };
     let state = super::SchedulerState {
         config,
@@ -7056,7 +15564,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -7070,14 +15578,16 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     super::tick(&state);
@@ -7128,6 +15638,95 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     );
 }
 
+/// R1 (partition epoch capture): the tick's partition stamps each entry's spawn
+/// epoch from the CURRENT epoch map, so a rebuilt entry landing after a forget
+/// still writes its store entry and cadence — never the build-time 0, which
+/// would read as "epoch moved" and drop both.
+#[test]
+fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["z"]);
+    let z = crate::profile::ProfileName::from("z");
+    let _old = save_unanchored_login("z", "z-old");
+    // A change site forgets `z` (a re-login), then the rebuild writes the new
+    // credential before the tick's partition runs.
+    crate::usage::bump_epoch_for_test(&z, crate::usage::Half::OAuth);
+    let new = save_unanchored_login("z", "z-new");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![new],
+    }));
+
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    // The token list holds the rebuilt entry with the build-time 0 epoch; the
+    // partition is what stamps it with the post-bump epoch.
+    let due = collect_tokens(&config.lock().unwrap());
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(due)),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+
+    assert!(
+        state.store.lock().unwrap().contains_key("z"),
+        "the rebuilt entry's landing writes its store entry (partition epoch capture)"
+    );
+    assert!(
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("z")),
+        "the rebuilt entry's landing stamps cadence (partition epoch capture)"
+    );
+}
+
 /// Pins two tick legs the existing armed-tick test does not cover: the
 /// history-prune leg and the cadence-window throttle.
 ///
@@ -7160,6 +15759,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     profile.base_url = Some(base.clone());
     profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
@@ -7170,6 +15770,11 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
             base_url: base.clone(),
         },
         api_key: "key".to_string(),
+        identity: crate::usage::third_party_identity(None, Some("key"), None, Some(base.as_str())),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::ThirdParty,
+        ),
     };
     let stale_prune = crate::usage::now_ms().saturating_sub(HISTORY_PRUNE_INTERVAL_MS + 1);
     let state = super::SchedulerState {
@@ -7179,7 +15784,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -7193,13 +15798,15 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(stale_prune),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     // First tick: wins the lease, prunes histories, fetches.
@@ -7273,6 +15880,9 @@ fn auto_start_queue_election_is_wired_into_tick() {
         },
         profiles: vec![auto_start_queue_profile("a"), auto_start_queue_profile("b")],
     };
+    for profile in &app_config.profiles {
+        crate::profile::save_profile(profile).expect("save profile");
+    }
     let tokens = super::collect_tokens(&app_config);
     let lapsed = || UsageInfo {
         five_hour: Some(UsageWindow {
@@ -7293,7 +15903,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -7307,13 +15917,15 @@ fn auto_start_queue_election_is_wired_into_tick() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     super::tick(&state);
@@ -7374,10 +15986,8 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         },
         profiles: vec![auto_start_queue_profile("a")],
     };
-    let mut entry = super::collect_tokens(&app_config)
-        .into_iter()
-        .next()
-        .expect("queued token");
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = collect_one_token_for_landing(&app_config);
     entry.may_open_window = true;
     let config = Arc::new(RankedMutex::new(app_config));
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -7391,7 +16001,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         },
     )])));
     let refetch = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let streaks = Arc::new(RankedMutex::new(HashMap::new()));
     let blocks = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -7522,10 +16132,14 @@ fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
             auto_start_queue_profile("sibling"),
         ],
     };
-    let entry = super::collect_tokens(&app_config)
+    for profile in &app_config.profiles {
+        crate::profile::save_profile(profile).expect("save profile");
+    }
+    let mut entry = super::collect_tokens(&app_config)
         .into_iter()
         .find(|entry| entry.name == "elected")
         .expect("elected token");
+    entry.epoch_at_spawn = crate::usage::epoch_value(&entry.name, crate::usage::Half::OAuth);
     let config = Arc::new(RankedMutex::new(app_config));
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
         "elected".to_string(),
@@ -7628,10 +16242,8 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
         },
         profiles: vec![auto_start_queue_profile("a")],
     };
-    let mut entry = super::collect_tokens(&app_config)
-        .into_iter()
-        .next()
-        .expect("queued token");
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = collect_one_token_for_landing(&app_config);
     entry.may_open_window = true; // elected this tick
     let config = Arc::new(RankedMutex::new(app_config));
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -7798,6 +16410,7 @@ fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
 fn apply_outcome_threads_is_active_into_the_deferral() {
     use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome, now_ms};
 
+    let _home = crate::testutil::HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -7820,6 +16433,15 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(
+            &crate::profile::ProfileName::from(name),
+            crate::usage::Half::OAuth,
+        ),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     };
 
     let before = now_ms();
@@ -7893,7 +16515,7 @@ fn completion_order_state() -> super::SchedulerState {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -7907,13 +16529,15 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     }
 }
 
@@ -7931,6 +16555,12 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         login_gone: false,
         plan_override: None,
         retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
     }
 }
 
@@ -7939,6 +16569,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    let _home = crate::testutil::HomeSandbox::new();
     let state = completion_order_state();
 
     // `slow` (index 0) blocks in its worker until the test releases it; `fast`
@@ -8163,7 +16794,7 @@ fn recovery_config(
     active_profile: Option<&str>,
     fallback_chain: &[&str],
 ) -> crate::profile::ConfigHandle {
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
 
     Arc::new(RankedMutex::new(AppConfig {
         state: AppState {
@@ -8171,7 +16802,7 @@ fn recovery_config(
             fallback_chain: fallback_chain.iter().map(|s| (*s).into()).collect(),
             ..AppState::default()
         },
-        profiles: vec![Profile::new("b".to_string(), None, None)],
+        profiles: vec![logged_in("b")],
     }))
 }
 
@@ -8206,6 +16837,7 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert_eq!(
@@ -8242,6 +16874,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8277,6 +16910,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
             &kick_blocks,
             &pending,
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -8296,6 +16930,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     assert!(
         pending.lock().unwrap().is_empty(),
@@ -8336,6 +16971,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8366,6 +17002,7 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert_eq!(
@@ -8377,6 +17014,171 @@ fn scan_recovery_queues_a_recovered_chain_member() {
             key_rejected_cause: None,
         }]),
         "a recovered chain member must be queued for switch"
+    );
+}
+
+/// The switch-off recovery walk never queues a relink onto a recovered-looking
+/// member that holds no login (no stored pair, no session-token sidecar, no api
+/// key): the relink would install an empty login into the global slot.
+#[test]
+fn scan_recovery_never_queues_a_member_holding_no_login() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::new(),
+        "a member holding no login must never be queued"
+    );
+}
+
+/// The recovery walk's skip filter (P3): a skipped member whose store still
+/// reads unreadable sits ahead of a clear member; recovery must pass over it and
+/// queue the clear one, or the relink re-picks the skipped member off the stale
+/// config and wedges recovery on it forever.
+#[test]
+fn scan_recovery_passes_over_a_skipped_member_to_the_next_clear_one() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let profiles: Vec<crate::profile::Profile> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&ProfileName::from(*name));
+            p.credentials = Some(crate::testutil::oauth_pair(name));
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles,
+    }));
+    let now = crate::usage::now_epoch_secs();
+    let recoverable = |util: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: util,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), recoverable(10.0)),
+        ("b".to_string(), recoverable(10.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let skipped: super::SkippedUnreadable =
+        Arc::new(RankedMutex::new(HashSet::from(["a".to_string()])));
+    // Tear "a"'s committed store so the healing re-read keeps it skipped.
+    let a_store = crate::profile::profile_dir(&ProfileName::from("a"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&a_store, "{\"claudeAiOauth\": {\"accessToken\": ").expect("tear a's store");
+
+    scan_recovery(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &skipped,
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+            reason: None,
+            proactive: false,
+        }]),
+        "a skipped clear member ahead of a clear one must be passed over"
+    );
+}
+
+/// cloudy's "polled readings only" on the switch-off recovery walk: a keyless
+/// provider member's cached reading (seeded by the display superset) reads as
+/// no reading, so a recovered-looking cache never queues a relink onto an
+/// account nothing polls — `6836c1a6`'s absent store entry, never a recovered
+/// member (the A4 divergence: passing the display superset queues it).
+#[test]
+fn scan_recovery_ignores_a_keyless_provider_members_cached_reading() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::providers::Provider;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut kl = Profile::new(
+        "kl".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    kl.provider = Some(Provider::DeepSeek);
+    let config = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["kl".into()],
+            ..AppState::default()
+        },
+        profiles: vec![kl],
+    }));
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    super::scan_recovery(
+        &config,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &tp_store_with("kl", 10.0),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &tp_status_with("kl", super::FetchStatus::Fresh),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a keyless member's cached recovered reading never queues a relink"
     );
 }
 
@@ -8415,6 +17217,7 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8470,6 +17273,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8518,6 +17322,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8561,6 +17366,7 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -8619,6 +17425,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
@@ -8626,12 +17433,15 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
         // while the seed hoist stays, the tick thread this would spawn breaks
         // at its loop-top check instead of looping past this sandbox teardown.
         Arc::new(AtomicBool::new(true)),
         Arc::new(crate::daemon::FetchLease::new()),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     // `cfg!(test)` makes `spawn_refresher` return without ever spawning the
@@ -8641,6 +17451,114 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         kick_blocks.lock().unwrap().get("kitty").copied(),
         Some(cached),
         "the on-disk kick block must be seeded before spawn_refresher returns"
+    );
+}
+
+/// Write a kick block for `name` where the fetching instance's write-through
+/// leaves it, and return it.
+fn cached_kick_block(name: &str) -> super::KickBlock {
+    let block = super::KickBlock {
+        streak: 2,
+        rejected: true,
+        until: Some(1_700_000_600),
+        next_retry: 1_700_000_100,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &block,
+    );
+    block
+}
+
+/// A stood-down instance mirrors the kick block the fetching instance's probe
+/// set on an account without a pair, so its card shows the block and the fix
+/// line that lifts it.
+#[test]
+fn a_stood_down_instance_mirrors_a_probed_accounts_kick_block() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 90_000, true);
+    let block = cached_kick_block("probed");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
+    );
+}
+
+/// With the probe switched off the block sits out its ceiling, and a
+/// stood-down instance still mirrors it for an account without a pair.
+#[test]
+fn a_stood_down_instance_mirrors_a_kick_block_with_the_probe_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 90_000, true);
+    if let Some(p) = state
+        .config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("probed"))
+    {
+        p.usage_probe = false;
+    }
+    let block = cached_kick_block("probed");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
+    );
+}
+
+/// A restart seeds the kick block of an account without a pair as it seeds a
+/// pair's: the account is on no token list, and its block is on disk.
+#[test]
+fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
+    use super::{KickBlocks, spawn_refresher};
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["probed"]);
+    let block = cached_kick_block("probed");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("probed"),
+        )],
+    }));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    spawn_refresher(
+        config,
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::clone(&kick_blocks),
+        crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
+    );
+
+    assert_eq!(
+        kick_blocks.lock().unwrap().get("probed").copied(),
+        Some(block)
     );
 }
 
@@ -8712,12 +17630,17 @@ fn a_live_fetch_appends_the_sample_and_its_bridge() {
         .unwrap()
         .insert("alice".to_string(), history_sample(50.0));
 
+    let mut outcome = FetchOutcome::live(
+        &crate::profile::ProfileName::from("alice"),
+        history_sample(80.0),
+        None,
+    );
+    outcome.epoch_at_spawn = crate::usage::epoch_value(
+        &crate::profile::ProfileName::from("alice"),
+        crate::usage::Half::OAuth,
+    );
     apply_outcome(
-        FetchOutcome::live(
-            &crate::profile::ProfileName::from("alice"),
-            history_sample(80.0),
-            None,
-        ),
+        outcome,
         &store,
         &status,
         &last_fetched,
@@ -8863,8 +17786,10 @@ fn a_fresh_wire_reset_drops_the_prev_wire_sourced_window() {
         store.lock().unwrap().insert(name.to_string(), prev.clone());
         write_profile_cache(&profile, USAGE_CACHE_FILE, &prev);
 
+        let mut outcome = FetchOutcome::live(&profile, wire_reset.clone(), None);
+        outcome.epoch_at_spawn = crate::usage::epoch_value(&profile, crate::usage::Half::OAuth);
         apply_outcome(
-            FetchOutcome::live(&profile, wire_reset.clone(), None),
+            outcome,
             &store,
             &status,
             &last_fetched,
@@ -8926,18 +17851,20 @@ fn a_lagging_fresh_body_keeps_the_kick_window_and_its_stamp() {
         .cloned()
         .expect("mark_window_open seeded the store");
 
+    let mut outcome = FetchOutcome::live(
+        &profile,
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+        None,
+    );
+    outcome.epoch_at_spawn = crate::usage::epoch_value(&profile, crate::usage::Half::OAuth);
     apply_outcome(
-        FetchOutcome::live(
-            &profile,
-            UsageInfo {
-                five_hour: Some(UsageWindow {
-                    utilization: 0.0,
-                    resets_at: None,
-                }),
-                ..Default::default()
-            },
-            None,
-        ),
+        outcome,
         &store,
         &status,
         &last_fetched,
@@ -8990,12 +17917,17 @@ fn an_unchanged_live_sample_appends_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, last_fetched, streaks) = history_stores();
     let apply = || {
+        let mut outcome = FetchOutcome::live(
+            &crate::profile::ProfileName::from("alice"),
+            history_sample(80.0),
+            None,
+        );
+        outcome.epoch_at_spawn = crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("alice"),
+            crate::usage::Half::OAuth,
+        );
         apply_outcome(
-            FetchOutcome::live(
-                &crate::profile::ProfileName::from("alice"),
-                history_sample(80.0),
-                None,
-            ),
+            outcome,
             &store,
             &status,
             &last_fetched,
@@ -9035,12 +17967,17 @@ fn a_cold_store_does_not_re_append_the_last_recorded_sample() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, last_fetched, streaks) = history_stores();
     let apply = |util: f64| {
+        let mut outcome = FetchOutcome::live(
+            &crate::profile::ProfileName::from("alice"),
+            history_sample(util),
+            None,
+        );
+        outcome.epoch_at_spawn = crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("alice"),
+            crate::usage::Half::OAuth,
+        );
         apply_outcome(
-            FetchOutcome::live(
-                &crate::profile::ProfileName::from("alice"),
-                history_sample(util),
-                None,
-            ),
+            outcome,
             &store,
             &status,
             &last_fetched,
@@ -9165,6 +18102,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
@@ -9172,12 +18110,15 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         // Same pre-armed shutdown as the kick-block seed test: if the
         // `cfg!(test)` spawn-skip ever goes while this hoist stays, the tick
         // thread breaks at its loop top instead of outliving the sandbox.
         Arc::new(AtomicBool::new(true)),
         Arc::new(crate::daemon::FetchLease::new()),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     for name in ["kitty", "sleepy", "orphan"] {
@@ -9309,11 +18250,20 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9442,11 +18392,20 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9552,11 +18511,20 @@ fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9569,6 +18537,392 @@ fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
     );
     assert_eq!(outcome.status, super::FetchStatus::Cached);
     assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// A refresh refused by the shutdown flag sends nothing: the leg walks through
+/// the 401 and the pre-spend checks, then the flag gate at the marker site
+/// bails unrotated before the token endpoint. `max` sits above the happy path
+/// (usage + the identity probe) so a leaked token POST is RECORDED, never
+/// refused a socket.
+#[test]
+fn a_shutting_down_refresh_refuses_without_sending_or_marking() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-shutting-down";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a shutting-down refresh must not spend the token: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the refusal must leave no spend marker"
+    );
+}
+
+/// The poll leg's claim is its own: a marker the TUI holds on the account (a
+/// switch gate, its rotate) is neither overwritten nor cleared by the rotation,
+/// and the rotation's own claim is gone once it returns.
+#[test]
+fn a_poll_rotation_runs_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-slot-held";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    super::mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from(name),
+        super::ProfileActivity::Switching,
+    );
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the poll leg rotates beside the TUI's marker: {seen:?}"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert_eq!(
+        account_marker(&activity, name),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the poll"
+    );
+    super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the poll leg's own claim is gone once it returned"
+    );
+}
+
+/// A TUI-side clear of the account slot while the poll leg spends (the TUI's
+/// rotate retiring its own marker) leaves the poll leg's claim standing: the
+/// quit still waits for the spend that runs.
+#[test]
+fn a_tui_clear_during_a_poll_rotation_leaves_its_claim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-tui-clear";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let in_flight_after_clear = Arc::new(std::sync::Mutex::new(None));
+    {
+        let activity = Arc::clone(&activity);
+        let in_flight_after_clear = Arc::clone(&in_flight_after_clear);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || {
+                super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+                *in_flight_after_clear.lock().expect("record") =
+                    Some(super::token_spend_in_flight(&activity));
+            }),
+        );
+    }
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    server.join().expect("listener");
+
+    assert_eq!(
+        *in_flight_after_clear.lock().expect("record"),
+        Some(true),
+        "the poll leg's claim survives a TUI clear of the account slot"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// The kick's spend site refuses the same way: a 401 kick walks to the marker
+/// site, the flag gate refuses, and the token endpoint is never reached.
+#[test]
+fn a_shutting_down_kick_refuses_without_sending_or_marking() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-shutting-down";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((&activity, &shutting_down)),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a shutting-down kick must not spend the token: {seen:?}"
+    );
+    assert_eq!(result.rotated, None, "nothing may be rotated");
+    assert!(
+        activity.lock().unwrap().get(name).is_none(),
+        "the refusal must leave no marker"
+    );
+}
+
+/// The kick's claim is its own: a marker the TUI holds on the account is
+/// neither overwritten nor cleared by the kick's rotation, and the kick's own
+/// claim is gone once it returns.
+#[test]
+fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-slot-held";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity = crate::testutil::fresh_activity();
+    super::mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from(name),
+        super::ProfileActivity::Switching,
+    );
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((&activity, &shutting_down)),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick rotates beside the TUI's marker: {seen:?}"
+    );
+    assert!(result.rotated.is_some(), "the kick's rotation landed");
+    assert_eq!(
+        account_marker(&activity, name),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the kick"
+    );
+    super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the kick's own claim is gone once it returned"
+    );
+}
+
+/// The admitted direction of the flag gate: a clear flag raises `Refreshing`,
+/// which is exactly what `shutdown`'s poll reads; a set flag refuses and leaves
+/// the store empty.
+#[test]
+fn the_shutdown_flag_gate_admits_or_refuses_a_spend() {
+    let activity = crate::testutil::fresh_activity();
+    let name = crate::profile::ProfileName::from("work");
+    let flag = std::sync::atomic::AtomicBool::new(false);
+
+    assert!(
+        super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "an unset flag must admit the spend"
+    );
+    assert!(
+        super::token_spend_in_flight(&activity),
+        "the admitted spend must be visible to shutdown's poll"
+    );
+    super::clear_activity(&activity, &name);
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a set flag must refuse the spend"
+    );
+    assert!(
+        activity.lock().unwrap().get(name.as_str()).is_none(),
+        "the refusal must leave no marker"
+    );
+}
+
+/// A poisoned activity store fails open: with no shutdown in flight the spend
+/// still proceeds (nothing can be raised), and only a set flag refuses it.
+#[test]
+fn a_poisoned_activity_store_fails_open_unless_shutting_down() {
+    let activity = crate::testutil::fresh_activity();
+    let name = crate::profile::ProfileName::from("work");
+    // Poison the store the way it happens in production: a thread panics while
+    // holding the lock, so every later `lock()` returns the poison error.
+    let poisoner = Arc::clone(&activity);
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock();
+        panic!("deliberate: poison the activity store");
+    })
+    .join();
+
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a poisoned store with no shutdown in flight must still admit the spend"
+    );
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a poisoned store with the shutdown flag set must refuse"
+    );
+}
+
+/// The flag read and the `Refreshing` raise happen under ONE activity-store
+/// lock hold: a flag stored while the helper is parked on the store is still
+/// seen, so the spend refuses. A helper that loads the flag before locking
+/// reopens the check-then-exit interleaving this one-hold shape closes.
+#[test]
+fn the_flag_read_and_raise_share_one_lock_hold() {
+    let activity = crate::testutil::fresh_activity();
+    let name = crate::profile::ProfileName::from("work");
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let held = activity.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let store = Arc::clone(&activity);
+        let flag_for_worker = Arc::clone(&flag);
+        scope.spawn(move || {
+            let _ = tx.send(super::raise_refreshing_unless_shutting_down(
+                &store,
+                &name,
+                &flag_for_worker,
+            ));
+        });
+        // Let the spawned thread run until it is parked on the held store. The
+        // store is held, so the helper cannot return; once the thread is
+        // scheduled it reaches `store.lock()` (this shape) or reads the flag
+        // and then blocks on the store (the two-hold mutant). A short sleep is
+        // the wait — 100 ms dwarfs thread-start latency, and the flag store
+        // below must land while the thread is parked for the one-hold property
+        // to refuse.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+    });
+    let admitted = rx.recv().expect("the helper's answer");
+    assert!(
+        !admitted,
+        "the one-hold helper must refuse when the flag lands while it is blocked on the store"
+    );
 }
 
 /// The flagged-profile skip must take the `bail_unrotated` shape, never an
@@ -9624,11 +18978,20 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 300_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9693,11 +19056,20 @@ fn a_flagged_non_active_profile_carries_a_moved_disk_pair_without_a_refresh() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9765,11 +19137,20 @@ fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_ref
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -9851,12 +19232,21 @@ fn a_live_session_blocking_rotation_still_carries_a_moved_disk_pair() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(true));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -9926,12 +19316,21 @@ fn a_live_session_blocking_rotation_with_an_unchanged_pair_still_bails() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(true));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -9996,12 +19395,21 @@ fn a_disarmed_refusal_keeps_the_carry_outcome_on_the_unblocked_path() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::runtime::set_rotation_blocked_override(Some(false));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -10079,11 +19487,20 @@ fn a_tokenless_profile_bails_before_the_carry_runs() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: true,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10147,6 +19564,8 @@ fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEnt
         access_expires_at,
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     }
 }
 
@@ -10267,7 +19686,7 @@ fn a_429_on_a_clock_expired_token_rotates_and_repulls_the_plan() {
     silence_profile_ttl(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 - 1_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     // A plan already in hand, so `prev_plan.is_none()` is FALSE and the unmask is
     // the only thing left that can force the retry's `/profile` pull.
@@ -10277,6 +19696,7 @@ fn a_429_on_a_clock_expired_token_rotates_and_repulls_the_plan() {
         Some(active_pro_plan()),
         &refetch,
         &activity,
+        &std::sync::atomic::AtomicBool::new(false),
     );
     let seen = server.join().expect("listener");
 
@@ -10347,9 +19767,16 @@ fn a_rate_limited_retry_keeps_the_pair_and_never_enqueues_a_refetch() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10406,9 +19833,16 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10464,9 +19898,16 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     );
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10517,9 +19958,16 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
     crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10601,9 +20049,16 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
     write_live_mirror("at-mirror-pre", crate::usage::now_ms() as i64 + 90_000_000);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10667,9 +20122,16 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
     silence_profile_ttl(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -10813,17 +20275,29 @@ fn claude_rolling_tick_restamps_a_dying_rolling_sidecar() {
     let now = crate::usage::now_ms();
 
     let calls = std::sync::atomic::AtomicUsize::new(0);
-    super::claude_rolling_tick(&config, &pacing, now, &|name| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(name, "cl-feed");
-        crate::oauth::AuthGate::Ready
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(name, "cl-feed");
+            crate::oauth::AuthGate::Ready
+        },
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the scan gap: no re-run even though the sidecar is still dying.
-    super::claude_rolling_tick(&config, &pacing, now + 1_000, &|_| {
-        panic!("inside the scan gap — must not re-run")
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 1_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| panic!("inside the scan gap — must not re-run"),
+    );
 }
 
 /// Fresh sidecars and non-rolling profiles are never the timer's business.
@@ -10834,9 +20308,390 @@ fn claude_rolling_tick_ignores_fresh_and_non_rolling_profiles() {
     write_rolling_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
     write_rolling_sidecar("cl-plain", 60 * 60 * 1000); // dying, but the rolling token is OFF
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
-        panic!("'{name}' must not be re-stamped")
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| panic!("'{name}' must not be re-stamped"),
+    );
+}
+
+/// A rolling profile whose sidecar is due for a re-stamp and whose stored chain
+/// is comfortable, so `tick`'s own gate re-stamps the sidecar from the chain
+/// with no token spend: the sidecar's access token says whether the leg ran.
+fn rolling_tick_state(name: &str) -> super::SchedulerState {
+    let profile_name = crate::profile::ProfileName::from(name);
+    let mut profile = crate::testutil::blank_profile(&profile_name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("{name}-chain"),
+            refresh_token: Some(format!("{name}-rt")),
+            expires_at: Some(crate::usage::now_ms() as i64 + 24 * 60 * 60 * 1000),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
     });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut app = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    app.state.profiles.push(profile_name);
+    crate::profile::save_app_state(&app.state).expect("save app state");
+    write_rolling_sidecar(name, 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let mut state = third_party_state(stub_ok_stats);
+    state.config = Arc::new(RankedMutex::new(app));
+    state
+}
+
+/// The access token the profile's rolling sidecar holds.
+fn sidecar_access_token(name: &str) -> Option<String> {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let bytes = std::fs::read(dir.join("session-token.json")).ok()?;
+    let creds: crate::profile::ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
+    creds.claude_ai_oauth.map(|oauth| oauth.access_token)
+}
+
+/// Control for the two refusals below: the fixture reaches `tick`'s re-stamp
+/// leg, which re-stamps the dying sidecar from the stored chain.
+#[test]
+fn tick_restamps_a_due_rolling_sidecar_from_its_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    // Any token spend stays on a refused local port.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-feed");
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-feed").as_deref(),
+        Some("cl-tick-feed-chain")
+    );
+}
+
+/// `tick` hands the re-stamp its OWN activity store: the re-stamp runs beside a
+/// marker the TUI holds there and leaves that marker standing.
+#[test]
+fn tick_restamps_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-busy");
+    super::mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("cl-tick-busy"),
+        super::ProfileActivity::Switching,
+    );
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-busy").as_deref(),
+        Some("cl-tick-busy-chain"),
+        "the re-stamp runs beside the TUI's marker"
+    );
+    assert_eq!(
+        account_marker(&state.activity, "cl-tick-busy"),
+        Some(super::ProfileActivity::Switching)
+    );
+    super::clear_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("cl-tick-busy"),
+    );
+    assert!(!super::token_spend_in_flight(&state.activity));
+}
+
+/// `tick` hands the re-stamp its OWN shutdown flag: once a quit set it, the
+/// due sidecar is left alone.
+#[test]
+fn a_shutting_down_tick_leaves_a_due_rolling_sidecar() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-quit");
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-quit").as_deref(),
+        Some("cl-tick-quit-rolled"),
+        "no re-stamp may start once shutdown began"
+    );
+}
+
+/// A codex profile whose chain is due inside the standby lead.
+fn write_due_codex_chain(name: &str) {
+    crate::testutil::write_codex_roster(&[name]);
+    crate::testutil::write_codex_store(
+        name,
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 60),
+            "rt.old",
+        ),
+    );
+}
+
+/// Whether the codex standby leg wrote its pre-wire attempt memo for `name`.
+fn codex_attempt_memo_exists(name: &str) -> bool {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("auth.attempt")
+        .exists()
+}
+
+/// `tick` hands the codex standby leg its OWN activity store: the refresh POST
+/// goes out under the account's marker in the store a TUI quit reads.
+#[test]
+fn tick_refreshes_a_due_codex_chain_under_its_own_spend_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let marked_at_post = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (addr, handle) = {
+        let activity = Arc::clone(&state.activity);
+        let marked_at_post = Arc::clone(&marked_at_post);
+        crate::testutil::serve_endpoints(1, move |_path, _i| {
+            marked_at_post
+                .lock()
+                .expect("record")
+                .push(super::spending_account(&activity));
+            (
+                200,
+                r#"{"id_token":"id.n","access_token":"at.n","refresh_token":"rt.new"}"#.to_string(),
+            )
+        })
+    };
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    // The codex usage leg runs in the same tick: keep it on a refused port.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-own");
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert_eq!(handle.join().expect("join stub"), ["/oauth/token"]);
+    assert_eq!(
+        *marked_at_post.lock().expect("record"),
+        vec![Some("cx-tick-own".to_string())],
+        "the POST went out under the marker in tick's own store"
+    );
+    assert_eq!(super::spending_account(&state.activity), None);
+}
+
+/// `tick` hands the codex standby leg its OWN shutdown flag: once a quit set
+/// it, the due chain is left alone, with no attempt memo written.
+#[test]
+fn a_shutting_down_tick_leaves_a_due_codex_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    // Any refresh stays on a refused local port.
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, "http://127.0.0.1:9");
+    let state = third_party_state(stub_ok_stats);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-quit");
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert!(
+        !codex_attempt_memo_exists("cx-tick-quit"),
+        "no refresh attempt may start once shutdown began"
+    );
+    assert!(crate::testutil::read_codex_store("cx-tick-quit").contains("rt.old"));
+}
+
+/// The account marker a test reads for one profile, `None` when the store
+/// holds no entry (or no account op) for it.
+fn account_marker(activity: &super::ActivityStore, name: &str) -> Option<super::ProfileActivity> {
+    activity
+        .lock()
+        .expect("activity store")
+        .get(name)
+        .and_then(|state| state.account)
+}
+
+/// A re-stamp can spend the profile's refresh token, so its gate runs under a
+/// scheduler spend claim: a TUI quit waits for it (`token_spend_in_flight`),
+/// the save cue names its account, and the claim is gone once the gate returns.
+#[test]
+fn a_rolling_restamp_holds_the_spend_marker_while_its_gate_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-marked"], &[]);
+    write_rolling_sidecar("cl-marked", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let during = std::sync::Mutex::new(Vec::new());
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| {
+            during.lock().expect("record").push((
+                name.to_string(),
+                super::spending_account(&activity),
+                super::token_spend_in_flight(&activity),
+            ));
+            crate::oauth::AuthGate::Refreshed
+        },
+    );
+
+    assert_eq!(
+        *during.lock().expect("record"),
+        vec![("cl-marked".to_string(), Some("cl-marked".to_string()), true)],
+        "the gate runs once, under the profile's own spend claim"
+    );
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the claim clears once the gate returns"
+    );
+}
+
+/// A gate that panics still drops its claim: a stranded claim would hold every
+/// later quit for the whole of `shutdown`'s backstop.
+#[test]
+fn a_panicking_rolling_restamp_clears_its_spend_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-panics"], &[]);
+    write_rolling_sidecar("cl-panics", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::claude_rolling_tick(
+            &config,
+            &pacing,
+            crate::usage::now_ms(),
+            &activity,
+            &shutting_down,
+            &|_| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("the gate dies mid-spend")
+            },
+        );
+    }));
+
+    assert!(unwound.is_err(), "the gate's panic propagates");
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate ran"
+    );
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "an unwinding gate leaves no spend claim behind"
+    );
+}
+
+/// The re-stamp's claim is its own: it runs beside a marker the TUI holds on
+/// the account (an answered switch gate whose drain waits on a modal) and leaves
+/// that marker standing.
+#[test]
+fn a_rolling_restamp_runs_beside_a_tui_marker_and_leaves_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-busy"], &[]);
+    write_rolling_sidecar("cl-busy", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let name = crate::profile::ProfileName::from("cl-busy");
+    super::mark_activity(&activity, &name, super::ProfileActivity::Switching);
+    let ran = std::sync::atomic::AtomicBool::new(false);
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|_| {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Ready
+        },
+    );
+
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate ran"
+    );
+    assert_eq!(
+        account_marker(&activity, "cl-busy"),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the scan"
+    );
+    super::clear_activity(&activity, &name);
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// A TUI-side clear of the account slot while the re-stamp spends leaves the
+/// re-stamp's claim standing: the quit still waits for it.
+#[test]
+fn a_tui_clear_during_a_rolling_restamp_leaves_its_claim() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-cleared"], &[]);
+    write_rolling_sidecar("cl-cleared", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let after_clear = std::sync::Mutex::new(None);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| {
+            super::clear_activity(&activity, name);
+            *after_clear.lock().expect("record") = Some(super::token_spend_in_flight(&activity));
+            crate::oauth::AuthGate::Refreshed
+        },
+    );
+
+    assert_eq!(
+        *after_clear.lock().expect("record"),
+        Some(true),
+        "the re-stamp's claim survives a TUI clear of the account slot"
+    );
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// Once shutdown began, a due re-stamp never starts: no gate call, so no token
+/// is spent after the quit decided, and no marker is raised to hold the quit.
+#[test]
+fn a_shutting_down_rolling_tick_runs_no_gate_and_raises_no_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-quitting"], &[]);
+    write_rolling_sidecar("cl-quitting", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| panic!("'{name}' must not be re-stamped once shutdown began"),
+    );
+
+    assert_eq!(account_marker(&activity, "cl-quitting"), None);
+    assert!(!super::token_spend_in_flight(&activity));
+    assert!(
+        pacing.lock().expect("pacing").retry_after_ms.is_empty(),
+        "a refused profile takes no retry hold"
+    );
 }
 
 /// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
@@ -10856,12 +20711,26 @@ fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Ready
     };
-    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Re-open the scan gate: the still-due Ready must have widened.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + 60_000, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 60_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -10874,6 +20743,8 @@ fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -10896,12 +20767,26 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
             crate::format::Retry::Connection,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Re-open the scan gate; the per-profile widening must still hold.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + 60_000, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 60_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -10910,7 +20795,14 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
 
     // Past the widening → retried.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -10927,19 +20819,26 @@ fn claude_rolling_tick_logs_a_login_change_as_deferred() {
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
 
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
-        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
-            crate::format::Cause::LoginChanged("cl-moved".to_string()),
-            crate::format::Retry::Stated,
-        ))
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+                crate::format::Cause::LoginChanged("cl-moved".to_string()),
+                crate::format::Retry::Stated,
+            ))
+        },
+    );
 
     drop(capture);
     assert_eq!(
         lines.snapshot(),
         vec![
             "tollgate: re-stamp for 'cl-moved' deferred: 'cl-moved' login changed during its \
-             refresh and the new login expires soon · retry in a moment"
+             refresh and the new login expires soon. Retry in a moment"
                 .to_string()
         ]
     );
@@ -10962,9 +20861,14 @@ fn claude_rolling_tick_skips_a_disabled_profile() {
     }
     write_rolling_sidecar("cl-off", 60 * 60 * 1000); // dying, inside the horizon
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
-        panic!("'{name}' is disabled and must never reach the re-stamp leg")
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| panic!("'{name}' is disabled and must never reach the re-stamp leg"),
+    );
 }
 
 /// A standing `auth_broken` takes the Broken leash on EVERY verdict. Without
@@ -10993,7 +20897,14 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Ready
     };
-    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Where an unflagged profile would retry (past ROLLING_RETRY_MS), the
@@ -11003,6 +20914,8 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(
@@ -11017,6 +20930,8 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         &config,
         &pacing,
         now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -11039,7 +20954,14 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Refreshed // clears any widening
     };
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the gap, gate untouched: the scan must not run. Pinned on the
@@ -11051,6 +20973,8 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         &config,
         &pacing,
         now + super::ROLLING_SCAN_GAP_MS - 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -11073,6 +20997,8 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         &config,
         &pacing,
         now + super::ROLLING_SCAN_GAP_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -11111,12 +21037,26 @@ fn claude_rolling_tick_survives_a_backwards_clock_step() {
         crate::oauth::AuthGate::Refreshed
     };
     // Tick 1 clamps the scan stamp back into range (and runs nothing).
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 2, one gap later: the scan runs and clamps the retry leash to at
     // most one Broken leash from NOW — the profile is still leashed here.
     let t2 = now + super::ROLLING_SCAN_GAP_MS + 1;
-    super::claude_rolling_tick(&config, &pacing, t2, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        t2,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 3, one clamped leash later: the profile runs. Unclamped, the
     // ten-leash stamp would have held it for most of a day longer.
@@ -11124,6 +21064,8 @@ fn claude_rolling_tick_survives_a_backwards_clock_step() {
         &config,
         &pacing,
         t2 + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -11149,12 +21091,26 @@ fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Broken
     };
-    super::claude_rolling_tick(&config, &pacing, now, &broken);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &broken,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Where a transient would retry, Broken must still be leashed.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &broken);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &broken,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -11165,6 +21121,8 @@ fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
         &config,
         &pacing,
         now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &broken,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -11191,7 +21149,14 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
             crate::format::Retry::Stated,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &unrecorded,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     // Where an ordinary transient would retry, the re-login refusal is still
     // leashed…
@@ -11200,6 +21165,8 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -11218,13 +21185,22 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
     };
     pacing.lock().unwrap().next_scan_ms = 0;
     pacing.lock().unwrap().retry_after_ms.clear();
-    super::claude_rolling_tick(&config, &pacing, now, &ordinary);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &ordinary,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     pacing.lock().unwrap().next_scan_ms = 0;
     super::claude_rolling_tick(
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &ordinary,
     );
     assert_eq!(
@@ -11256,7 +21232,14 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
             crate::format::Retry::Stated,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &unrecorded,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the leash with NOTHING changed on disk: still held.
@@ -11265,6 +21248,8 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -11298,6 +21283,8 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 2,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -11339,10 +21326,17 @@ fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
 
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        crate::oauth::AuthGate::Ready
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Ready
+        },
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -11377,7 +21371,14 @@ fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
         crate::oauth::AuthGate::Refreshed
     };
     // Tick 1: the clamp pulls the stamp back to the SHORT cadence; still held.
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 2, one short cadence later: the profile runs. Clamped to the long
     // leash instead, this unwatched hold would sit for six hours with no
@@ -11387,6 +21388,8 @@ fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -11414,7 +21417,14 @@ fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
             watched: None,
         },
     );
-    super::claude_rolling_tick(&config, &pacing, now, &|_| crate::oauth::AuthGate::Ready);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| crate::oauth::AuthGate::Ready,
+    );
     let p = pacing.lock().unwrap();
     assert!(
         !p.retry_after_ms.contains_key("cl-deleted"),
@@ -11486,7 +21496,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11500,13 +21510,15 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     let snapshot = vec![warming("a"), warming("b"), warming("c")];
@@ -11672,6 +21684,161 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
     );
 }
 
+/// The canceled exclusion reads the election's OWN store snapshot: a canceled
+/// plan that lives only in `state.store` (never a disk cache) drops the account
+/// from the queue, and it keeps the permissive out-of-queue flag the
+/// auth-broken leg above pins. `a` is a hybrid (OAuth pair + DeepSeek key),
+/// the shape the Usage tab's queue chip reads the same raw store for.
+#[test]
+fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    let warming = |name: &str| {
+        let mut e = token(name);
+        e.auto_start = true;
+        e
+    };
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let mut hybrid = opted_in("a");
+    hybrid.base_url = Some("https://api.deepseek.com/anthropic".into());
+    hybrid.api_key = Some("k".into());
+    hybrid.provider = Some(crate::providers::Provider::DeepSeek);
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![hybrid, opted_in("b"), opted_in("c")],
+    }));
+
+    // `a`'s plan is canceled and lives ONLY in the store, with no
+    // `usage_cache.json`, so a disk read (`is_canceled_cached`) answers "not
+    // canceled".
+    let lapsed = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now - 60)),
+        }),
+        ..Default::default()
+    };
+    let canceled = UsageInfo {
+        plan: Some(PlanInfo {
+            subscription_status: Some("canceled".to_string()),
+            ..PlanInfo::default()
+        }),
+        ..lapsed.clone()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), canceled),
+        ("b".to_string(), lapsed.clone()),
+        ("c".to_string(), lapsed.clone()),
+    ])));
+
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store,
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+
+    let mut due = vec![warming("a"), warming("b"), warming("c")];
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let may_open: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        may_open,
+        vec!["a", "b"],
+        "canceled `a` holds no slot but keeps its permissive out-of-queue flag; `b` is elected"
+    );
+}
+
+/// The queue-open line sizes its queue off the same store the election reads:
+/// a canceled plan held only in the OAuth store leaves `b` the one member, so
+/// the line names `1/1` and the one-member gap (5h less the 90 s interval
+/// tolerance = 17910 s = `4h 58m`), never `2/2` and `2h 28m`.
+#[test]
+fn the_queue_open_line_counts_no_account_canceled_in_the_store() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = crate::testutil::HomeSandbox::new();
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("b")],
+    }));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let kick_blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let line = super::queue_open_line(
+        &config,
+        &kick_blocks,
+        &store,
+        "b",
+        REFRESH_INTERVAL_MS,
+        crate::usage::now_epoch_secs(),
+    );
+    assert_eq!(
+        line,
+        Some("b: 5h auto-start window opened (queue 1/1, next in 4h 58m)".to_string()),
+        "the canceled account holds no queue slot in the open line"
+    );
+}
+
 /// The toggle is a real off switch: with `auto_start_queue` false every entry
 /// keeps the permissive `may_open_window` `collect_tokens` set, which is exactly the
 /// pre-queue behaviour (every lapsed window reopens on its own tick).
@@ -11704,7 +21871,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         status: Arc::new(RankedMutex::new(HashMap::new())),
         refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
-        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
@@ -11718,13 +21885,15 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
+        display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
     };
 
     let mut a = token("a");
@@ -11846,6 +22015,255 @@ fn apply_codex_switch_moves_the_operator_link_with_the_marker() {
     );
 }
 
+/// codex 0.157 runs every task inside one shared app-server daemon that reads
+/// `auth.json` once, at start. An auto-switch off a spent account restarts one
+/// that started before the switch moved the operator link (its tasks are
+/// stalled on that account anyway). The restart only counts under test.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_restarts_a_codex_daemon_left_on_the_spent_account() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let operator = home.home().join(".codex");
+    // Pinned, so an exported CODEX_HOME never points the switch at a real login.
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
+    // A live daemon, started before anything below: sun_path caps at 104
+    // bytes on macOS, so the socket sits at a short path behind the link.
+    let socket =
+        std::path::PathBuf::from(format!("/tmp/tollgate-cdxd-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        operator.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    std::os::unix::fs::symlink(&store, operator.join("auth.json")).expect("link the slot");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before + 1,
+        "the daemon still holding cx1 is restarted"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// Guest mode (G88, G94): the same spent-account walk as the test above, with
+/// `~/.clauth` staged (guest mode). `~/.codex/auth.json` and codex's shared app-server daemon
+/// are upstream clauth's, so the operator link stays on cx1 and nothing is
+/// restarted. The fixture restarts outside guest mode (the test above).
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_in_guest_mode_moves_no_link_and_restarts_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let operator = home.home().join(".codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
+    let socket =
+        std::path::PathBuf::from(format!("/tmp/tollgate-cdxg-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        operator.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    let slot = operator.join("auth.json");
+    std::os::unix::fs::symlink(&store, &slot).expect("link the slot");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    stage_upstream_data_dir(&home);
+    assert!(crate::identity::upstream_active(), "fixture reads as guest");
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(
+        std::fs::read_link(&slot).expect("still a link"),
+        store,
+        "in guest mode the operator's ~/.codex/auth.json link stays where it was"
+    );
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before,
+        "in guest mode codex's shared app-server daemon is never restarted"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// A daemon that merely predates the operator's OWN login file (a regular
+/// file, which a switch never moves) runs an account tollgate does not manage:
+/// the auto-switch leaves it and its healthy turns alone.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_leaves_a_daemon_on_the_operators_own_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let operator = home.home().join(".codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
+    let socket =
+        std::path::PathBuf::from(format!("/tmp/tollgate-cdxo-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        operator.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Written after the daemon started, so by mtime alone it would read stale.
+    std::fs::write(
+        operator.join("auth.json"),
+        crate::testutil::codex_auth_body("me", "me"),
+    )
+    .expect("the operator's own login");
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before,
+        "nothing of tollgate's moved, so the daemon keeps its turns"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// A live daemon under `codex_home`, started now: its control link points at
+/// a socket at a short path (sun_path caps at 104 bytes on macOS).
+#[cfg(unix)]
+fn codex_daemon_at(
+    codex_home: &std::path::Path,
+    tag: &str,
+) -> (std::os::unix::net::UnixListener, std::path::PathBuf) {
+    std::fs::create_dir_all(codex_home.join("app-server-control")).expect("mkdir control");
+    let socket = std::path::PathBuf::from(format!(
+        "/tmp/tollgate-cdx{tag}-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        codex_home.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    (daemon, socket)
+}
+
+/// Restarts one auto-switch off cx1 asks for, with the operator's own
+/// `CODEX_HOME` set. `~/.codex` holds a tollgate link to cx1 and a daemon that
+/// predates it (`default_stale`) or started after it; the operator's home
+/// holds a tollgate link to cx1 and, with `own_daemon`, a daemon (any daemon
+/// there predates the switch about to move its link).
+#[cfg(unix)]
+fn restarts_with_own_codex_home(default_stale: bool, own_daemon: bool) -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    let own = home.home().join("my-codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &own);
+    let mut sockets = Vec::new();
+    let default_home = home.home().join(".codex");
+    std::fs::create_dir_all(&default_home).expect("mkdir ~/.codex");
+    if !default_stale {
+        std::os::unix::fs::symlink(&store, default_home.join("auth.json")).expect("slot");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sockets.push(codex_daemon_at(&default_home, "d"));
+    if default_stale {
+        std::os::unix::fs::symlink(&store, default_home.join("auth.json")).expect("slot");
+    }
+    std::fs::create_dir_all(&own).expect("mkdir CODEX_HOME");
+    if own_daemon {
+        sockets.push(codex_daemon_at(&own, "m"));
+    }
+    std::os::unix::fs::symlink(&store, own.join("auth.json")).expect("own slot");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert!(
+        std::fs::read_link(own.join("auth.json"))
+            .expect("own slot")
+            .ends_with("cx2/auth.json"),
+        "the switch moves the CODEX_HOME slot"
+    );
+    for (_, socket) in &sockets {
+        let _ = std::fs::remove_file(socket);
+    }
+    crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get) - before
+}
+
+/// An operator's own `CODEX_HOME` is the home the switch moves, so it is the
+/// home judged: its daemon, stranded by the switch, restarts even with
+/// `~/.codex` current.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_restarts_the_stale_daemon_under_codex_home() {
+    assert_eq!(restarts_with_own_codex_home(false, true), 1);
+}
+
+/// ... and with no daemon under the moved home, a stale-looking `~/.codex`
+/// daemon the switch never touched keeps its turns.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_leaves_the_default_homes_daemon_alone_under_codex_home() {
+    assert_eq!(restarts_with_own_codex_home(true, false), 0);
+}
+
 /// The codex chain walks at the codex file's OWN weekly line, never the claude
 /// setting: `weekly_switch_threshold = 50.0` in `codex-profiles.toml` makes a
 /// member at 60% weekly exhausted while the claude state sits at its 98
@@ -11901,7 +22319,7 @@ fn apply_codex_switch_walks_at_the_codex_weekly_line() {
         lines
             .snapshot()
             .iter()
-            .any(|line| line.contains("codex auto-switched to 'cx2' (7d at 60% ≥ threshold 50%)"))
+            .any(|line| line.contains("codex auto-switched to 'cx2' (7d at 60% >= threshold 50%)"))
     );
 }
 
@@ -12091,7 +22509,7 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
 
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, streaks) = issue83_inputs(None, super::ACTIVE_CAP_MAX_STREAK + 1);
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12102,6 +22520,7 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12179,7 +22598,7 @@ fn run_third_party_scan(
     tp_streaks: &super::ThirdPartyStreaks,
 ) -> Vec<String> {
     use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12190,6 +22609,7 @@ fn run_third_party_scan(
         tp_status,
         tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12381,6 +22801,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
@@ -12399,7 +22820,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
     )])));
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12410,6 +22831,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12428,7 +22850,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
 /// stats; its OAuth leg's freshness says nothing about them.
 #[test]
 fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
     let _home = crate::testutil::HomeSandbox::new();
 
     // a's OAuth leg is Fresh; its provider leg failed; its provider windows are
@@ -12438,7 +22860,7 @@ fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
     let status = all_fresh(&["a", "b"]);
     let tp_status = tp_status_with("a", super::FetchStatus::Failed);
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12449,6 +22871,7 @@ fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12485,6 +22908,7 @@ fn recovery_relinks_onto_a_third_party_member_with_provider_headroom() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     assert_eq!(
         pending.lock().unwrap().clone(),
@@ -12506,7 +22930,7 @@ fn recovery_relinks_onto_a_third_party_member_with_provider_headroom() {
 /// `base_url.is_some()` would read the empty provider store and stay put.
 #[test]
 fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_reading() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
     use std::collections::BTreeMap;
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -12527,7 +22951,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
         !a.usage_cache_is_third_party() && a.base_url.is_some(),
         "fixture: the two predicates disagree"
     );
-    let b = crate::profile::Profile::new("b".to_string(), None, None);
+    let b = logged_in("b");
     let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
         state: crate::profile::AppState {
             active_profile: Some("a".into()),
@@ -12540,7 +22964,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
 
     let store = session_store(&[("a", 100.0), ("b", 10.0)]);
     let status = all_fresh(&["a", "b"]);
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12551,6 +22975,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12600,13 +23025,61 @@ fn a_swapped_session_on_a_hybrid_member_walks_on_provider_windows() {
     );
 }
 
+/// cloudy's "polled readings only" on the per-session decision leg: a session
+/// parked on a keyless provider member (display-only, nothing polls it) must
+/// read no reading for it even though the display superset seeded its cached
+/// reading into the provider store. The leg treats the member as absent — the
+/// `6836c1a6` store entry — so the session stays parked; passing the display
+/// superset as the polled set reads the exhausted cache and walks it off (the
+/// A3 divergence).
+#[test]
+fn the_session_decision_leg_ignores_a_keyless_provider_members_cached_reading() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::providers::Provider;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-9", "a");
+    row.current_member = Some("kl".to_string());
+    let _marker = register_live_row(&row);
+
+    let a = Profile::new("a".to_string(), None, None);
+    let mut kl = Profile::new(
+        "kl".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    kl.provider = Some(Provider::DeepSeek);
+    let config = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "kl".into()],
+            fallback_chain: vec!["a".into(), "kl".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, kl],
+    }));
+
+    scan_sessions_tp(
+        &config,
+        &session_store(&[("a", 10.0)]),
+        &tp_store_with("kl", 100.0),
+        &all_fresh(&["a"]),
+        &tp_status_with("kl", super::FetchStatus::Fresh),
+    );
+
+    assert_eq!(
+        decision_of("4242-9"),
+        (None, None),
+        "a keyless member's cached exhausted reading never reaches the decision leg: the session stays parked"
+    );
+}
+
 /// `reading_dead_names` decides "stuck" from the same side the picker
 /// reads. A windowless-provider hybrid whose OAuth leg is deep-stuck but whose
 /// provider leg is Fresh must NOT be flagged reading-dead (the OAuth-first
 /// reading would flag it and lose the exhaustion gate).
 #[test]
 fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() {
-    use super::{ActivityStore, PendingSwitch, PendingSwitchOff, PollStreaks, scan_auto_switch};
+    use super::{PendingSwitch, PendingSwitchOff, PollStreaks, scan_auto_switch};
     let _home = crate::testutil::HomeSandbox::new();
 
     // b is the clear OAuth sibling; a holds no merged entry (its windows are
@@ -12640,7 +23113,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
     )])));
     let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
     let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -12651,6 +23124,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -12827,6 +23301,8 @@ fn stub_console_expired(
 fn fetch_third_party_due_marks_a_dead_key_broken_not_a_console_lapse() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["tp-key", "tp-console"]);
+    save_tp_entry_profile("tp-key");
+    save_tp_entry_profile("tp-console");
 
     let key = tp_entry("tp-key");
     let key_state = third_party_state(stub_auth_expired);
@@ -12978,6 +23454,7 @@ fn queued_switch_away_is_stale_detects_a_repair() {
 fn fetch_third_party_due_clears_the_broken_mark_on_a_live_body() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["tp-recovered"]);
+    save_tp_entry_profile("tp-recovered");
     let entry = tp_entry("tp-recovered");
     let fp = entry.credential_fingerprint();
     let state = third_party_state(stub_ok_stats);
@@ -12998,13 +23475,14 @@ fn fetch_third_party_due_clears_the_broken_mark_on_a_live_body() {
     );
 }
 
-/// N1 (E-clear): a NON-dead-key outcome (a transient network blip, no cache →
-/// `Failed`) also clears the mark — a key rejection is "the last fetch under
-/// THIS credential died", so one that didn't must not leave it standing.
+/// A transient network blip (no cache → `Failed`) proves nothing about the key,
+/// so it must not clear the broken mark: only a live body or a console lapse
+/// clears it.
 #[test]
-fn fetch_third_party_due_clears_the_broken_mark_on_a_non_dead_key_outcome() {
+fn fetch_third_party_due_leaves_the_broken_mark_standing_on_a_transient() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["tp-blip"]);
+    save_tp_entry_profile("tp-blip");
     let entry = tp_entry("tp-blip");
     let fp = entry.credential_fingerprint();
     let state = third_party_state(stub_network_error);
@@ -13016,12 +23494,12 @@ fn fetch_third_party_due_clears_the_broken_mark_on_a_non_dead_key_outcome() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(
-        !state
+        state
             .third_party_broken
             .lock()
             .unwrap()
             .contains_key("tp-blip"),
-        "a non-dead-key outcome must clear the broken mark"
+        "a transient proves nothing about the key: the broken mark stands"
     );
 }
 
@@ -13038,7 +23516,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
         "a".to_string(),
         entry_a.credential_fingerprint(),
     )])));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -13049,6 +23527,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
         &tp_status,
         &tp_streaks,
         &broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -13081,7 +23560,7 @@ fn scan_records_key_rejected(
     broken: &super::ThirdPartyBroken,
 ) -> Vec<super::PendingSwitchTarget> {
     use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -13092,6 +23571,7 @@ fn scan_records_key_rejected(
         tp_status,
         tp_streaks,
         broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -13125,6 +23605,7 @@ fn scan_auto_switch_does_not_label_an_independently_exhausted_key_rejected_activ
                 )),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
@@ -13439,7 +23920,7 @@ fn scan_auto_switch_keeps_a_console_lapse_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, tp_status, tp_streaks) =
         issue83_third_party_inputs(Some(super::FetchStatus::AuthExpired), None, None, None);
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -13450,6 +23931,7 @@ fn scan_auto_switch_keeps_a_console_lapse_active() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -13502,7 +23984,7 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         "b".to_string(),
         entry_b.credential_fingerprint(),
     )])));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
     scan_auto_switch(
@@ -13513,6 +23995,7 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -13570,11 +24053,20 @@ fn a_401_in_guest_mode_bails_to_cache_without_spending_the_chain() {
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13653,11 +24145,20 @@ fn guest_mode_polls_on_the_held_token_instead_of_rotating_ahead_of_expiry() {
         access_expires_at: Some(soon),
         auth_broken: false,
         may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13693,6 +24194,7 @@ fn auto_start_kick_does_not_rotate_in_guest_mode() {
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
 
     let result = crate::oauth::auto_start_kick(
         &config,
@@ -13700,7 +24202,7 @@ fn auto_start_kick_does_not_rotate_in_guest_mode() {
         "at-old",
         Some("rt-old"),
         None,
-        Some(&activity),
+        Some((&activity, &shutting_down)),
     );
     let seen = server.join().expect("listener");
 
@@ -13727,9 +24229,14 @@ fn claude_rolling_tick_restamps_nothing_in_guest_mode() {
     write_rolling_sidecar("cl-guest", 60 * 60 * 1000); // +1h, inside the 2h horizon
     stage_upstream_data_dir(&home);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
-        panic!("'{name}' must not be re-stamped in guest mode")
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| panic!("'{name}' must not be re-stamped in guest mode"),
+    );
 }
 
 /// Hot-swap spec test 48. Executor B rows never follow the chain: even a live
@@ -13870,10 +24377,17 @@ fn a_flock_wedged_rotation_persist_leaves_a_stage_the_next_load_reads() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::lock::set_state_lock_timeout_override(None);
     let seen = server.join().expect("listener");
     drop(held_rx.try_recv().expect("the token call took the flock"));
@@ -13920,9 +24434,16 @@ fn drained_tokens(
     state.config = config.clone();
     state.tokens = Arc::new(RankedMutex::new(vec![entry.clone()]));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
-        super::fetch_with_rotation(config, &e, None, &refetch, &activity)
+        super::fetch_with_rotation(
+            config,
+            &e,
+            None,
+            &refetch,
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
     });
     state.tokens.lock().unwrap().clone()
 }
@@ -14078,9 +24599,16 @@ fn wedge_a_fetch_rotation(
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let outcome = super::fetch_with_rotation(config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::lock::set_state_lock_timeout_override(None);
     drop(held_rx.try_recv().expect("the token call took the flock"));
     assert!(
@@ -14547,9 +25075,16 @@ fn a_live_stage_expiring_later_holds_off_the_proactive_rotation() {
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(soon));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity = crate::testutil::fresh_activity();
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -14654,4 +25189,6160 @@ fn the_catch_up_waits_on_the_flock_without_holding_the_config_lock() {
         "the config lock stayed held across the catch-up's flock wait"
     );
     assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
+}
+
+/// A startup seed racing a change — the epoch moved between its disk read
+/// and its store write — writes nothing, so a forget cannot be undone by a
+/// stale seed the change's own re-seed raced.
+#[test]
+fn a_startup_seed_racing_a_change_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "access-A".to_string(),
+            refresh_token: Some("refresh-A".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Pose a change landing between the seed's disk read and its store write.
+    super::set_seed_hook(super::SeedPhase::PreWrite, crate::usage::Half::OAuth, |n| {
+        crate::usage::bump_epoch_for_test(n, crate::usage::Half::OAuth);
+    });
+
+    crate::usage::bootstrap_fetch(
+        &store,
+        &status,
+        &last_fetched,
+        &[("acct".to_string(), REFRESH_INTERVAL_MS)],
+    );
+
+    assert!(
+        !store.lock().unwrap().contains_key("acct"),
+        "the seed writes no reading once the epoch moved"
+    );
+    assert!(
+        !status.lock().unwrap().contains_key("acct"),
+        "the seed writes no status once the epoch moved"
+    );
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(name.clone())),
+        "the seed writes no cadence stamp once the epoch moved"
+    );
+}
+
+/// A seed holds the epoch guard from its compare through its store, status and
+/// cadence writes, so a forget cannot bump the epoch between the check and the
+/// write.
+#[test]
+fn a_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "access-A".to_string(),
+            refresh_token: Some("refresh-A".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::OAuth,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let lf2 = Arc::clone(&last_fetched);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::try_seed_cache(
+            &store2,
+            &status2,
+            &lf2,
+            &name2,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        )
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        // Panic-safe release: if the assertion fails, the seed still unparks.
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the seed holds the epoch guard across its store write"
+        );
+    }
+    let seeded = seed.join().expect("the seed finishes");
+    assert!(seeded, "the seed wrote the reading");
+    assert!(
+        store.lock().unwrap().contains_key("acct"),
+        "the reading landed under the held guard"
+    );
+}
+
+/// The third-party startup seed writes nothing once its epoch moved between the
+/// disk read and the store write.
+#[test]
+fn a_third_party_startup_seed_racing_a_change_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("tp");
+    let profile = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["tp"]);
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let store: crate::usage::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    super::set_seed_hook(
+        super::SeedPhase::PreWrite,
+        crate::usage::Half::ThirdParty,
+        |n| {
+            crate::usage::bump_epoch_for_test(n, crate::usage::Half::ThirdParty);
+        },
+    );
+    let work = crate::usage::collect_third_party_entries(&[profile]);
+
+    crate::usage::bootstrap_third_party(
+        &store,
+        &status,
+        &last_fetched,
+        &["tp".to_string()],
+        &work,
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        !store.lock().unwrap().contains_key("tp"),
+        "the third-party seed writes no reading once the epoch moved"
+    );
+    assert!(
+        !status.lock().unwrap().contains_key("tp"),
+        "the third-party seed writes no status once the epoch moved"
+    );
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::ThirdParty.key(name.clone())),
+        "the third-party seed writes no cadence stamp once the epoch moved"
+    );
+}
+
+/// A third-party seed holds the epoch guard from its compare through its store,
+/// status and cadence writes — the provider-half twin of the OAuth hold test.
+#[test]
+fn a_third_party_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("tp");
+    let profile = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["tp"]);
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let store: crate::usage::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::ThirdParty,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let lf2 = Arc::clone(&last_fetched);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::seed_third_party_name(
+            &store2,
+            &status2,
+            &lf2,
+            &name2,
+            true,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        );
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the third-party seed holds the epoch guard across its store write"
+        );
+    }
+    seed.join().expect("the seed finishes");
+    assert!(
+        store.lock().unwrap().contains_key("tp"),
+        "the reading landed under the held guard"
+    );
+    assert!(
+        status.lock().unwrap().contains_key("tp"),
+        "the status landed under the held guard"
+    );
+}
+
+/// A codex seed holds the epoch guard from its compare through its store and
+/// status writes — the codex-half twin of the OAuth hold test.
+#[test]
+fn a_codex_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cx");
+    crate::testutil::write_codex_roster(&["cx"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::Codex,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::seed_codex_name(
+            &store2,
+            &status2,
+            &name2,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        );
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the codex seed holds the epoch guard across its store write"
+        );
+    }
+    seed.join().expect("the seed finishes");
+    assert!(
+        store.lock().unwrap().contains_key("cx"),
+        "the reading landed under the held guard"
+    );
+    assert!(
+        status.lock().unwrap().contains_key("cx"),
+        "the status landed under the held guard"
+    );
+}
+
+// ── tps producer leg ─────────────────────────────────────────────────────────
+
+/// A scheduler with no profiles, so a tick fetches nothing and only the legs
+/// that need no account run. `lease` decides who holds `usage-fetch.lock`.
+fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    super::SchedulerState {
+        config: Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: lease,
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    }
+}
+
+/// One 1222-token response that ended a second ago, 13 s after its user line.
+fn seed_recent_response(home: &std::path::Path) {
+    let now = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let dir = home.join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let user = serde_json::json!({
+        "type": "user", "timestamp": stamp(now - 14_000), "sessionId": "tick",
+        "message": {"role": "user", "content": "go"},
+    });
+    let reply = serde_json::json!({
+        "type": "assistant", "timestamp": stamp(now - 1_000), "sessionId": "tick",
+        "message": {
+            "id": "msg_tick", "model": "claude-opus-5-5", "role": "assistant",
+            "usage": {"input_tokens": 1, "output_tokens": 1222,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        },
+    });
+    std::fs::write(dir.join("tick.jsonl"), format!("{user}\n{reply}\n")).unwrap();
+}
+
+/// With no daemon, the process holding the lease (the TUI's scheduler runs
+/// this same tick) produces the tps cache, and the leg never writes the
+/// daemon-owned `status.json`.
+#[test]
+fn the_lease_holding_tick_produces_the_tps_cache_without_a_daemon() {
+    let home = crate::testutil::HomeSandbox::new();
+    seed_recent_response(home.home());
+    let state = tps_state(Arc::new(crate::daemon::FetchLease::new()));
+
+    super::tick(&state);
+
+    let snap = crate::tps::load_cache().expect("the lease holder wrote tps_cache.json");
+    let m5 = snap.sessions["tick"].figures.m5.rate;
+    assert!(
+        (m5 - 1222.0 / 300.0).abs() < 1e-3,
+        "the cache carries the response: {m5}"
+    );
+    assert!(
+        !home.home().join(".tollgate/status.json").exists(),
+        "the producer leg never writes status.json: the daemon is its one writer"
+    );
+}
+
+/// A process that stood down (another instance holds the lease) produces
+/// nothing: one tps producer, like one usage fetcher.
+#[test]
+fn a_stood_down_tick_writes_no_tps_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    seed_recent_response(home.home());
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the first instance wins the lease");
+    let state = tps_state(Arc::new(crate::daemon::FetchLease::new()));
+
+    super::tick(&state);
+
+    assert!(
+        !home
+            .home()
+            .join(".tollgate")
+            .join(crate::tps::TPS_CACHE_FILE)
+            .exists(),
+        "only the lease holder writes the tps cache"
+    );
+}
+
+#[test]
+fn a_rotated_pair_syncs_only_while_the_entry_still_holds_the_sent_token() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = completion_order_state();
+    *state.tokens.lock().unwrap() = vec![token("w")];
+
+    // A rebuild landed mid-flight (another thread put a new credential in the
+    // entry), so the drain must leave the rebuilt entry alone.
+    let run = |entry: TokenEntry| {
+        if let Ok(mut t) = state.tokens.lock()
+            && let Some(e) = t.iter_mut().find(|e| e.name == entry.name)
+        {
+            e.access_token = "rebuilt-token".into();
+        }
+        super::FetchOutcome::live(
+            &entry.name,
+            crate::usage::UsageInfo::default(),
+            Some(("rotated-access".into(), Some("rotated-refresh".into()))),
+        )
+    };
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    assert_eq!(
+        entry.access_token, "rebuilt-token",
+        "the sync must not overwrite an entry a rebuild moved past the sent token"
+    );
+}
+
+#[test]
+fn a_rotated_pair_syncs_into_the_entry_that_holds_the_sent_token() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = completion_order_state();
+    *state.tokens.lock().unwrap() = vec![token("w")];
+
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(
+            &entry.name,
+            crate::usage::UsageInfo::default(),
+            Some(("rotated-access".into(), Some("rotated-refresh".into()))),
+        )
+    };
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    assert_eq!(
+        entry.access_token, "rotated-access",
+        "the rotated pair reaches the entry that still holds the sent token"
+    );
+}
+
+/// A3d / ruling (b): a peer holding the state flock past the wait bound stalls
+/// one drain batch once, never once per landing — the first timed-out wait sets
+/// the tick's `timed_out` flag, so the later landings skip the flock without
+/// waiting and take the timeout path (no reading), each still stamping cadence
+/// while the epoch is unmoved. Completion order is pinned separately by
+/// `oauth_completions_apply_in_completion_order_not_list_order` (N6): this test
+/// pins the flag's effect by COUNT alone, never a worker-finish order its own
+/// closure scripts.
+#[test]
+fn a_wedged_flock_stalls_one_drain_batch_once_not_once_per_landing() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let state = completion_order_state();
+    *state.tokens.lock().unwrap() = vec![token("a"), token("b"), token("c")];
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let timed_out = AtomicBool::new(false);
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("a"), token("b"), token("c")],
+        REFRESH_INTERVAL_MS,
+        Some(&timed_out),
+        run,
+    );
+
+    // The flag's effect is pinned by COUNT, not wall time: exactly one
+    // landing took a nonzero flock wait (the first, which timed out); the
+    // other two skipped the flock without waiting.
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the batch must take one flock wait, never once per landing"
+    );
+    assert!(
+        !state.store.lock().unwrap().contains_key("a"),
+        "no reading lands under the wedge"
+    );
+    assert!(
+        !state.store.lock().unwrap().contains_key("b"),
+        "no reading lands under the wedge"
+    );
+    assert!(
+        !state.store.lock().unwrap().contains_key("c"),
+        "no reading lands under the wedge"
+    );
+    for name in ["a", "b", "c"] {
+        assert!(
+            state
+                .last_fetched
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key(name)),
+            "each landing still stamps cadence (epoch unmoved)"
+        );
+    }
+
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+}
+
+/// Ruling (a): one brief contention that SUCCEEDS, then an uncontended landing
+/// later in the same tick (past what the old 1 s budget allowed), both land —
+/// a successful wait sets no flag, so the tick never drops a later landing.
+/// Red when a trivial collision opens something the later landing skips (the
+/// round-5 U1 class: the old S1 through ordinary contention).
+#[test]
+fn a_brief_contention_then_a_later_uncontended_landing_both_land() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    let (locked_tx, locked_rx) = mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        holder.lock().expect("hold the flock");
+        locked_tx.send(()).expect("signal the hold");
+        std::thread::sleep(Duration::from_millis(200));
+        drop(holder);
+    });
+    locked_rx.recv().expect("the peer holds the flock");
+
+    let state = completion_order_state();
+    *state.tokens.lock().unwrap() = vec![token("a"), token("b")];
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let timed_out = AtomicBool::new(false);
+    let run = |entry: TokenEntry| {
+        if entry.name == "b" {
+            std::thread::sleep(Duration::from_millis(1300));
+        }
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("a"), token("b")],
+        REFRESH_INTERVAL_MS,
+        Some(&timed_out),
+        run,
+    );
+    peer.join().expect("peer");
+    crate::lock::set_state_lock_timeout_override(None);
+    let s = state.store.lock().unwrap();
+    assert!(
+        s.contains_key("a") && s.contains_key("b"),
+        "a brief successful contention must not drop a later landing"
+    );
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no wait timed out, so nothing set the flag"
+    );
+}
+
+/// T3 (third-party arm of S2): a third-party entry the partition finds stale
+/// (its identity differs from the snapshot half) is NOT spawned — the fetcher
+/// never runs, so no fetch, no landing, no cadence. Red when the partition's
+/// third-party check is removed (the stale entry then reaches the due list and
+/// the fetcher fires).
+static TP_STALE_FETCH_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_tp_fetcher(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    TP_STALE_FETCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(tp_stats_with_bar(50.0))
+}
+
+#[test]
+fn a_stale_third_party_entry_is_not_fetched() {
+    use std::sync::atomic::Ordering;
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(counting_tp_fetcher);
+    // The snapshot half holds a DIFFERENT credential digest than the entry —
+    // the entry predates a forget that never rebuilt the third-party list.
+    let snapshot_digest = crate::usage::third_party_identity(
+        None,
+        Some("other-key"),
+        None,
+        Some("https://example.com"),
+    );
+    *state.snapshot.lock().unwrap() = HashMap::from([(
+        "tp".to_string(),
+        crate::usage::forget::SnapshotIdentities {
+            third_party: snapshot_digest,
+            ..crate::usage::forget::SnapshotIdentities::default()
+        },
+    )]);
+    *state.third_party_tokens.lock().unwrap() = vec![tp_entry("tp")];
+
+    TP_STALE_FETCH_CALLS.store(0, Ordering::Relaxed);
+    super::tick(&state);
+
+    assert_eq!(
+        TP_STALE_FETCH_CALLS.load(Ordering::Relaxed),
+        0,
+        "a stale third-party entry must not be fetched"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("tp"),
+        "a stale third-party entry must not land a reading"
+    );
+}
+
+/// V3 (third-party unknown mark at the partition): a third-party entry whose
+/// snapshot half is marked UNKNOWN (an unreadable forget) is skipped, even when
+/// the identity value beside the mark equals the entry's — the partition skips
+/// on the mark, never trusts the stale identity. Red when the partition's
+/// unknown check is removed (the entry then reaches the due list and the
+/// fetcher fires).
+#[test]
+fn a_third_party_entry_whose_half_is_unknown_is_not_fetched() {
+    use std::sync::atomic::Ordering;
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(counting_tp_fetcher);
+    let entry = tp_entry("tp");
+    let entry_identity = entry.identity;
+    *state.snapshot.lock().unwrap() = HashMap::from([(
+        "tp".to_string(),
+        crate::usage::forget::SnapshotIdentities {
+            third_party: entry_identity,
+            third_party_unknown: true,
+            ..crate::usage::forget::SnapshotIdentities::default()
+        },
+    )]);
+    *state.third_party_tokens.lock().unwrap() = vec![entry];
+
+    TP_STALE_FETCH_CALLS.store(0, Ordering::Relaxed);
+    super::tick(&state);
+
+    assert_eq!(
+        TP_STALE_FETCH_CALLS.load(Ordering::Relaxed),
+        0,
+        "a third-party entry whose half is unknown must not be fetched"
+    );
+}
+
+/// Releases a parked fetch worker on drop, so a failing assertion still lets
+/// the scope join instead of hanging.
+struct ReleaseParkedFetch(std::sync::mpsc::Sender<()>);
+impl Drop for ReleaseParkedFetch {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// An unanchored OAuth account `name` holding `access`, saved on disk.
+fn save_unanchored_login(name: &str, access: &str) -> crate::profile::Profile {
+    let mut p = oauth_profile_disabled(name, false);
+    if let Some(oauth) = p
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.access_token = access.to_string();
+        oauth.refresh_token = Some(format!("{access}-refresh"));
+    }
+    crate::profile::save_profile(&p).expect("save profile");
+    p
+}
+
+/// A3 (OAuth leg): a `/usage` fetch sent under one login lands after the stored
+/// login changed (another process re-logged the account in; this process has
+/// not reloaded). The landing writes no reading anywhere: no store entry, no
+/// `usage_cache.json`, no history sample. The two accounts guard the compare's
+/// key: the untouched `keep` lands its reading in the same batch.
+#[test]
+fn an_oauth_landing_after_the_stored_login_changed_writes_no_reading() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w", "keep"]);
+    let w = save_unanchored_login("w", "w-old-access");
+    let keep = save_unanchored_login("keep", "keep-access");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![w, keep],
+    };
+    let due = collect_tokens_for_landing(&config);
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let run = move |entry: TokenEntry| -> super::FetchOutcome {
+        if entry.name == "w" {
+            ready_tx.send(()).expect("signal ready");
+            let _ = release_rx.lock().unwrap().recv();
+        }
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+
+    std::thread::scope(|scope| {
+        let _release = ReleaseParkedFetch(release_tx);
+        scope.spawn(|| super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker reached the gate");
+        // Another process re-logs `w` in while its fetch is in flight.
+        save_unanchored_login("w", "w-new-access");
+    });
+
+    let w_name = crate::profile::ProfileName::from("w");
+    assert!(
+        !state.store.lock().unwrap().contains_key("w"),
+        "the superseded login's reading must not land in the store"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&w_name, crate::profile_cache::USAGE_CACHE_FILE)
+            .is_some_and(|p| !p.exists()),
+        "the superseded login's reading must not land in usage_cache.json"
+    );
+    assert!(
+        !crate::profile::profile_history_path(&w_name)
+            .expect("history path")
+            .exists(),
+        "the superseded login's reading must not reach the usage history"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("keep"),
+        "the unchanged account in the same batch still lands"
+    );
+}
+
+/// The gate a parked third-party fetch blocks on. The fetcher is a `fn` pointer
+/// (no captures), so the channels live in a process-wide slot the test fills.
+static PARKED_THIRD_PARTY: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+fn parked_ok_stats(
+    target: &crate::providers::ThirdPartyTarget,
+    key: &str,
+    hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    let gate = PARKED_THIRD_PARTY.lock().unwrap().take();
+    if let Some((ready, release)) = gate {
+        ready.send(()).expect("signal ready");
+        let _ = release.recv();
+    }
+    stub_ok_stats(target, key, hint)
+}
+
+/// A3 (third-party leg): a provider fetch sent under one api key lands after
+/// the stored key changed (another process edited it; this process has not
+/// reloaded). The landing writes no reading: no provider store entry, no
+/// `third_party_cache.json`, no wallet sample.
+#[test]
+fn a_third_party_landing_after_the_stored_key_changed_writes_no_reading() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+    let api = crate::profile::Profile::new(
+        "api".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    crate::profile::save_profile(&api).expect("save profile");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![api.clone()],
+    };
+    let entries = collect_third_party_entries(&config.profiles);
+    assert_eq!(entries.len(), 1, "the keyed account is on the work list");
+    let state = third_party_state(parked_ok_stats);
+    *state.config.lock().unwrap() = config;
+    *state.third_party_tokens.lock().unwrap() = entries.clone();
+    crate::usage::reset_request_slots();
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    *PARKED_THIRD_PARTY.lock().unwrap() = Some((ready_tx, release_rx));
+
+    std::thread::scope(|scope| {
+        let _release = ReleaseParkedFetch(release_tx);
+        scope.spawn(|| fetch_third_party_due(&state, entries));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker reached the gate");
+        // Another process re-keys `api` while its fetch is in flight.
+        let mut rekeyed = api.clone();
+        rekeyed.api_key = Some("new-key".to_string());
+        crate::profile::save_profile(&rekeyed).expect("save profile");
+    });
+
+    let name = crate::profile::ProfileName::from("api");
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("api"),
+        "the superseded key's provider reading must not land in the store"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE
+        )
+        .is_some_and(|p| !p.exists()),
+        "the superseded key's reading must not land in third_party_cache.json"
+    );
+    assert!(
+        !crate::profile::profile_wallet_history_path(&name)
+            .expect("wallet history path")
+            .exists(),
+        "the superseded key's reading must not reach the wallet history"
+    );
+}
+
+/// F1/A3b: a fetch that SPAWNS after another process's proven install (anchor B
+/// written beside token B) but before this process reloads — the entry is built
+/// off a stale in-memory config holding token A. The spawn identity must carry
+/// the unanchored A digest (the disk anchor is adopted only when the stored
+/// token equals the in-memory token), so A's reading never lands under B.
+#[test]
+fn a_stale_config_spawn_adopts_the_anchor_only_when_the_stored_token_matches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["x"]);
+    let x_name = crate::profile::ProfileName::from("x");
+    // This process's in-memory config still holds account A's token.
+    let stale = save_unanchored_login("x", "tok-a");
+    // Another process installs account B (proven): new token, then anchor B.
+    save_unanchored_login("x", "tok-b");
+    crate::profile_cache::write_profile_cache(
+        &x_name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &crate::profile::AccountId::from("uuid-b".to_string()),
+    );
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![stale],
+    };
+    let due = collect_tokens_for_landing(&config);
+    assert_eq!(due[0].access_token, "tok-a");
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    let cache_exists =
+        crate::profile_cache::profile_cache_path(&x_name, crate::profile_cache::USAGE_CACHE_FILE)
+            .is_some_and(|p| p.exists());
+    assert!(
+        !state.store.lock().unwrap().contains_key("x") && !cache_exists,
+        "account A's reading (sent with tok-a) landed under account B: store={} cache={}",
+        state.store.lock().unwrap().contains_key("x"),
+        cache_exists
+    );
+}
+
+/// A5 (staged-pair arm): a persist-failed rotation leaves a live staged pair
+/// (at-t2) over a store still holding at-t1. A rebuild off the stale in-memory
+/// config reads the spawn identity through the staged-pair-aware reader, so the
+/// entry stays UNANCHORED — the loader's chain head (at-t2) differs from the
+/// in-memory token (at-t1), so the anchor is not adopted against a token the
+/// loader no longer considers the head.
+#[test]
+fn a_staged_pair_after_a_failed_persist_keeps_the_spawn_unanchored() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["s"]);
+    let name = crate::profile::ProfileName::from("s");
+    // Store: at-t1 / at-t1-refresh, anchored to uuid-a.
+    let profile = save_unanchored_login("s", "at-t1");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &crate::profile::AccountId::from("uuid-a".to_string()),
+    );
+    // A persist-failed rotation staged at-t2 over the at-t1 store.
+    let base = crate::codex_auth::token_fingerprint("at-t1-refresh");
+    let stage_path =
+        crate::profile::profile_subpath(&name, "credentials.json.staged").expect("stage path");
+    std::fs::write(
+        &stage_path,
+        format!(
+            r#"{{"base":"{base}","base_access":"at-t1","creds":{{"claudeAiOauth":{{"accessToken":"at-t2","refreshToken":"at-t2-refresh"}}}}}}"#
+        ),
+    )
+    .expect("write the live stage");
+    // The stale in-memory config still holds at-t1.
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    let due = collect_tokens_for_landing(&config);
+    assert_eq!(due[0].access_token, "at-t1");
+    assert!(
+        due[0].oauth_identity.anchor.is_none(),
+        "the live staged pair keeps the spawn unanchored"
+    );
+    // The landing still matches the store (anchor backfill over the same stored
+    // token) and lands the reading.
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    assert!(
+        state.store.lock().unwrap().contains_key("s"),
+        "the reading lands under the stored account, never discarded forever"
+    );
+}
+
+/// A5's memory == stage arm: a persist-failed rotation staged at-t2 over an
+/// at-t1 store, AND the drain synced at-t2 into memory, so the in-memory token
+/// equals the staged chain head. `spawn_oauth_identity` adopts the anchor
+/// through the staged-pair-aware reader and the landing writes the reading.
+/// The Q5 mutant (refuse to adopt whenever a stage is live) discards the
+/// landing instead and reds this test.
+#[test]
+fn a_staged_pair_the_memory_holds_adopts_the_anchor_and_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["sm"]);
+    let name = crate::profile::ProfileName::from("sm");
+    // Store: at-t1, anchored to uuid-a.
+    let mut profile = save_unanchored_login("sm", "at-t1");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &crate::profile::AccountId::from("uuid-a".to_string()),
+    );
+    // A persist-failed rotation staged at-t2 over the at-t1 store.
+    let base = crate::codex_auth::token_fingerprint("at-t1-refresh");
+    let stage_path =
+        crate::profile::profile_subpath(&name, "credentials.json.staged").expect("stage path");
+    std::fs::write(
+        &stage_path,
+        format!(
+            r#"{{"base":"{base}","base_access":"at-t1","creds":{{"claudeAiOauth":{{"accessToken":"at-t2","refreshToken":"at-t2-refresh"}}}}}}"#
+        ),
+    )
+    .expect("write the live stage");
+    // The drain synced the staged pair into memory: the in-memory config now
+    // holds at-t2, matching the stage.
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.access_token = "at-t2".to_string();
+        oauth.refresh_token = Some("at-t2-refresh".to_string());
+    }
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    let due = collect_tokens_for_landing(&config);
+    assert_eq!(due[0].access_token, "at-t2");
+    assert!(
+        due[0].oauth_identity.anchor.is_some(),
+        "memory == stage adopts the anchor through the staged reader"
+    );
+    // The landing matches the store's anchor and lands the reading.
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    assert!(
+        state.store.lock().unwrap().contains_key("sm"),
+        "the staged pair the memory holds lands the reading"
+    );
+}
+
+/// F2/A3 own-process arm: the tick clones the token list, then this process's
+/// change site lands (new login + epoch bump) before the worker starts. The
+/// spawn epoch is captured at the partition, so the old credential's landing
+/// sees the epoch as moved and stamps no cadence; the new login's `/profile`
+/// is still due.
+#[test]
+fn an_epoch_bump_before_the_worker_starts_still_stamps_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["y"]);
+    let y = crate::profile::ProfileName::from("y");
+    let old = save_unanchored_login("y", "y-old");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![old],
+    };
+    // The tick's partition clones the entry (its spawn epoch is captured here)…
+    let due = collect_tokens_for_landing(&config);
+    // …then this process's change site lands: new login on disk, its forget
+    // bumps the epoch, all before the worker thread starts.
+    save_unanchored_login("y", "y-new");
+    crate::usage::bump_epoch_for_test(&y, crate::usage::Half::OAuth);
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let now = crate::usage::now_ms();
+    let run = move |entry: TokenEntry| {
+        let mut o =
+            super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None);
+        o.profile_wanted = true;
+        o.profile_attempt_at = Some(now);
+        o
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    let stamped = state
+        .last_fetched
+        .lock()
+        .unwrap()
+        .contains_key(&oauth_key("y"));
+    let profile_due = crate::usage::decide_profile_fetch(&y, false, now + 1);
+    assert!(
+        !stamped && profile_due,
+        "the old credential's landing after this process's epoch moved stamped cadence={stamped}, \
+         new login's /profile due={profile_due}"
+    );
+}
+
+/// F4 (rewritten onto the flag): only a wait that TIMES OUT sets the flag — a
+/// slow batch whose fetch took 1.2 s and whose only peer hold is a brief 300 ms
+/// one (inside the bound) still lands, because the 300 ms wait succeeds and
+/// sets nothing.
+#[test]
+fn a_slow_batch_spends_no_window_without_any_wait() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    let state = completion_order_state();
+    *state.tokens.lock().unwrap() = vec![token("a")];
+    // The fetch itself takes 1.2 s (a slow /usage); a peer takes the flock at
+    // 1.1 s for 300 ms. No wait has timed out before this landing.
+    let peer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1100));
+        holder.lock().expect("hold the flock");
+        std::thread::sleep(Duration::from_millis(300));
+        drop(holder);
+    });
+    let run = |entry: TokenEntry| {
+        std::thread::sleep(Duration::from_millis(1200));
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    let timed_out = AtomicBool::new(false);
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("a")],
+        REFRESH_INTERVAL_MS,
+        Some(&timed_out),
+        run,
+    );
+    peer.join().unwrap();
+    crate::lock::set_state_lock_timeout_override(None);
+    assert!(
+        state.store.lock().unwrap().contains_key("a"),
+        "the batch's first landing, with no timed-out wait before it, was dropped by a \
+         300 ms peer hold"
+    );
+}
+
+/// F9: the drain's login-gone retain removes the entry only while it still
+/// holds the token the fetch sent — a re-login that rebuilt the entry between
+/// spawn and drain keeps its own entry.
+#[test]
+fn a_login_gone_drain_keeps_a_rebuilt_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["lg"]);
+    let state = completion_order_state();
+    let mut spawned = token("lg");
+    spawned.access_token = "sent".to_string();
+    *state.tokens.lock().unwrap() = vec![spawned.clone()];
+    let run = |entry: TokenEntry| {
+        // The re-login lands while the fetch is in flight, rebuilding the entry.
+        let mut rebuilt = entry.clone();
+        rebuilt.access_token = "rebuilt".to_string();
+        *state.tokens.lock().unwrap() = vec![rebuilt];
+        super::FetchOutcome::cached(&entry.name, super::FetchStatus::Cached, None, None)
+            .with_login_gone()
+    };
+    super::fetch_oauth_due_with(&state, vec![spawned], REFRESH_INTERVAL_MS, run);
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    assert_eq!(
+        entry.access_token, "rebuilt",
+        "the rebuilt entry of the new login survives the login-gone retain"
+    );
+}
+
+/// F11: a cached landing with no disk write still runs the section-1 compare —
+/// its status write is a reading-surface entry and must not land under a
+/// credential a peer changed.
+#[test]
+fn a_cached_bail_still_compares_before_writing_status() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ch"]);
+    // This process's spawn identity: unanchored token A.
+    let spawn = crate::usage::OAuthIdentity::for_values(None, Some("tok-a"));
+    // Another process re-logs to token B before the landing.
+    save_unanchored_login("ch", "tok-b");
+    let state = completion_order_state();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::cached(&entry.name, super::FetchStatus::Cached, None, None)
+    };
+    let mut entry = token("ch");
+    entry.access_token = "tok-a".to_string();
+    entry.oauth_identity = spawn;
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, run);
+    assert!(
+        !state.status.lock().unwrap().contains_key("ch"),
+        "the superseded credential's status must not land without a compare"
+    );
+}
+
+/// F14: the drain applies the re-anchor's memory forget only while this
+/// process's snapshot half still holds the spawn identity — a reload compare
+/// that already forgot the change leaves the snapshot at the new identity, and
+/// a second bump would discard a valid landing.
+#[test]
+fn a_reanchor_forget_is_applied_once_even_after_a_reload_compare() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ra"]);
+    let ra = crate::profile::ProfileName::from("ra");
+    // The re-anchor already landed on disk (token "new-token"), and the reload
+    // compare already seeded the snapshot to that new identity.
+    save_unanchored_login("ra", "new-token");
+    let state = completion_order_state();
+    state
+        .memory_stores()
+        .seed_snapshot(std::slice::from_ref(&ra));
+    let epoch_before = crate::usage::epoch_value(&ra, crate::usage::Half::OAuth);
+    // The entry the fetch spawned under still carries the OLD identity.
+    let mut entry = token("ra");
+    entry.access_token = "old-token".to_string();
+    entry.oauth_identity = crate::usage::OAuthIdentity::for_values(None, Some("old-token"));
+    let run = move |entry: TokenEntry| {
+        let mut o =
+            super::FetchOutcome::cached(&entry.name, super::FetchStatus::Cached, None, None);
+        o.reanchored = true;
+        o
+    };
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, run);
+    assert_eq!(
+        crate::usage::epoch_value(&ra, crate::usage::Half::OAuth),
+        epoch_before,
+        "a snapshot already at the new identity must not be forgotten a second time"
+    );
+}
+
+/// A7 (drain memory forget + no second `/profile`): a re-anchored landing whose
+/// snapshot still holds the spawn identity forgets the old account's memory once
+/// (the positive arm of the F14 gate), and the durable stamp the re-anchor's
+/// hold wrote keeps the next fetch from re-pulling `/profile`.
+#[test]
+fn a_reanchored_landing_forgets_memory_and_keeps_the_profile_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["rz"]);
+    let rz = crate::profile::ProfileName::from("rz");
+    save_unanchored_login("rz", "tok-a");
+    crate::usage::seed_login_anchor(
+        &rz,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    let state = completion_order_state();
+    // Seed the snapshot BEFORE the re-anchor, so it still holds the spawn
+    // identity when the drain runs.
+    state
+        .memory_stores()
+        .seed_snapshot(std::slice::from_ref(&rz));
+    // The re-anchor's hold wrote the new anchor, the plan-only seed and the
+    // durable /profile stamp (its `forget_disk` removed the caches first, then
+    // it re-wrote the plan-only body).
+    crate::usage::seed_login_anchor(
+        &rz,
+        Some(&crate::profile::AccountId::from("u-b".to_string())),
+    );
+    super::write_profile_cache(
+        &rz,
+        super::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
+    );
+    let now = crate::usage::now_ms();
+    crate::usage::stamp_profile_fetch(&rz, now);
+    let epoch_before = crate::usage::epoch_value(&rz, crate::usage::Half::OAuth);
+    let mut entry = token("rz");
+    entry.access_token = "tok-a".to_string();
+    entry.oauth_identity = crate::usage::OAuthIdentity::for_values(
+        Some(&crate::profile::AccountId::from("u-a")),
+        Some("tok-a"),
+    );
+    let run = move |entry: TokenEntry| {
+        let mut o =
+            super::FetchOutcome::cached(&entry.name, super::FetchStatus::Cached, None, None);
+        o.reanchored = true;
+        o.profile_wanted = true;
+        o.profile_attempt_at = Some(now);
+        o
+    };
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, run);
+    assert_eq!(
+        crate::usage::epoch_value(&rz, crate::usage::Half::OAuth),
+        epoch_before + 1,
+        "the drain forgets the re-anchored old account once"
+    );
+    assert!(
+        !crate::usage::decide_profile_fetch(&rz, false, now + 1),
+        "the durable stamp keeps the next fetch from re-pulling /profile"
+    );
+    // C8: the drain's re-anchor forget re-seeds B from the plan-only body the
+    // re-anchor's hold wrote, which carries no windows to resume — the new
+    // login's OAuth cadence must stay unstamped (its first /usage is due next
+    // tick, not one interval off a `Fresh` status dated at the plan rewrite).
+    let last_fetched = state.memory_stores().last_fetched;
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(rz.clone())),
+        "the re-anchor's plan-only re-seed stamped the new login's OAuth cadence: its first /usage fetch waits one interval"
+    );
+    // C10: that missing stamp is what `partition_due` reads as due at once.
+    let activity = crate::testutil::fresh_activity();
+    let (due, _) = partition_due(
+        &[token("rz")],
+        crate::usage::now_ms(),
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::new(),
+    );
+    assert!(
+        due.iter().any(|e| e.name.as_str() == "rz"),
+        "partition_due must mark the re-anchored, unstamped name due at once"
+    );
+}
+
+/// F8/M7: section 1 writes the durable `/profile` stamp only on an identity
+/// match — a matched landing with a wanted `/profile` stamps, a mismatched one
+/// (peer changed the credential) does not.
+#[test]
+fn the_profile_stamp_lands_only_on_a_section_one_match() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["st", "keep"]);
+    let st = crate::profile::ProfileName::from("st");
+    let keep = crate::profile::ProfileName::from("keep");
+    let old = save_unanchored_login("st", "st-old");
+    let kp = save_unanchored_login("keep", "keep-access");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![old, kp],
+    };
+    let due = collect_tokens_for_landing(&config);
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let now = crate::usage::now_ms();
+    let run = move |entry: TokenEntry| {
+        if entry.name == "st" {
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.lock().unwrap().recv();
+        }
+        let mut o =
+            super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None);
+        o.profile_wanted = true;
+        o.profile_attempt_at = Some(now);
+        o
+    };
+    std::thread::scope(|scope| {
+        let _release = ReleaseParkedFetch(release_tx);
+        scope.spawn(|| super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run));
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker reached the gate");
+        save_unanchored_login("st", "st-new");
+    });
+
+    let stamp = crate::profile_cache::profile_cache_path(
+        &st,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    )
+    .expect("stamp path");
+    let keep_stamp = crate::profile_cache::profile_cache_path(
+        &keep,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    )
+    .expect("stamp path");
+    assert!(
+        !stamp.exists(),
+        "a mismatched landing must not write the /profile stamp"
+    );
+    assert!(
+        keep_stamp.exists(),
+        "the matched landing still writes the /profile stamp"
+    );
+}
+
+/// F8/M9 (third-party flag): a peer holding the state flock past the wait bound
+/// stalls one third-party batch once, never once per landing.
+#[test]
+fn a_wedged_flock_stalls_one_third_party_batch_once() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+
+    // Save the matching profiles BEFORE a peer holds the flock — the save takes
+    // the flock itself.
+    crate::testutil::register_names(&["tp-a", "tp-b"]);
+    save_tp_entry_profile("tp-a");
+    save_tp_entry_profile("tp-b");
+    let entries = vec![tp_entry("tp-a"), tp_entry("tp-b")];
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let state = third_party_state(stub_ok_stats);
+    *state.third_party_tokens.lock().unwrap() = entries.clone();
+    crate::usage::reset_request_slots();
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let timed_out = AtomicBool::new(false);
+    super::fetch_third_party_due_flagged(&state, entries, Some(&timed_out));
+
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the third-party batch must take one flock wait, never once per landing"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("tp-a"),
+        "no reading lands under the wedge"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("tp-b"),
+        "no reading lands under the wedge"
+    );
+
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+}
+
+/// F8/M1 (kick gate): an auto-start kick whose stored login changed mid-kick
+/// writes no synthetic window and no queue anchor for the new login (A13).
+#[test]
+fn a_kick_across_a_relogin_writes_no_window_or_queue_anchor() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now_before + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            // The kick succeeds; a re-login to a different token lands while it
+            // is in flight, so the stored identity no longer matches the spawn.
+            let _ = save_unanchored_login("a", "tok-b");
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 4.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([ProfileName::from("a")])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let _ = server.join().expect("listener");
+
+    let stored = store.lock().unwrap().clone();
+    assert!(
+        stored.get("a").is_some_and(|i| i.open_at.is_none()),
+        "no synthetic window lands under the new login"
+    );
+    assert!(
+        crate::usage::queue_anchor_cached(&queue).is_none(),
+        "no queue anchor lands for the new login"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(
+            &ProfileName::from("a"),
+            crate::profile_cache::KICK_BLOCK_CACHE_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "no kick_block.json lands under the new login"
+    );
+}
+
+/// F5: a flock timeout with the epoch unmoved keeps the kick's backoff as
+/// cadence — the memory kick block and the weekly-mark consume land — while
+/// `kick_block.json` and the queue anchor stay match-only.
+#[test]
+fn a_kick_flock_timeout_keeps_the_backoff_but_writes_no_durable_block() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let now_before = crate::usage::now_epoch_secs();
+    let reset = now_before + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, now_before + 383_473);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(4, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (429, limiter.clone(), String::new())
+        } else if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                Vec::new(),
+                format!(
+                    r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+                    epoch_secs_to_iso(reset)
+                ),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, Vec::new(), "{}".to_string())
+        } else {
+            (404, Vec::new(), "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let mut entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("token");
+    entry.epoch_at_spawn =
+        crate::usage::epoch_value(&ProfileName::from("a"), crate::usage::Half::OAuth);
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([ProfileName::from("a")])));
+    let queue = crate::usage::new_auto_start_queue_state();
+
+    // A peer holds the state flock past the wait bound.
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    let holder =
+        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).expect("open");
+    holder.lock().expect("hold the flock");
+
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &HashSet::new(),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let _ = server.join().expect("listener");
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    let a = ProfileName::from("a");
+    assert!(
+        super::kick_block(&blocks, &a).is_some(),
+        "the memory kick block lands as cadence on a timeout"
+    );
+    assert!(
+        !weekly_reset_kicks.lock().unwrap().contains(&a),
+        "the weekly-reset mark was consumed as cadence"
+    );
+    let kick_block_path =
+        crate::profile_cache::profile_cache_path(&a, crate::profile_cache::KICK_BLOCK_CACHE_FILE)
+            .expect("path");
+    assert!(
+        !kick_block_path.exists(),
+        "kick_block.json stays match-only"
+    );
+    assert!(
+        crate::usage::queue_anchor_cached(&queue).is_none(),
+        "the queue anchor stays match-only"
+    );
+}
+
+/// F10/A5 (unanchored rotation): the drain sync refreshes an UNANCHORED entry's
+/// stored-token digest to the synced token, so the next fetch — whose own
+/// landing was discarded as a changed unanchored digest — matches and lands.
+#[test]
+fn a_rotated_pair_sync_refreshes_an_unanchored_entrys_digest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = completion_order_state();
+    let mut w = token("w");
+    w.access_token = "pre-rotation".to_string();
+    w.oauth_identity = crate::usage::OAuthIdentity::for_values(None, Some("pre-rotation"));
+    *state.tokens.lock().unwrap() = vec![w.clone()];
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(
+            &entry.name,
+            crate::usage::UsageInfo::default(),
+            Some(("rotated-access".into(), Some("rotated-refresh".into()))),
+        )
+    };
+    super::fetch_oauth_due_with(&state, vec![w], REFRESH_INTERVAL_MS, run);
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    assert!(
+        entry.oauth_identity.anchor.is_none(),
+        "an unanchored entry stays unanchored"
+    );
+    assert_eq!(
+        entry.oauth_identity.stored,
+        crate::usage::OAuthIdentity::for_values(None, Some("rotated-access")).stored,
+        "the unanchored entry's stored-token digest is refreshed to the synced token"
+    );
+}
+
+/// F8/M3 (codex compare): a codex usage poll whose `auth.json` account id
+/// changes after the fetch but before the section-1 compare writes no reading
+/// for the old account — no `usage_cache.json`, no store entry.
+#[test]
+fn a_codex_poll_across_an_account_change_writes_no_reading() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let name = crate::profile::ProfileName::from("cx");
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir profile dir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("write auth.json");
+
+    let (base, server) = crate::testutil::serve_endpoints(2, |_path, _i| {
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    // A codex login to account B lands after the fetch, before the compare.
+    super::set_codex_compare_hook("cx", |n| {
+        let p = crate::profile::profile_subpath(n, "auth.json").expect("path");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok-b","account_id":"account-b"}}"#,
+        )
+        .expect("rewrite auth.json");
+    });
+
+    let state = completion_order_state();
+    super::codex_usage_tick(&state);
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+
+    assert!(
+        !state.store.lock().unwrap().contains_key("cx"),
+        "the old account's codex reading must not land in the store"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .is_some_and(|p| !p.exists()),
+        "the old account's codex reading must not land in usage_cache.json"
+    );
+}
+
+/// The codex leg stamps the usage cache it writes: a live poll's `fetched_at`
+/// lands in epoch MILLISECONDS between the tick's call and return, so the TUI's
+/// `status  read <age> ago` row reads the poll's own age in production — not
+/// only when a fixture writes the stamp.
+#[test]
+fn a_codex_poll_stamps_the_written_cache_in_epoch_ms() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxstamp"]);
+    let name = crate::profile::ProfileName::from("cxstamp");
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir profile dir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("write auth.json");
+
+    let (base, server) = crate::testutil::serve_endpoints(2, |_path, _i| {
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    let before = crate::usage::now_ms();
+    super::codex_usage_tick(&completion_order_state());
+    let after = crate::usage::now_ms();
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+
+    let cached =
+        super::load_profile_cache::<crate::usage::UsageInfo>(&name, super::USAGE_CACHE_FILE)
+            .expect("the poll wrote a cache");
+    let stamped = cached
+        .fetched_at
+        .expect("a live codex poll stamps the cache");
+    assert!(
+        before <= stamped && stamped <= after,
+        "the stamp is the poll's own epoch-ms clock ({before} <= {stamped} <= {after})"
+    );
+}
+
+/// The stamp is the poll's own moment, not the tick's start (F8/G3-PL9): two
+/// codex accounts poll at distinguishable moments — the loopback server delays
+/// the first response, and the per-host request pacing separates them — so the
+/// second account's stamp must be at least the first response's send time. A
+/// tick-start stamp would predate it.
+#[test]
+fn the_second_codex_poll_stamps_after_the_first_response() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    for n in ["cx1", "cx2"] {
+        let name = crate::profile::ProfileName::from(n);
+        let p = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+        crate::profile::mkdir_700(p.parent().expect("dir")).expect("mkdir profile dir");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+        )
+        .expect("auth.json");
+    }
+    let first_reply_sent = std::sync::Arc::new(AtomicU64::new(0));
+    let reply_marker = std::sync::Arc::clone(&first_reply_sent);
+    let (base, server) = crate::testutil::serve_endpoints(2, move |_path, i| {
+        if i == 0 {
+            std::thread::sleep(Duration::from_millis(80));
+            reply_marker.store(crate::usage::now_ms(), Ordering::SeqCst);
+        }
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    super::codex_usage_tick(&completion_order_state());
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+
+    let second = crate::profile::ProfileName::from("cx2");
+    let cached =
+        super::load_profile_cache::<crate::usage::UsageInfo>(&second, super::USAGE_CACHE_FILE)
+            .expect("the second poll wrote a cache");
+    let stamped = cached.fetched_at.expect("the second poll stamps its cache");
+    let first_reply = first_reply_sent.load(Ordering::SeqCst);
+    assert!(
+        stamped >= first_reply,
+        "the second account's stamp is the poll's own moment ({stamped} >= {first_reply})"
+    );
+}
+
+/// F8/M9 twin (codex flag): a peer holding the state flock past the wait bound
+/// stalls one codex batch once, never once per landing.
+#[test]
+fn a_wedged_flock_stalls_one_codex_batch_once() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    for n in ["cx1", "cx2"] {
+        let name = crate::profile::ProfileName::from(n);
+        let p = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+        crate::profile::mkdir_700(p.parent().expect("dir")).expect("mkdir profile dir");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+        )
+        .expect("auth.json");
+    }
+    let (base, server) = crate::testutil::serve_endpoints(3, |_path, _i| {
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder =
+        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).expect("open");
+    holder.lock().expect("hold");
+
+    let state = completion_order_state();
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let timed_out = AtomicBool::new(false);
+    super::codex_usage_tick_flagged(&state, Some(&timed_out));
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the codex batch must take one flock wait, never once per landing"
+    );
+    assert!(
+        !state.store.lock().unwrap().contains_key("cx1"),
+        "no reading lands under the wedge"
+    );
+    assert!(
+        !state.store.lock().unwrap().contains_key("cx2"),
+        "no reading lands under the wedge"
+    );
+}
+
+/// One unanchored OAuth profile due, over an otherwise-empty tick state. The
+/// profile's `/usage` and `/profile` ride-along both hit the caller's test
+/// server through the endpoint sandbox; the partition stamps its spawn epoch.
+fn due_oauth_state() -> super::SchedulerState {
+    let profile = save_unanchored_login("qo", "qo-tok");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    let tokens = collect_tokens(&config);
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = tokens;
+    state
+}
+
+/// Two codex profiles, due (the process-global poll memo is empty for these
+/// fresh names), pointing at `base` through the codex URL override.
+fn write_codex_due(base: &str) {
+    crate::testutil::write_codex_roster(&["qc1", "qc2"]);
+    for n in ["qc1", "qc2"] {
+        let name = crate::profile::ProfileName::from(n);
+        let p = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+        crate::profile::mkdir_700(p.parent().expect("dir")).expect("mkdir profile dir");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+        )
+        .expect("auth.json");
+    }
+    crate::usage::set_codex_usage_url_override(base);
+    crate::usage::reset_request_slots();
+}
+
+/// P3/Q4 (rewritten): a tick with codex due and no third-party due under a
+/// wedge takes ONE wait — `codex_usage_tick_flagged` shares the tick's
+/// `timed_out` flag with the OAuth drain, so the second leg skips. Handing the
+/// codex leg a private flag (Q4) reds the count (2).
+#[test]
+fn a_tick_with_codex_due_under_a_wedge_takes_one_wait() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let (base, server) = crate::testutil::serve_endpoints(8, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (200, r#"{"plan_type":"pro"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    write_codex_due(&base);
+    let state = due_oauth_state();
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder =
+        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).expect("open");
+    holder.lock().expect("hold");
+
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    super::tick(&state);
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "codex and the OAuth drain share the tick's one deadline"
+    );
+}
+
+/// Q3 / ruling (c): the whole tick shares ONE `timed_out` flag — a due codex
+/// leg (which runs first, on the tick thread), a due third-party leg, a due
+/// OAuth drain, and an auto-start kick under one wedge take one wait in total:
+/// the codex hold times out and sets the flag, so every later hold skips.
+/// Handing any one leg a private flag reds the count (2).
+#[test]
+fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(12, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            // One body both the codex parser (`plan_type`) and the generic
+            // third-party parser (`session`) accept.
+            (
+                200,
+                r#"{"plan_type":"pro","session":{"percent":42.5}}"#.to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    write_codex_due(&base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let tokens = collect_tokens(&app_config);
+    let lapsed = || UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+        }),
+        ..UsageInfo::default()
+    };
+    let tp_entries = vec![
+        ThirdPartyEntry {
+            name: crate::profile::ProfileName::from("qt1"),
+            target: crate::providers::ThirdPartyTarget::Generic {
+                base_url: base.clone(),
+            },
+            api_key: "key".to_string(),
+            identity: crate::usage::third_party_identity(
+                None,
+                Some("key"),
+                None,
+                Some(base.as_str()),
+            ),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("qt1"),
+                crate::usage::Half::ThirdParty,
+            ),
+        },
+        ThirdPartyEntry {
+            name: crate::profile::ProfileName::from("qt2"),
+            target: crate::providers::ThirdPartyTarget::Generic {
+                base_url: base.clone(),
+            },
+            api_key: "key".to_string(),
+            identity: crate::usage::third_party_identity(
+                None,
+                Some("key"),
+                None,
+                Some(base.as_str()),
+            ),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("qt2"),
+                crate::usage::Half::ThirdParty,
+            ),
+        },
+    ];
+    let state = super::SchedulerState {
+        config: Arc::new(RankedMutex::new(app_config)),
+        tokens: Arc::new(RankedMutex::new(tokens)),
+        store: Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            lapsed(),
+        )]))),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(tp_entries)),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder =
+        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).expect("open");
+    holder.lock().expect("hold");
+
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    super::tick(&state);
+
+    let seen = server.join().expect("listener");
+    crate::usage::clear_codex_usage_url_override();
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "control: the kick fired before the flag could skip it: {seen:?}"
+    );
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "all four legs share the tick's one flag: one wait in total"
+    );
+}
+
+/// W1 (no-codex): a tick with OAuth + third-party + a kick due and NO codex
+/// under one wedge takes one wait in total. The three legs are CONCURRENT (the
+/// OAuth drain, the third-party drain, the kick worker), so with no
+/// sequential-first codex leg to set the flag ahead of them, the queued holds
+/// must re-read the flag after winning the in-process `THREAD_LOCK` and skip —
+/// otherwise each leg waits its own bound (count ≥ 2). Red when the re-check
+/// is removed.
+#[test]
+fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    // Exactly the requests this tick makes: one OAuth usage, one OAuth
+    // `/profile` ride-along, two third-party quota reads, one kick. Sized to
+    // the real count so the listener returns right after the last request
+    // instead of waiting out `IDLE_GRACE` for a sixth that never comes.
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (
+                200,
+                r#"{"plan_type":"pro","session":{"percent":42.5}}"#.to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::reset_request_slots();
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let tokens = collect_tokens(&app_config);
+    let lapsed = || UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+        }),
+        ..UsageInfo::default()
+    };
+    let tp_entries = vec![
+        ThirdPartyEntry {
+            name: crate::profile::ProfileName::from("qt1"),
+            target: crate::providers::ThirdPartyTarget::Generic {
+                base_url: base.clone(),
+            },
+            api_key: "key".to_string(),
+            identity: crate::usage::third_party_identity(
+                None,
+                Some("key"),
+                None,
+                Some(base.as_str()),
+            ),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("qt1"),
+                crate::usage::Half::ThirdParty,
+            ),
+        },
+        ThirdPartyEntry {
+            name: crate::profile::ProfileName::from("qt2"),
+            target: crate::providers::ThirdPartyTarget::Generic {
+                base_url: base.clone(),
+            },
+            api_key: "key".to_string(),
+            identity: crate::usage::third_party_identity(
+                None,
+                Some("key"),
+                None,
+                Some(base.as_str()),
+            ),
+            epoch_at_spawn: crate::usage::epoch_value(
+                &crate::profile::ProfileName::from("qt2"),
+                crate::usage::Half::ThirdParty,
+            ),
+        },
+    ];
+    let state = super::SchedulerState {
+        config: Arc::new(RankedMutex::new(app_config)),
+        tokens: Arc::new(RankedMutex::new(tokens)),
+        store: Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            lapsed(),
+        )]))),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(tp_entries)),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder =
+        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).expect("open");
+    holder.lock().expect("hold");
+
+    crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+    super::tick(&state);
+
+    let seen = server.join().expect("listener");
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/messages")),
+        "control: the kick fired before the flag could skip it: {seen:?}"
+    );
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the concurrent OAuth, third-party and kick legs share the tick's one flag: one wait in total"
+    );
+}
+
+/// A18: an unanchored profile whose `credentials.json` was written from outside
+/// tollgate discards that fetch's own landing but still stamps cadence — at most
+/// one `/usage` per interval, never a per-tick storm — and the epoch being
+/// unmoved is what keeps the cadence (this process changed nothing).
+#[test]
+fn an_outside_write_still_stamps_cadence_on_the_discarded_landing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["out"]);
+    let old = save_unanchored_login("out", "tok-a");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![old],
+    };
+    let due = collect_tokens_for_landing(&config);
+    // An outside write changes the stored token after the entry was built.
+    save_unanchored_login("out", "tok-b");
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    assert!(
+        !state.store.lock().unwrap().contains_key("out"),
+        "the discarded landing writes no reading"
+    );
+    assert!(
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("out")),
+        "cadence still stamps: at most one /usage per interval"
+    );
+}
+
+/// A18 (readings return): after an outside write discards a fetch's landing,
+/// the next successful `/profile` backfills the anchor; once the reload picks up
+/// the outside token, the rebuilt entry is anchored and its landing matches —
+/// the reading returns.
+#[test]
+fn a_reading_returns_after_the_next_successful_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ret"]);
+    let name = crate::profile::ProfileName::from("ret");
+    let old = save_unanchored_login("ret", "tok-a");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![old],
+    };
+    let due = collect_tokens_for_landing(&config);
+    // An outside write changes the stored token after the entry was built.
+    let new = save_unanchored_login("ret", "tok-b");
+    let state = completion_order_state();
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = due.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, due, REFRESH_INTERVAL_MS, run);
+    assert!(
+        !state.store.lock().unwrap().contains_key("ret"),
+        "the discarded landing writes no reading"
+    );
+
+    // The next successful /profile backfills the anchor.
+    let (base, server) = crate::testutil::serve_endpoints(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-x"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let mut decision = crate::usage::ProfileFetchDecision::default();
+    let _ = crate::usage::fetch_profile_plan(&name, "tok-b", true, None, &mut decision);
+    let _ = server.join().expect("listener");
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the /profile backfilled the anchor"
+    );
+
+    // The reload picks up the outside token; the rebuilt entry is anchored and
+    // the next fetch lands.
+    let reloaded = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![new],
+    };
+    let rebuilt = collect_tokens_for_landing(&reloaded);
+    assert!(
+        rebuilt[0].oauth_identity.anchor.is_some(),
+        "the rebuilt entry adopted the backfilled anchor"
+    );
+    *state.config.lock().unwrap() = reloaded;
+    *state.tokens.lock().unwrap() = rebuilt.clone();
+    let run = |entry: TokenEntry| {
+        super::FetchOutcome::live(&entry.name, crate::usage::UsageInfo::default(), None)
+    };
+    super::fetch_oauth_due_with(&state, rebuilt, REFRESH_INTERVAL_MS, run);
+    assert!(
+        state.store.lock().unwrap().contains_key("ret"),
+        "the reading returns after the next successful /profile"
+    );
+}
+
+/// A NON-chain live row (a plain `tollgate start` without the chain) resumed onto
+/// the same conversation as an opus chain row. The other row's live claude
+/// process holds a record naming the conversation, so the 429 is
+/// unattributable: the opus row must not move on it. Unix-only (the second
+/// claimant is a live `sleep` child).
+#[cfg(unix)]
+#[test]
+fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other_child = LiveChild::spawn();
+    let mut other = session_row("8050-0", "a");
+    other.follows_chain = false;
+    other.claude_pid = Some(other_child.pid());
+    let _m1 = register_live_row(&other);
+    let mut opus = session_row("8051-0", "a");
+    opus.claude_pid = Some(88_888);
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&opus);
+    seed_live_session_record(&home, "conv-a", other_child.pid());
+    seed_session_record(&home, "conv-a", 88_888);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8051-0"),
+        (None, None),
+        "an opus chain row must not move on a non-chain row's 429"
+    );
+}
+
+/// A second Claude Code process with NO tollgate row (a plain `claude --resume`,
+/// or a `claude` wrapper's grandchild) holds a session record naming the same
+/// conversation. The row-count never sees it, but the record is a live
+/// process's, so the 429 is unattributable. Unix-only.
+#[cfg(unix)]
+#[test]
+fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut opus = session_row("8052-0", "a");
+    opus.claude_pid = Some(88_888);
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m = register_live_row(&opus);
+    seed_session_record(&home, "conv-a", 88_888);
+    seed_live_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8052-0"),
+        (None, None),
+        "an opus chain row must not move on another process's 429"
+    );
+}
+
+/// The credit-seen mark is keyed by the row's `started_at`. A
+/// session that ends marked and a new session minted with the same id before
+/// the next scan (rows stay non-empty) has a different `started_at`, so it must
+/// not inherit the mark: the capped gate-off preferred home pulls it back.
+#[test]
+fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut old = session_row("8055-0", "a");
+    old.claude_pid = Some(77_777);
+    let marker = register_live_row(&old);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        super::SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow().get("8055-0") == Some(&old.started_at)),
+        "control: the old session is marked under its started_at"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8055-0").expect("unregister");
+    let mut fresh = session_row("8055-0", "a");
+    fresh.current_member = Some("b".to_string());
+    fresh.intended_member = Some("b".to_string());
+    fresh.chain_cursor = Some(1);
+    fresh.started_at = crate::usage::now_ms() + 1;
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8055-0"),
+        (Some("a".to_string()), Some(0)),
+        "a new opus session must not inherit the dead session's mark"
+    );
+}
+
+/// A shared conversation (a second live record names it) makes the 429
+/// ambiguous, so it sets NO mark: an unknown-demand row on the non-preferred
+/// member is walked home by the return-to-preferred pass — an unmarked row's
+/// demand does not read credit-billed. Unix-only (the second claimant is a live
+/// `sleep` child).
+#[cfg(unix)]
+#[test]
+fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8057-0", "a");
+    row.claude_pid = Some(77_777);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _m = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_live_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8057-0"),
+        (Some("a".to_string()), Some(0)),
+        "an ambiguous 429 sets no mark; the unmarked row's home pass walks it onto a"
+    );
+}
+
+/// A record naming the conversation under a LIVE pid whose `procStart` names a
+/// different process is not that live process's record: the identity compare
+/// skips it, so the conversation is not ambiguous and the session's own 429
+/// moves it. Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8058-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::write(
+        sessions.join(format!("{}.json", other.pid())),
+        serde_json::json!({ "sessionId": "conv-a", "pid": other.pid(), "procStart": "999999999999" })
+            .to_string(),
+    )
+    .unwrap();
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8058-0"),
+        (Some("b".to_string()), Some(1)),
+        "a mismatched-start record is not the live process; the 429 stays the session's own"
+    );
+}
+
+/// A fresh session (no swap yet) whose own 429 lands 5 s after its start. No
+/// outgoing member exists, so the in-flight grace has nothing to protect.
+#[test]
+fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8090-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = crate::usage::now_ms().saturating_sub(5_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8090-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fresh session's own 429 must move it"
+    );
+}
+
+/// Control: the same fresh row started a minute ago still moves.
+#[test]
+fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8091-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = crate::usage::now_ms().saturating_sub(60_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8091-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: a minute-old 429 still moves the fresh session"
+    );
+}
+
+/// A latched 429 on `a` (no target: both capped), the session ends and a new
+/// opus session reuses its id on the SAME member before any empty scan. The
+/// latch's `started_at` key must refuse it once `b` frees.
+#[test]
+fn a_reused_id_on_the_same_member_does_not_fire_the_dead_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut old = session_row("8092-0", "a");
+    old.claude_pid = Some(77_777);
+    let marker = register_live_row(&old);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8092-0")),
+        "control: the old session latched"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8092-0").expect("unregister");
+    let mut fresh = session_row("8092-0", "a");
+    fresh.started_at = crate::usage::now_ms() + 1;
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8092-0"),
+        (None, None),
+        "a new opus session must not fire a dead session's latch"
+    );
+}
+
+/// A second session record naming the conversation under a DEAD pid (a reaped
+/// child) must not make the conversation ambiguous.
+#[cfg(unix)]
+#[test]
+fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut dead = std::process::Command::new("true").spawn().expect("spawn");
+    let dead_pid = dead.id();
+    // A crashed Claude Code's record keeps the start the process had while
+    // alive: on linux the dead-pid term must decide by DEADNESS, not by an
+    // empty start. Read the start before reaping (the zombie's `/proc` entry
+    // keeps it).
+    #[cfg(target_os = "linux")]
+    let dead_start = crate::testutil::proc_start_of(dead_pid)
+        .expect("the zombie's start is still readable before reaping");
+    dead.wait().expect("reap");
+    let mut row = session_row("8094-0", "a");
+    row.claude_pid = Some(77_777);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    #[cfg(target_os = "linux")]
+    {
+        let sessions = home.home().join(".claude/sessions");
+        std::fs::write(
+            sessions.join(format!("{dead_pid}.json")),
+            serde_json::json!({ "sessionId": "conv-a", "pid": dead_pid, "procStart": dead_start })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
+    seed_session_record(&home, "conv-a", dead_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8094-0"),
+        (Some("b".to_string()), Some(1)),
+        "a dead pid's stale record must not suppress the session's own 429"
+    );
+}
+
+/// A 429 inside the in-flight grace after a swap onto `b` still MARKS the
+/// session (the grace gates the latch only): the model is credit-billed, so the
+/// home pass must not walk the unknown-demand row back onto its capped gate-off
+/// preferred home `a`.
+#[test]
+fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8095-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8095-0"),
+        (Some("b".to_string()), Some(1)),
+        "the in-grace 429 marks the session; it stays on b"
+    );
+}
+
+/// Control: the same row with no 429 is walked home onto `a`.
+#[test]
+fn an_unmarked_swapped_row_returns_home() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("8096-0", "a");
+    row.claude_pid = Some(77_777);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8096-0"),
+        (Some("a".to_string()), Some(0)),
+        "unmarked, the home pass walks it onto a"
+    );
+}
+
+/// A record naming the conversation under a LIVE pid whose `procStart` is
+/// empty is not that process's record: an empty start never counts on linux,
+/// so the conversation is not ambiguous and the session's own 429 moves it.
+/// Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pid_record_with_an_empty_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8197-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8197-0"),
+        (Some("b".to_string()), Some(1)),
+        "a live pid's record with an empty start is not that process's; the 429 stays the session's own"
+    );
+}
+
+/// A crashed Claude Code leaves its record WITH a real `procStart` behind: a
+/// DEAD pid whose record carries the start it had while alive must not count.
+/// Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut gone = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn");
+    let gone_pid = gone.id();
+    let start = crate::testutil::proc_start_of(gone_pid).expect("the child's start");
+    gone.kill().expect("kill");
+    gone.wait().expect("reap");
+    let mut row = session_row("8198-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::write(
+        sessions.join(format!("{gone_pid}.json")),
+        serde_json::json!({ "sessionId": "conv-a", "pid": gone_pid, "procStart": start })
+            .to_string(),
+    )
+    .unwrap();
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8198-0"),
+        (Some("b".to_string()), Some(1)),
+        "a dead pid's record carrying its real start must not suppress the session's own 429"
+    );
+}
+
+// ── third-party leg: completion-ordered landings ─────────────────────────────
+//
+// The third-party twin of `oauth_completions_apply_in_completion_order_not_list_order`:
+// a fast provider's landing (mark cleared, countdown published) must not wait
+// behind a slower provider listed before it.
+
+/// Held closed by the test while `slow`'s fetch must stay in flight; the
+/// fetcher is a plain `fn`, so the gate is static.
+static JOIN_ORDER_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+fn join_order_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    let slow = matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("slow")
+    );
+    if slow {
+        let (lock, cvar) = &JOIN_ORDER_GATE;
+        let guard = lock.lock().unwrap();
+        let _released = cvar
+            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| !*open)
+            .unwrap();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+fn join_order_entry(name: &str, base_url: &str) -> ThirdPartyEntry {
+    let profile_name = crate::profile::ProfileName::from(name);
+    ThirdPartyEntry {
+        name: profile_name.clone(),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: base_url.to_string(),
+        },
+        api_key: "key".to_string(),
+        identity: crate::usage::third_party_identity(None, Some("key"), None, Some(base_url)),
+        epoch_at_spawn: crate::usage::epoch_value(&profile_name, crate::usage::Half::ThirdParty),
+    }
+}
+
+#[test]
+fn third_party_landings_apply_in_completion_order_not_list_order() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *JOIN_ORDER_GATE.0.lock().unwrap() = false;
+
+    // Distinct hosts, so the per-host request spacing never sits between them:
+    // only the order landings are applied in can delay `fast`.
+    let slow_url = "https://slow.join-order.example";
+    let fast_url = "https://fast.join-order.example";
+    let state = third_party_state(join_order_fetcher);
+    {
+        let mut config = state.config.lock().unwrap();
+        for (name, url) in [("slow", slow_url), ("fast", fast_url)] {
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+            p.base_url = Some(url.to_string());
+            p.api_key = Some("key".to_string());
+            config.profiles.push(p);
+        }
+    }
+    *state.third_party_tokens.lock().unwrap() = vec![
+        join_order_entry("slow", slow_url),
+        join_order_entry("fast", fast_url),
+    ];
+
+    /// Opens the gate on drop, so `slow` returns and the scope joins even when
+    /// an assertion below fails.
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (lock, cvar) = &JOIN_ORDER_GATE;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let _release = Release;
+        scope.spawn(|| super::tick(&state));
+
+        // In completion order `fast` lands while `slow` is still held; a
+        // list-order drain is parked on `slow` and never reaches `fast`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let fast_marked = state
+                .activity
+                .lock()
+                .unwrap()
+                .get("fast")
+                .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+                .is_some();
+            let fast_counted = state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .get(&tp_key("fast"))
+                .is_some_and(|next| *next > super::now_ms());
+            if !fast_marked && fast_counted {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "`fast` never landed while `slow` held the head of the list: \
+                 third-party landings still apply in list order"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            state
+                .activity
+                .lock()
+                .unwrap()
+                .get("slow")
+                .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+                .is_some(),
+            "`slow` is still in flight when `fast` lands, so `fast` did not wait on it"
+        );
+    });
+
+    assert!(
+        state.activity.lock().unwrap().is_empty(),
+        "every mark cleared once the leg drains"
+    );
+}
+
+/// The lines an instance logs about the usage-fetch lease while another
+/// instance holds it for two ticks and then exits, with or without the TUI's
+/// UI-thread acquire (`App::finish_bootstrap`) on the same shared lease ahead
+/// of the first tick. Every line from every step is captured, so a line raised
+/// by the UI-thread acquire counts the same as one raised inside a tick.
+fn lease_transition_lines(ui_thread_acquires_first: bool) -> Vec<String> {
+    let _home = crate::testutil::HomeSandbox::new();
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the other instance wins the lease");
+    let state = third_party_state(stub_auth_expired);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        if ui_thread_acquires_first {
+            assert!(
+                !state.fetch_lease.acquire(),
+                "the UI-thread acquire is denied"
+            );
+        }
+        super::tick(&state);
+        super::tick(&state);
+        drop(other);
+        super::tick(&state);
+        super::tick(&state);
+    }
+    lease_lines(&lines)
+}
+
+/// The captured lines that speak about the usage-fetch lease.
+fn lease_lines(lines: &crate::logline::LogLines) -> Vec<String> {
+    lines
+        .snapshot()
+        .into_iter()
+        .filter(|l| l.contains("usage-fetch lease"))
+        .collect()
+}
+
+#[test]
+fn a_lease_never_denied_logs_no_transition() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_auth_expired);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        assert!(state.fetch_lease.acquire(), "a free lease is won");
+        super::tick(&state);
+        super::tick(&state);
+    }
+    assert_eq!(
+        lease_lines(&lines),
+        Vec::<String>::new(),
+        "an instance that never stood down logs neither transition"
+    );
+}
+
+#[test]
+fn an_unreadable_lease_file_logs_its_stand_down_then_its_acquire() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_auth_expired);
+    // A directory where the lock file belongs: the lease cannot open it.
+    let lock_path = crate::profile::tollgate_dir()
+        .expect("tollgate dir")
+        .join("usage-fetch.lock");
+    std::fs::create_dir_all(&lock_path).expect("mkdir lock path");
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        super::tick(&state);
+        super::tick(&state);
+        assert!(
+            !state.fetch_lease.fetches_here(),
+            "an unreadable lease file stands this instance down"
+        );
+        std::fs::remove_dir(&lock_path).expect("rmdir lock path");
+        super::tick(&state);
+        super::tick(&state);
+    }
+    assert_eq!(
+        lease_lines(&lines),
+        vec![
+            "tollgate: another instance (or upstream clauth's refresher) holds the usage-fetch lease: standing down (rendering from the shared cache)"
+                .to_string(),
+            "tollgate: acquired the usage-fetch lease: fetching".to_string(),
+        ],
+        "an unreadable lease file logs one stand-down, then one acquire once it reads"
+    );
+}
+
+#[test]
+fn an_instance_beside_a_lease_holder_logs_its_stand_down_once() {
+    let want = vec![
+        "tollgate: another instance (or upstream clauth's refresher) holds the usage-fetch lease: standing down (rendering from the shared cache)"
+            .to_string(),
+        "tollgate: acquired the usage-fetch lease: fetching".to_string(),
+    ];
+    assert_eq!(
+        lease_transition_lines(false),
+        want,
+        "a tick-first instance logs one stand-down, then one acquire"
+    );
+    assert_eq!(
+        lease_transition_lines(true),
+        want,
+        "an instance whose UI thread asked for the lease first still logs one \
+         stand-down, then one acquire"
+    );
+}
+
+/// The producer leg rewrites `tps_cache.json` only on a content change or the
+/// 10 s heartbeat: an idle tick 1 s later leaves the bytes alone even though
+/// its `generated_at` moved with the clock.
+#[test]
+fn an_idle_tick_leaves_the_tps_cache_bytes_alone() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".tollgate")).unwrap();
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let t0 = 1_790_110_000_000u64;
+    super::tps_producer_tick(t0);
+    let first = std::fs::read(&path).unwrap();
+    super::tps_producer_tick(t0 + 1_000);
+    let idle = std::fs::read(&path).unwrap();
+    super::tps_producer_tick(t0 + 10_000);
+    let heartbeat = std::fs::read(&path).unwrap();
+    assert_eq!(first, idle, "an idle tick rewrote tps_cache.json");
+    assert_ne!(idle, heartbeat, "the 10 s heartbeat did not rewrite");
+}
+
+/// One `.jsonl` whose name is not UTF-8 under a walked store never stops the
+/// tps cache write. Linux only: APFS refuses to create a non-UTF-8 name
+/// (`EILSEQ`), so macOS CI cannot build the fixture; macOS runs the same
+/// unix walk.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_transcript_name_never_blocks_the_tps_cache_write() {
+    use std::os::unix::ffi::OsStrExt;
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".tollgate")).unwrap();
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.jsonl"), "").unwrap();
+    let t0 = crate::usage::now_ms();
+    super::tps_producer_tick(t0);
+    assert!(path.exists(), "control: the cache is written");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9.jsonl")), "").unwrap();
+    super::tps_producer_tick(t0 + 6_000);
+    super::tps_producer_tick(t0 + 17_000);
+    assert!(
+        path.exists(),
+        "a non-UTF-8 transcript name blocked the write"
+    );
+}
+
+/// The attribution timeline lives in its own 0600 file, never in the cache
+/// every reader parses.
+#[cfg(unix)]
+#[test]
+fn the_attribution_timeline_lives_in_its_own_file_never_in_the_tps_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".tollgate")).unwrap();
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let u = serde_json::json!({"type": "user", "timestamp": stamp(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+    let a = serde_json::json!({"type": "assistant", "timestamp": stamp(t0 - 100_000), "message": {"id": "m0", "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": 500}}});
+    std::fs::write(dir.join("a.jsonl"), format!("{u}\n{a}\n")).unwrap();
+    super::tps_producer_tick(t0);
+    let cache: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            home.home()
+                .join(".tollgate")
+                .join(crate::tps::TPS_CACHE_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        cache.get("entries").is_none(),
+        "the cache carries the timeline"
+    );
+    let timeline = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_ATTRIBUTION_FILE);
+    let meta = std::fs::metadata(&timeline).expect("tps_attribution.json written");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&timeline).unwrap()).unwrap();
+    assert_eq!(body["version"], serde_json::json!(1));
+    assert_eq!(
+        body["entries"][0]["session"],
+        serde_json::json!("a"),
+        "the session seeded at first sight: {body}"
+    );
+}
+
+/// While the attribution timeline cannot be saved (a directory sits at its
+/// path), the producer leg still publishes `tps_cache.json` (output only): a
+/// new session's 300 shows in the cache (500 + 300) at once.
+#[test]
+fn a_pending_attribution_save_still_publishes_the_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    let tollgate = home.home().join(".tollgate");
+    std::fs::create_dir_all(&tollgate).unwrap();
+    let timeline = tollgate.join(crate::tps::TPS_ATTRIBUTION_FILE);
+    let cache = tollgate.join(crate::tps::TPS_CACHE_FILE);
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let transcript = |id: &str, out: u64| {
+        let u = serde_json::json!({"type": "user", "timestamp": stamp(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+        let a = serde_json::json!({"type": "assistant", "timestamp": stamp(t0 - 100_000), "message": {"id": id, "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": out}}});
+        format!("{u}\n{a}\n")
+    };
+    // Every cell's output across every day of the cache's `days`.
+    let output = |path: &std::path::Path| -> u64 {
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        body["days"]
+            .as_object()
+            .into_iter()
+            .flat_map(|d| d.values())
+            .filter_map(|accounts| accounts.as_object())
+            .flat_map(|a| a.values())
+            .filter_map(|models| models.as_object())
+            .flat_map(|m| m.values())
+            .map(|cell| cell["output"].as_u64().unwrap_or(0))
+            .sum()
+    };
+    std::fs::write(dir.join("a.jsonl"), transcript("m0", 500)).unwrap();
+    super::tps_producer_tick(t0);
+    assert_eq!(output(&cache), 500, "control: the first cache");
+    std::fs::remove_file(&timeline).unwrap();
+    std::fs::create_dir_all(timeline.join("blocker")).unwrap();
+    std::fs::write(dir.join("b.jsonl"), transcript("m1", 300)).unwrap();
+    super::tps_producer_tick(t0 + 6_000);
+    assert_eq!(
+        output(&cache),
+        800,
+        "a pending attribution save withheld the cache"
+    );
+    std::fs::remove_dir_all(&timeline).unwrap();
+    super::tps_producer_tick(t0 + 7_000);
+    assert!(timeline.is_file(), "the timeline landed");
+}
+
+/// While every speed-ledger save fails (a directory at its path), the day that
+/// left the window stays held and the same from tick to tick, so idle ticks
+/// inside the 10 s heartbeat never rewrite `tps_cache.json`.
+#[test]
+fn idle_ticks_never_rewrite_the_cache_while_a_ledger_save_keeps_failing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let tollgate = home.home().join(".tollgate");
+    std::fs::create_dir_all(&tollgate).unwrap();
+    let cache = tollgate.join(crate::tps::TPS_CACHE_FILE);
+    let ledger = tollgate.join("token_speed.json");
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64, fmt: &str| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format(fmt)
+            .to_string()
+    };
+    let iso = |ms: u64| stamp(ms, "%Y-%m-%dT%H:%M:%S%.3fZ");
+    let u = serde_json::json!({"type": "user", "timestamp": iso(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+    let a = serde_json::json!({"type": "assistant", "timestamp": iso(t0 - 100_000), "message": {"id": "m0", "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": 500}}});
+    std::fs::write(dir.join("a.jsonl"), format!("{u}\n{a}\n")).unwrap();
+    super::tps_producer_tick(t0);
+    if ledger.is_file() {
+        std::fs::remove_file(&ledger).unwrap();
+    }
+    std::fs::create_dir_all(ledger.join("blocker")).unwrap();
+    let left = t0 + 2 * 86_400_000;
+    super::tps_producer_tick(left);
+    let written = std::fs::read_to_string(&cache).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let day = stamp(t0 - 100_000, "%Y-%m-%d");
+    assert_eq!(
+        body["days"][&day]["*"]["claude-opus-5-5"]["output"], 500,
+        "control: the day is held while its fold fails: {body}"
+    );
+    for s in 1..=3 {
+        super::tps_producer_tick(left + s * 1_000);
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            written,
+            "the idle tick at +{s} s rewrote the cache"
+        );
+    }
+}
+
+/// A 15 min clock step back while idle: the heartbeat writes on the first tick
+/// after the step, so the cache's `generated_at` never stays ahead of the clock
+/// and every reader keeps an age (the `tps` slot stays published).
+#[test]
+fn the_tps_heartbeat_writes_on_the_first_tick_after_a_step_back() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".tollgate")).unwrap();
+    let path = home
+        .home()
+        .join(".tollgate")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let t0 = crate::usage::now_ms();
+    super::tps_producer_tick(t0);
+    super::tps_producer_tick(t0 + 11_000);
+    let back = t0 + 11_000 - 15 * 60_000;
+    let mut ageless = Vec::new();
+    for k in 0..60u64 {
+        let t = back + k * 1_000;
+        super::tps_producer_tick(t);
+        let snap: crate::tps::Snapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if snap.age_ms(t).is_none() {
+            ageless.push(k);
+        }
+    }
+    assert!(ageless.is_empty(), "ticks with no cache age: {ageless:?}");
+}
+
+/// A scan that consumes nothing leaves the producer's success for a later
+/// scan: the record lives in the producer, so a scan that returns before
+/// judging any latch loses no success. The scan after it here drives a fresh
+/// config — a production handle stays poisoned once its lock is — and that
+/// scan drops the latch and leaves the recovered session on its member.
+#[test]
+fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
+    super::tps_producer_tick(now + 1_000);
+    // Poison the scan's config lock: the scan returns before the per-row loop,
+    // so nothing reads the success this tick.
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let doomed = Arc::clone(&config);
+    std::thread::spawn(move || {
+        let _held = doomed.lock().expect("lock the config before poisoning it");
+        panic!("poison the config lock");
+    })
+    .join()
+    .expect_err("the planted panic unwinds the thread");
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        order_row_latched(),
+        "the early-returning scan dropped the latch"
+    );
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success still drops the latch once a scan can judge it"
+    );
+    assert!(!order_row_latched(), "the next scan dropped the latch");
+}
+
+/// A subagent transcript's success must not drop the main loop's latch: the
+/// pulled record is keyed by the latched 429's OWN file, so a newer success in
+/// a subagent file (the same conversation key) leaves the latch live and the
+/// session moves once `b` frees.
+#[test]
+fn a_subagent_success_does_not_drop_the_main_files_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // A later line and a newer stamp than the latched 429's, in the subagent
+    // file only: the main file holds no success. The tick is past the walk
+    // interval, so discovery picks the new subagent file up and reads it.
+    write_subagent(&home, "conv-a", &[ok_row_at(now - 500_000)]);
+    super::tps_producer_tick(now + 6_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a subagent's success is another file's and must not drop the latch"
+    );
+}
+
+/// A scheduler spend reads as the account's `Refreshing` without touching the
+/// TUI's account slot, counts once per claim, and its last claim's drop leaves
+/// no entry behind.
+#[test]
+fn a_scheduler_spend_counts_per_claim_and_reads_as_refreshing() {
+    let activity = crate::testutil::fresh_activity();
+    let name = crate::profile::ProfileName::from("spend-shown");
+    let flag = std::sync::atomic::AtomicBool::new(false);
+
+    let first = super::claim_scheduler_spend_unless_shutting_down(&activity, &name, &flag)
+        .expect("an unset flag admits the spend");
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("spend-shown").expect("activity state");
+        assert_eq!(state.selected(FetchLeg::OAuth), ProfileActivity::Refreshing);
+        assert_eq!(state.account, None, "the account slot stays the TUI's");
+    }
+    assert!(!super::is_idle(&activity, &name));
+    assert_eq!(
+        super::spending_account(&activity).as_deref(),
+        Some("spend-shown")
+    );
+
+    let second = super::claim_scheduler_spend_unless_shutting_down(&activity, &name, &flag)
+        .expect("a second leg's spend is admitted beside the first");
+    drop(first);
+    assert!(
+        super::token_spend_in_flight(&activity),
+        "the second spend still runs after the first returned"
+    );
+    drop(second);
+    assert!(
+        activity.lock().unwrap().get("spend-shown").is_none(),
+        "the last claim's drop leaves no entry"
+    );
+}
+
+/// Blocks the land of a rotation whose token answer is held at the stub, and
+/// samples the quit's predicate while the land waits: `answered` fires when the
+/// token endpoint is hit, `release` lets its answer go. Holding `config` blocks
+/// [`crate::oauth::apply_rotated_tokens_locked`], which takes it first, and the
+/// stage file shows the answer was settled before the land.
+fn spend_while_the_land_waits(
+    config: &crate::profile::ConfigHandle,
+    activity: &ActivityStore,
+    name: &crate::profile::ProfileName,
+    answered: &std::sync::mpsc::Receiver<()>,
+    release: &std::sync::mpsc::Sender<()>,
+) -> (bool, Vec<bool>) {
+    answered
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the rotation reached the token endpoint");
+    let held = config.lock().expect("config");
+    release.send(()).expect("release the token answer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let staged = loop {
+        if crate::oauth::has_stage(name) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let samples = (0..20)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            super::token_spend_in_flight(activity)
+        })
+        .collect();
+    drop(held);
+    (staged, samples)
+}
+
+/// A token stub whose refresh answer waits for the test's release.
+fn held_token_stub(
+    first: &'static str,
+) -> (
+    String,
+    std::thread::JoinHandle<Vec<String>>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with(first) {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            answered_tx.send(()).expect("signal the token hit");
+            release_rx.recv().expect("wait for the release");
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    (base, server, answered_rx, release_tx)
+}
+
+/// The poll leg's claim spans the land of the minted pair, not just its stage:
+/// a failed stage write leaves the land as the only durable point, so a quit
+/// must wait for it.
+#[test]
+fn a_poll_rotation_holds_its_claim_until_its_pair_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-land-held";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server, answered, release) = held_token_stub("/api/oauth/usage");
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let activity = crate::testutil::fresh_activity();
+    let worker = {
+        let config = Arc::clone(&config);
+        let activity = Arc::clone(&activity);
+        std::thread::spawn(move || {
+            let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+            super::fetch_with_rotation(
+                &config,
+                &entry,
+                None,
+                &refetch,
+                &activity,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        })
+    };
+
+    let (staged, samples) =
+        spend_while_the_land_waits(&config, &activity, &profile, &answered, &release);
+    let outcome = worker.join().expect("worker");
+    server.join().expect("listener");
+
+    assert!(staged, "the answer was staged before the land");
+    assert_eq!(
+        samples,
+        vec![true; 20],
+        "the claim stands while the land waits"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// The kick's claim spans the land of its minted pair too.
+#[test]
+fn a_kick_holds_its_claim_until_its_pair_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-land-held";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server, answered, release) = held_token_stub("/v1/messages");
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    let activity = crate::testutil::fresh_activity();
+    let worker = {
+        let config = Arc::clone(&config);
+        let activity = Arc::clone(&activity);
+        let profile = profile.clone();
+        std::thread::spawn(move || {
+            crate::oauth::auto_start_kick(
+                &config,
+                &profile,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+            )
+        })
+    };
+
+    let (staged, samples) =
+        spend_while_the_land_waits(&config, &activity, &profile, &answered, &release);
+    let result = worker.join().expect("worker");
+    server.join().expect("listener");
+
+    assert!(staged, "the answer was staged before the land");
+    assert_eq!(
+        samples,
+        vec![true; 20],
+        "the claim stands while the land waits"
+    );
+    assert!(result.rotated.is_some(), "the kick's rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// The OAuth leg's marker for one profile, `None` when the store holds no
+/// entry (or no leg op) for it.
+fn oauth_leg(activity: &ActivityStore, name: &str) -> Option<ProfileActivity> {
+    activity
+        .lock()
+        .expect("activity store")
+        .get(name)
+        .and_then(|state| state.fetch(FetchLeg::OAuth))
+}
+
+/// Puts `name`'s stored expiry inside the rotation lead window, so the poll
+/// takes the proactive arm: no probe runs first to mark the OAuth leg itself.
+#[cfg(not(target_os = "macos"))]
+fn make_rotation_proactive(config: &crate::profile::ConfigHandle, name: &str) -> i64 {
+    let soon = crate::usage::now_ms() as i64 + 300_000;
+    let mut cfg = config.lock().unwrap();
+    let token = cfg
+        .find_mut(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.credentials.as_mut())
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+        .expect("oauth credentials");
+    token.expires_at = Some(soon);
+    soon
+}
+
+/// A kick whose refresh the token endpoint fails hands the profile to the
+/// OAuth leg all the same: the caller's fetch follows on that leg.
+#[test]
+fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-refresh-500";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity = crate::testutil::fresh_activity();
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick reached the token endpoint: {seen:?}"
+    );
+    assert_eq!(result.rotated, None, "the refresh failed");
+    assert_eq!(oauth_leg(&activity, name), Some(ProfileActivity::Fetching));
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// A poll rotation whose land fails, on the proactive arm: no fetch follows
+/// the failed persist, so only the hand-off at the token answer leaves the
+/// OAuth leg `Fetching`.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_poll_rotation_whose_land_fails_leaves_the_oauth_leg_fetching() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-land-fails";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let soon = make_rotation_proactive(&config, name);
+    seed_usage_cache(name);
+    crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
+    let entry = rotation_entry(name, Some(soon));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the poll rotated before its land could fail: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "no fetch follows a failed land: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    assert_eq!(oauth_leg(&activity, name), Some(ProfileActivity::Fetching));
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// Write `name`'s usage chain (`credentials.json`) with `access` as its live
+/// access token beside a rotating refresh token.
+fn write_rolling_chain(name: &str, access: &str) {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        serde_json::json!({ "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": "rt-chain",
+            "expiresAt": crate::usage::now_ms() as i64 + 8 * 60 * 60 * 1000,
+            "subscriptionType": "max"
+        }})
+        .to_string(),
+    )
+    .expect("write chain");
+}
+
+/// Run one scan under a fresh transient (15-minute) hold, counting gate calls.
+fn tick_under_transient_hold(name: &str) -> (usize, bool) {
+    let config = rolling_profile_config(&[name], &[]);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    pacing.lock().unwrap().retry_after_ms.insert(
+        name.to_string(),
+        super::RetryHold {
+            not_before: now + super::ROLLING_RETRY_MS,
+            watched: None,
+        },
+    );
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+                crate::format::Cause::PersistFailed(name.to_string()),
+                crate::format::Retry::Wait,
+            ))
+        },
+    );
+    let held = pacing.lock().unwrap().retry_after_ms.contains_key(name);
+    (calls.load(std::sync::atomic::Ordering::SeqCst), held)
+}
+
+/// A transient hold over a sidecar its chain has rotated past releases on the
+/// next scan: that bearer is revoked, so the gate runs at once.
+#[test]
+fn claude_rolling_tick_releases_a_transient_hold_over_a_bearer_the_chain_passed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_rolling_sidecar("cl-behind", 8 * 60 * 60 * 1000); // far outside the horizon
+    write_rolling_chain("cl-behind", "cl-behind-new");
+    let (calls, _) = tick_under_transient_hold("cl-behind");
+    assert_eq!(calls, 1, "the hold releases and the gate runs");
+}
+
+/// A transient hold over a sidecar that carries the chain's own bearer keeps
+/// its 15-minute leash.
+#[test]
+fn claude_rolling_tick_keeps_a_transient_hold_over_a_caught_up_bearer() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_rolling_sidecar("cl-caught", 60 * 60 * 1000); // due by clock, but held
+    write_rolling_chain("cl-caught", "cl-caught-rolled");
+    let (calls, held) = tick_under_transient_hold("cl-caught");
+    assert_eq!(calls, 0, "the leash holds");
+    assert!(held, "the hold is still in place");
+}
+
+/// The fetch leg's rotation over a cut landing (the store and the token list on
+/// the staged pair, its stage still on disk) redoes that landing's hooks and
+/// mirror before it spends: its own landing would replace the stage, and with
+/// it the pre-rotation bearer the Keychain item still holds.
+#[test]
+fn a_fetch_rotation_over_a_cut_landing_redoes_its_mirror_before_it_spends() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-cut-then-fetch";
+    let usage_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let uc = usage_calls.clone();
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            if uc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    // The cut landing's leftovers: P1 (`rt-old`) spent, the store and memory on
+    // the staged P2 (`rt-mid`), the stage beside them.
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    std::fs::write(
+        chain_dir(name).join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}"#,
+    )
+    .expect("write the store");
+    std::fs::write(
+        chain_dir(name).join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    {
+        let mut cfg = config.lock().expect("config");
+        let profile = cfg.find_mut(&chain_pn(name)).expect("profile");
+        crate::lock::with_state_lock(|held| {
+            profile.set_credentials(
+                crate::oauth::read_raw_store(&chain_pn(name)).expect("store"),
+                held,
+            );
+            Ok(())
+        })
+        .expect("memory on the staged pair");
+    }
+    seed_usage_cache(name);
+    let mut entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    entry.access_token = "at-mid".into();
+    entry.refresh_token = Some("rt-mid".into());
+    /// Each mirror's stage: its pair's refresh token and its `base_access`.
+    type MirrorStages = Rc<RefCell<Vec<(Option<String>, String)>>>;
+    let seen: MirrorStages = Rc::default();
+    let recorder = Rc::clone(&seen);
+    crate::oauth::set_keychain_mirror_hook(Some(Box::new(move || {
+        let stage =
+            crate::oauth::StagedPair::read(&chain_pn(name)).expect("a stage at every mirror");
+        recorder.borrow_mut().push((
+            stage.creds.refresh_token().map(str::to_string),
+            stage.base_access,
+        ));
+    })));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    crate::oauth::set_keychain_mirror_hook(None);
+    let paths = server.join().expect("listener");
+
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| p.starts_with("/v1/oauth/token"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (Some("rt-mid".to_string()), "at-old".to_string()),
+            (Some("rt-new".to_string()), "at-mid".to_string()),
+        ],
+        "the cut landing's mirror is redone against the bearer it replaced, then the new pair \
+         mirrors against the one it replaces"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-new"));
+    assert!(!chain_dir(name).join("credentials.json.staged").exists());
+}
+
+// ── the usage probe leg ──────────────────────────────────────────────────────
+
+const SETUP_TOKEN: &str = "sk-ant-oat01-probe-fixture";
+
+/// A probe response's unified headers: 5h at 31%, 7d at 20%, both an hour and
+/// more out.
+fn probe_headers() -> Vec<(String, String)> {
+    let now = crate::usage::now_epoch_secs();
+    [
+        (
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.31".to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-5h-reset",
+            (now + 3600).to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.2".to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-reset",
+            (now + 86_400).to_string(),
+        ),
+        ("anthropic-ratelimit-unified-status", "allowed".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// A scheduler state over one setup-token account `name` with the usage probe
+/// on at `interval_ms`: no pair, `SETUP_TOKEN` in its sidecar unless `minted`
+/// is false, and an empty token list, since the probe leg reads the config.
+fn probe_state(name: &str, interval_ms: u64, minted: bool) -> super::SchedulerState {
+    probe_state_over(&[name], interval_ms, minted)
+}
+
+/// [`probe_state`] over several setup-token accounts, in `names` order.
+fn probe_state_over(names: &[&str], interval_ms: u64, minted: bool) -> super::SchedulerState {
+    let names_pn: Vec<crate::profile::ProfileName> = names
+        .iter()
+        .map(|name| crate::profile::ProfileName::from(*name))
+        .collect();
+    let mut profiles = Vec::new();
+    for pn in &names_pn {
+        let mut profile = crate::testutil::blank_profile(pn);
+        profile.usage_probe = true;
+        profile.usage_probe_interval_ms = interval_ms;
+        crate::profile::save_profile(&profile).expect("save the profile");
+        profiles.push(profile);
+    }
+    crate::testutil::register_names(names);
+    if minted {
+        for profile in &mut profiles {
+            crate::claude::write_session_token(
+                &profile.name,
+                SETUP_TOKEN,
+                crate::usage::now_ms() as i64,
+            )
+            .expect("mint");
+            // What the loader records off the sidecar it finds.
+            profile.has_long_lived_sidecar = true;
+            profile.setup_token_digest =
+                crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+        }
+    }
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState {
+                profiles: names_pn,
+                ..crate::profile::AppState::default()
+            },
+            profiles,
+        }));
+    chain_state(&config, Vec::new())
+}
+
+/// The whole leg on one tick: the probe goes out on the setup token, and its
+/// reading lands as a `/usage` one does, in the store with a `Fresh` status, in
+/// the disk cache, in `usage_history.jsonl`, and with a countdown at the
+/// profile's own interval.
+#[test]
+fn an_opted_in_setup_token_account_is_probed_and_its_reading_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("probed", 300_000, true);
+    let name = crate::profile::ProfileName::from("probed");
+
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 1, "one probe on the tick");
+    assert!(
+        raw[0].starts_with("POST /v1/messages?beta=true "),
+        "{raw:?}"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&raw[0], "authorization").as_deref(),
+        Some(format!("Bearer {SETUP_TOKEN}").as_str())
+    );
+    let stored = state.store.lock().unwrap().get("probed").cloned();
+    let five = stored
+        .and_then(|i| i.five_hour)
+        .expect("the 5h reading landed");
+    assert_eq!(five.utilization, 31.0);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::Fresh)
+    );
+    let cached = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("the disk cache");
+    assert!(cached.fetched_at.is_some(), "a live reading is dated");
+    assert_eq!(
+        crate::profile::load_usage_history(&name).len(),
+        1,
+        "the reading joins the history the burn rate and the auto-start queue read"
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")];
+    assert!(
+        (before + 300_000..after + 300_000 + 300_000 / 4).contains(&next),
+        "the countdown runs at the profile's own interval: {next}"
+    );
+}
+
+/// The switch alone admits the account, but with no setup token on disk there
+/// is nothing to probe with: no request, no reading.
+#[test]
+fn a_probe_switch_without_a_setup_token_sends_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("unminted", 300_000, false);
+    super::tick(&state);
+    crate::testutil::assert_nothing_sent(&listener);
+    assert!(!state.store.lock().unwrap().contains_key("unminted"));
+}
+
+/// A probe entry is due at its own interval, not the leg's.
+#[test]
+fn a_probe_entry_is_due_at_its_own_interval() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let entry = super::ProbeEntry {
+        name: crate::profile::ProfileName::from("p"),
+        token: SETUP_TOKEN.to_string(),
+        identity: crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN),
+        interval_ms: 300_000,
+        epoch_at_spawn: 0,
+        verdict_only: false,
+    };
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert(oauth_key("p"), FetchStamp::at(EpochMs::from_millis(base)));
+    let due_at = |now: u64| {
+        let (due, next) = partition_due(
+            std::slice::from_ref(&entry),
+            now,
+            &last_fetched,
+            &activity,
+            REFRESH_INTERVAL_MS,
+            &HashMap::new(),
+        );
+        assert_eq!(next.get(&oauth_key("p")).copied(), Some(base + 300_000));
+        !due.is_empty()
+    };
+    assert!(
+        !due_at(base + REFRESH_INTERVAL_MS),
+        "the leg's 90 s are not the probe's"
+    );
+    assert!(!due_at(base + 299_999));
+    assert!(due_at(base + 300_000));
+}
+
+/// A 429 without a reading keeps the last one and defers the next probe to the
+/// server's `retry-after` (10 min, under the 15 min `MAX_RETRY_AFTER_MS` cap).
+#[test]
+fn a_throttled_probe_keeps_the_last_reading_and_waits_out_retry_after() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (
+            429,
+            vec![("retry-after".to_string(), "600".to_string())],
+            "{}".into(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("throttled", 120_000, true);
+    let name = crate::profile::ProfileName::from("throttled");
+    let last = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 12.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &last);
+
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert_eq!(
+        state.status.lock().unwrap().get("throttled"),
+        Some(&super::FetchStatus::RateLimited)
+    );
+    let kept = state.store.lock().unwrap().get("throttled").cloned();
+    assert_eq!(
+        kept.and_then(|i| i.five_hour).map(|w| w.utilization),
+        Some(12.0)
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("throttled")];
+    assert!(
+        next >= before + 600_000,
+        "the next probe waits out retry-after, not the 2 min interval: {next}"
+    );
+    assert!(
+        next < after + 600_000 + 120_000 / 4,
+        "and no longer than it plus the spread, never up to the 15 min cap: {next}"
+    );
+}
+
+/// A re-mint while the probe is in flight discards its landing: the reading
+/// answered for the old token, which may be another account.
+#[test]
+fn a_probe_reading_for_a_token_reminted_mid_flight_never_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from("reminted"),
+            "sk-ant-oat01-another",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint mid-flight");
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("reminted", 300_000, true);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert!(
+        !state.store.lock().unwrap().contains_key("reminted"),
+        "no store entry under the new token"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &crate::profile::ProfileName::from("reminted"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .is_none(),
+        "and no disk cache"
+    );
+}
+
+/// One tick against a listener that answers every probe with `status` and no
+/// headers; returns how many probes reached it.
+fn probe_tick_answering(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    status: u16,
+) -> usize {
+    // A 401 or a 403 carries the Anthropic error body that refuses the
+    // credential, as the API's own refusal does.
+    let body = match status {
+        401 => r#"{"type":"error","error":{"type":"authentication_error","message":"refused"}}"#,
+        403 => {
+            r#"{"type":"error","error":{"type":"permission_error","message":"refused","details":{"error_code":"token_revoked"}}}"#
+        }
+        _ => "{}",
+    };
+    probe_tick_answering_with(home, state, status, body)
+}
+
+/// [`probe_tick_answering`] with the response body `body`.
+fn probe_tick_answering_with(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    status: u16,
+    body: &'static str,
+) -> usize {
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+        (status, Vec::new(), body.into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    server.join().expect("listener").len()
+}
+
+/// One tick against a listener nothing may reach.
+fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super::SchedulerState) {
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    crate::testutil::assert_nothing_sent(&listener);
+}
+
+/// A refused setup token beside a stored pair is never probed on the cadence,
+/// and the pair's `/usage` says nothing about the token, so nothing but a
+/// re-mint would lift its verdict. A manual refresh retries it once, as it
+/// retries a rejected api key: a good answer lifts the verdict, and its
+/// reading lands nowhere, so the pair's own reading stays the store's.
+#[test]
+fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("paired", 60_000, true);
+    let name = crate::profile::ProfileName::from("paired");
+    let fingerprint = {
+        let mut config = state.config.lock().unwrap();
+        let profile = config.find_mut(&name).expect("the profile");
+        profile.credentials = Some(crate::testutil::oauth_pair("paired"));
+        crate::testutil::refuse_setup_token(profile);
+        crate::usage::dead_login_fingerprint(profile).expect("the token's fingerprint")
+    };
+    state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .insert("paired".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state);
+
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("paired".to_string());
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1, "one retry");
+    assert!(!crate::profile_cache::auth_expired_matches(
+        &name,
+        fingerprint
+    ));
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("paired")
+    );
+    assert!(
+        state.store.lock().unwrap().get("paired").is_none(),
+        "the probe's reading lands nowhere beside the pair"
+    );
+}
+
+/// A verdict-only retry rides on its pair's key, so it sets no activity mark
+/// and clears none: the pair's own `/usage` fetch owns that row's spinner, and
+/// a retry that set or cleared it would drop the spinner mid-fetch. The
+/// control: each retry ran and lifted the verdict.
+#[test]
+fn a_verdict_only_retry_leaves_the_pairs_activity_mark_alone() {
+    use super::NamedEntry as _;
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("paired", 60_000, true);
+    let name = crate::profile::ProfileName::from("paired");
+    state
+        .config
+        .lock()
+        .unwrap()
+        .find_mut(&name)
+        .expect("the profile")
+        .credentials = Some(crate::testutil::oauth_pair("paired"));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let forced: HashSet<String> = ["paired".to_string()].into();
+    for held in [ProfileActivity::Fetching, ProfileActivity::Queued] {
+        let fingerprint = {
+            let mut config = state.config.lock().unwrap();
+            let profile = config.find_mut(&name).expect("the profile");
+            crate::testutil::refuse_setup_token(profile);
+            crate::usage::dead_login_fingerprint(profile).expect("the token's fingerprint")
+        };
+        let candidates = super::refused_token_candidates(&state.config.lock().unwrap(), &forced);
+        let entries = super::refused_tokens_beside_pairs(candidates);
+        assert_eq!(entries.len(), 1, "fixture: one verdict-only retry");
+        let key = entries[0].key();
+        super::mark_fetch_activity(&state.activity, &key, held);
+        super::fetch_probe_due_flagged(&state, entries, None);
+        assert_eq!(
+            state
+                .activity
+                .lock()
+                .unwrap()
+                .get("paired")
+                .and_then(|s| s.fetch(key.leg)),
+            Some(held),
+            "the pair's mark stands"
+        );
+        assert!(
+            !crate::profile_cache::auth_expired_matches(&name, fingerprint),
+            "control: the retry ran and lifted the verdict"
+        );
+    }
+    assert_eq!(server.join().expect("listener").len(), 2);
+}
+
+/// Whether one probe answered `status` with `body` leaves the setup token a
+/// dead login: `AuthExpired`, its durable record and its live verdict.
+fn refused_after_a_probe_answered(status: u16, body: &'static str) -> (bool, bool, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 60_000, true);
+    assert_eq!(probe_tick_answering_with(&home, &state, status, body), 1);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    // One lock at a time: the status store and the verdict mirror rank apart.
+    let expired =
+        state.status.lock().unwrap().get("probed") == Some(&super::FetchStatus::AuthExpired);
+    let recorded = crate::profile_cache::auth_expired_matches(
+        &crate::profile::ProfileName::from("probed"),
+        digest,
+    );
+    let dead = state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .contains_key("probed");
+    (expired, recorded, dead)
+}
+
+/// A 403 page from a WAF or a region block in front of the API says nothing
+/// about the token: the probe fails, and no dead login is recorded that would
+/// outlive every restart. A 401 on the same account is a refused token.
+#[test]
+fn a_block_page_403_leaves_the_setup_token_alive() {
+    assert_eq!(
+        refused_after_a_probe_answered(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#
+        ),
+        (true, true, true),
+        "control: a 401 is a refused token"
+    );
+    assert_eq!(
+        refused_after_a_probe_answered(
+            403,
+            "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1></body></html>",
+        ),
+        (false, false, false)
+    );
+}
+
+/// A 401 a TLS-intercepting proxy answers with, an HTML page and no
+/// `request-id`, says nothing about the token either: the probe fails and no
+/// dead login is recorded. The control: Anthropic's own 401 refusing the
+/// token records it.
+#[test]
+fn a_proxy_401_leaves_the_setup_token_alive() {
+    assert_eq!(
+        refused_after_a_probe_answered(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#
+        ),
+        (true, true, true),
+        "control: Anthropic's 401 records a dead login"
+    );
+    assert_eq!(
+        refused_after_a_probe_answered(
+            401,
+            "<html><body><h1>407 Proxy Authentication Required</h1></body></html>"
+        ),
+        (false, false, false)
+    );
+}
+
+#[test]
+fn a_401_leaves_the_setup_token_a_dead_login() {
+    assert_eq!(
+        refused_after_a_probe_answered(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#
+        ),
+        (true, true, true)
+    );
+}
+
+/// The OAuth fetch mark `name`'s row carries, if any.
+fn oauth_fetch_mark(activity: &super::ActivityStore, name: &str) -> Option<super::ProfileActivity> {
+    activity
+        .lock()
+        .unwrap()
+        .get(name)
+        .and_then(|state| state.fetch(crate::usage::FetchLeg::OAuth))
+}
+
+/// The probe leg flips its row to `Fetching` inside the request's turn, once
+/// it holds its spacing slot: the row reads `Queued` while the probe waits for
+/// the slot, and `Fetching` by the time the request reaches the server.
+#[test]
+fn the_probe_leg_flips_its_row_only_once_the_request_holds_its_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("waits", 60_000, true);
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, {
+        let activity = state.activity.clone();
+        let seen = seen.clone();
+        move |_, _| {
+            *seen.lock().unwrap() = Some(oauth_fetch_mark(&activity, "waits"));
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    // Another request took the slot just now, so the probe waits out the
+    // spacing before its turn.
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| super::tick(&state));
+        // Polled, bounded below the 5 s spacing the probe waits out, rather
+        // than one fixed sleep a loaded box may outlast before the tick marks
+        // the row at all.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4_500);
+        let mut mark = oauth_fetch_mark(&state.activity, "waits");
+        while mark != Some(super::ProfileActivity::Queued) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            mark = oauth_fetch_mark(&state.activity, "waits");
+        }
+        assert_eq!(
+            mark,
+            Some(super::ProfileActivity::Queued),
+            "the row reads queued while the probe waits for its slot"
+        );
+        ticking.join().expect("the tick");
+    });
+    assert_eq!(server.join().expect("listener").len(), 1);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(Some(super::ProfileActivity::Fetching)),
+        "and fetching once its request is out"
+    );
+}
+
+/// The status a probe leg that panics with its entry out leaves on `probed`'s
+/// row, `hook` run while the leg is out, just before the panic. The panic comes
+/// before any request, so nothing may reach the listener, and the stranded
+/// mark goes either way.
+fn status_after_a_probe_leg_panic(
+    hook: impl FnOnce(&crate::profile::ConfigHandle) + Send + 'static,
+) -> Option<super::FetchStatus> {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 60_000, true);
+    let config = state.config.clone();
+    let _armed = super::probe_panic::arm_panic(move || hook(&config));
+    probe_tick_expecting_none(&home, &state);
+    assert_eq!(
+        oauth_fetch_mark(&state.activity, "probed"),
+        None,
+        "the stranded mark goes"
+    );
+    state.status.lock().unwrap().get("probed").copied()
+}
+
+/// A panicking probe leg landed nothing: the row says the fetch failed rather
+/// than keep a status no probe will move.
+#[test]
+fn a_panicking_probe_leg_says_its_fetch_failed() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|_| {}),
+        Some(super::FetchStatus::Failed)
+    );
+}
+
+/// A probe switched off while the leg was out leaves the account as the
+/// switch-off cleared it: no `Failed` the probe will never move again.
+#[test]
+fn a_probe_leg_panic_after_the_switch_off_leaves_no_status() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|config| {
+            if let Some(p) = config
+                .lock()
+                .unwrap()
+                .find_mut(&crate::profile::ProfileName::from("probed"))
+            {
+                p.usage_probe = false;
+            }
+        }),
+        None
+    );
+}
+
+/// A probe leg that panics on a later entry leaves the reading an earlier one
+/// landed: only the entries the panic stranded read failed.
+#[test]
+fn a_probe_leg_panic_leaves_an_entry_that_landed_before_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state_over(&["landed", "panics"], 60_000, true);
+    let _armed = super::probe_panic::arm_panic_at("panics", || {});
+    super::tick(&state);
+    assert_eq!(
+        server.join().expect("listener").len(),
+        1,
+        "the leg probes the first entry, then panics on the second"
+    );
+    let status = state.status.lock().unwrap();
+    assert_eq!(status.get("landed"), Some(&super::FetchStatus::Fresh));
+    assert_eq!(status.get("panics"), Some(&super::FetchStatus::Failed));
+}
+
+/// A re-mint while the leg was out moves the epoch, and the new token's row
+/// takes no `Failed` for the old token's probe.
+#[test]
+fn a_probe_leg_panic_after_a_remint_leaves_no_status() {
+    assert_eq!(
+        status_after_a_probe_leg_panic(|_| {
+            crate::usage::bump_epoch_for_test(
+                &crate::profile::ProfileName::from("probed"),
+                crate::usage::Half::OAuth,
+            );
+        }),
+        None
+    );
+}
+
+/// A 401, or a 403 whose Anthropic error body refuses the credential, on the
+/// probe is a refused setup token: `AuthExpired` even with no cache to fall
+/// back on, and no probe again under that token.
+#[test]
+fn a_refused_setup_token_reads_auth_expired_and_rests() {
+    for status in [401, 403] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("refused", 60_000, true);
+        assert_eq!(probe_tick_answering(&home, &state, status), 1, "{status}");
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        // Due again on cadence, still refused: nothing goes out.
+        state.last_fetched.lock().unwrap().clear();
+        probe_tick_expecting_none(&home, &state);
+        // The verdict stays and no countdown is published for the rest, so
+        // the Overview's countdown slot stays blank beside the `⊘`.
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("refused")),
+            "{status}"
+        );
+    }
+}
+
+/// A re-mint re-admits the account: the suppression was recorded against the
+/// old token. The refused token rests until then, and the re-mint goes through
+/// the writer alone, as `tollgate login --setup-token` in this process does.
+#[test]
+fn a_remint_re_admits_a_refused_setup_token() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("reminted-after-401", 60_000, true);
+    let name = crate::profile::ProfileName::from("reminted-after-401");
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    state.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &state);
+
+    crate::claude::write_session_token(&name, "sk-ant-oat01-fresh", crate::usage::now_ms() as i64)
+        .expect("re-mint");
+    state.last_fetched.lock().unwrap().clear();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 1, "the new token is probed");
+    assert_eq!(
+        crate::testutil::request_header(&raw[0], "authorization").as_deref(),
+        Some("Bearer sk-ant-oat01-fresh")
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("reminted-after-401"),
+        Some(&super::FetchStatus::Fresh)
+    );
+}
+
+/// A manual refresh retries a refused token once; refused again, it rests.
+#[test]
+fn a_manual_refresh_retries_a_refused_setup_token_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("retried", 60_000, true);
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("retried".to_string());
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        1,
+        "`r` retries it"
+    );
+    state.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &state);
+}
+
+/// A chain of `a` (a stored pair, active) and `b`, an account the usage probe
+/// reads, its setup token in place of the fixture's pair.
+fn chain_with_a_probed_b() -> crate::profile::ConfigHandle {
+    let config = session_config(&["a", "b"], Some("a"));
+    for p in config.lock().unwrap().profiles.iter_mut() {
+        if p.name.as_str() == "b" {
+            crate::testutil::make_probed_account(p);
+        }
+    }
+    config
+}
+
+/// A setup token the probe found refused is a dead login: the exhaustion walk
+/// never moves the global account onto it to install it.
+#[test]
+fn a_refused_setup_token_is_no_walk_target() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = chain_with_a_probed_b();
+    let state = chain_state(&config, Vec::new());
+    let window = |pct: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: pct,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    // `a` is spent on a fresh reading; `b` holds the clear reading its last
+    // probe took before the token was refused.
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), window(100.0));
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), window(10.0));
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), super::FetchStatus::Fresh);
+
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        1,
+        "the tick probes b"
+    );
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
+    assert!(
+        !queued.iter().any(|t| t == "b"),
+        "the walk queued a switch onto a refused setup token: {queued:?}"
+    );
+    // Control, as the daemon's twin has it: without the verdict the same walk
+    // takes `b`, so the walk ran and the verdict alone kept it off.
+    state.third_party_broken.lock().unwrap().clear();
+    state.pending_switch.lock().unwrap().clear();
+    super::scan_auto_switch(
+        &state.config,
+        &state.store,
+        &state.third_party_usage_store,
+        &state.status,
+        &state.third_party_status,
+        &state.third_party_streaks,
+        &state.third_party_broken,
+        &state.skipped_unreadable,
+        &state.poll_streaks,
+        &state.kick_blocks,
+        &state.activity,
+        &state.pending_switch,
+        &state.pending_switch_off,
+    );
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
+    assert_eq!(
+        queued,
+        vec!["b".to_string()],
+        "fixture control: without the verdict the walk takes b"
+    );
+}
+
+/// A member whose organization refuses it serves no request, whatever headroom
+/// its windows read, so the exhaustion walk never moves the global account
+/// onto it. The control: the same reading without the refused plan is the
+/// walk's target.
+#[test]
+fn an_organization_refused_member_is_no_walk_target() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b"], Some("a"));
+    let state = chain_state(&config, Vec::new());
+    let window = |pct: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: pct,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let queued_after = |b: UsageInfo| {
+        state.store.lock().unwrap().insert("b".to_string(), b);
+        state.pending_switch.lock().unwrap().clear();
+        super::scan_auto_switch(
+            &state.config,
+            &state.store,
+            &state.third_party_usage_store,
+            &state.status,
+            &state.third_party_status,
+            &state.third_party_streaks,
+            &state.third_party_broken,
+            &state.skipped_unreadable,
+            &state.poll_streaks,
+            &state.kick_blocks,
+            &state.activity,
+            &state.pending_switch,
+            &state.pending_switch_off,
+        );
+        state
+            .pending_switch
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.target.clone())
+            .collect::<Vec<String>>()
+    };
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), window(100.0));
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), super::FetchStatus::Fresh);
+    assert_eq!(
+        queued_after(window(10.0)),
+        vec!["b".to_string()],
+        "control: with no refused plan the walk takes b"
+    );
+    let mut refused = window(10.0);
+    refused.plan = Some(crate::usage::PlanInfo {
+        subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+        ..Default::default()
+    });
+    let queued = queued_after(refused);
+    assert!(
+        !queued.iter().any(|t| t == "b"),
+        "the walk queued a switch onto a member its organization refuses: {queued:?}"
+    );
+}
+
+/// The refusal reaches `tollgate start --auto`, which has no live set, through
+/// the durable record: a launch never starts on that member.
+#[test]
+fn start_auto_passes_over_a_refused_setup_token() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = chain_with_a_probed_b();
+    let state = chain_state(&config, Vec::new());
+    for (name, pct) in [("a", 100.0), ("b", 10.0)] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                fetched_at: Some(crate::usage::now_ms()),
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+
+    let cfg = config.lock().unwrap().clone();
+    let (rows, pick) = crate::fallback::start_walk(
+        &cfg,
+        crate::runtime::Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
+    let picked = pick.map(|i| rows[i].name.to_string());
+    assert_ne!(
+        picked.as_deref(),
+        Some("b"),
+        "start --auto picked the member whose setup token was refused"
+    );
+    let b = rows
+        .iter()
+        .find(|r| r.name.as_str() == "b")
+        .expect("b's row");
+    assert_eq!(b.block, Some(crate::fallback::StartBlock::AuthBroken));
+}
+
+/// The verdict goes when the token does: a re-mint moves the digest it is
+/// bound to, and a reading off the same token lifts it outright.
+#[test]
+fn a_refused_setup_token_stays_dead_until_a_reading_or_a_remint() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dead");
+    let state = probe_state("dead", 60_000, true);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+    let dead = |state: &super::SchedulerState| {
+        let broken = state.third_party_broken.lock().unwrap().clone();
+        let config = state.config.lock().unwrap();
+        super::current_key_rejected_names(&broken, &config.profiles).contains(&name)
+    };
+    let recorded = || crate::profile_cache::auth_expired_matches(&name, digest.unwrap_or_default());
+
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    assert!(
+        dead(&state) && recorded(),
+        "refused: dead, live and on disk"
+    );
+
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest =
+            crate::usage::OAuthIdentity::for_setup_token("sk-ant-oat01-reminted").setup_token;
+    }
+    assert!(!dead(&state), "a re-mint moves the digest");
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+
+    state.last_fetched.lock().unwrap().clear();
+    state.suppressed_auth_expired.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+    assert!(!dead(&state) && !recorded(), "a reading lifts it");
+}
+
+/// A re-mint while a refused probe is out: the refusal answered for the old
+/// token, so it leaves no rest and no verdict behind, as it leaves no status.
+#[test]
+fn a_refusal_for_a_token_reminted_mid_flight_leaves_no_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from("reminted"),
+            "sk-ant-oat01-another",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint mid-flight");
+        (
+            401,
+            Vec::new(),
+            r#"{"type":"error","error":{"type":"authentication_error"}}"#.into(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("reminted", 300_000, true);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert_eq!(
+        state.status.lock().unwrap().get("reminted"),
+        None,
+        "the landing for the old token wrote no status"
+    );
+    assert!(
+        !state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .contains_key("reminted"),
+        "nor a rest under the old token's digest"
+    );
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("reminted"),
+        "nor a dead-login mark"
+    );
+}
+
+/// A probe entry answers to the identity snapshot as a token entry does: a
+/// setup token the last forget has not seen, or a half the last compare could
+/// not read, waits for the next compare instead of going out.
+#[test]
+fn a_probe_entry_the_snapshot_has_not_seen_waits() {
+    for (seen, unknown, probes) in [
+        ("sk-ant-oat01-older", false, 0),
+        (SETUP_TOKEN, true, 0),
+        (SETUP_TOKEN, false, 1),
+    ] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("probed", 60_000, true);
+        state.snapshot.lock().unwrap().insert(
+            "probed".to_string(),
+            crate::usage::forget::SnapshotIdentities {
+                oauth: crate::usage::OAuthIdentity::for_setup_token(seen),
+                oauth_unknown: unknown,
+                ..Default::default()
+            },
+        );
+        if probes == 0 {
+            probe_tick_expecting_none(&home, &state);
+        } else {
+            assert_eq!(probe_tick_answering(&home, &state, 200), probes);
+        }
+    }
+}
+
+// ── refresh_spent_accounts off and a spent probed account ────────────────────
+
+/// A 5h window spent until far out, the reading `refresh_spent_accounts` skips.
+fn spent_reading() -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    }
+}
+
+fn spent_probe_state(refresh_spent: bool) -> super::SchedulerState {
+    let state = probe_state("spent", 60_000, true);
+    state.config.lock().unwrap().state.refresh_spent_accounts = refresh_spent;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), spent_reading());
+    state
+}
+
+#[test]
+fn a_spent_probed_account_is_not_probed_with_refresh_spent_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "nothing pending, so no countdown"
+    );
+}
+
+/// The skip drops a stranded `Queued` mark too, so the row of a spent probed
+/// account stops spinning on a probe that never runs.
+#[test]
+fn a_skipped_spent_probed_account_drops_its_queued_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    crate::usage::mark_fetch_activity(
+        &state.activity,
+        &oauth_key("spent"),
+        ProfileActivity::Queued,
+    );
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("spent")
+            .is_none_or(|a| a.oauth.is_none()),
+        "the Queued mark is gone"
+    );
+}
+
+#[test]
+fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    assert_eq!(probe_tick_answering(&home, &state, 200), 1);
+}
+
+// ── a probed account in a stood-down instance and in the seeds ───────────────
+
+/// The display seed carries a probed account at its probe interval, and leaves
+/// out a setup-token account with the probe off, which nothing reads.
+#[test]
+fn the_seed_carries_a_probed_account_at_its_own_interval() {
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    probed.has_long_lived_sidecar = true;
+    probed.usage_probe_interval_ms = 450_000;
+    let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![probed, unprobed],
+    };
+    assert_eq!(
+        collect_oauth_seed_names(&config, REFRESH_INTERVAL_MS),
+        vec![("probed".to_string(), 450_000)]
+    );
+}
+
+/// A reload clears the probe's leftovers wherever the probe stopped reading an
+/// account still without a pair: the switch went off, or the account got an
+/// endpoint of its own with the switch left on. A pair stored meanwhile, with
+/// the switch on or off, and a profile gone are the reload compare's to
+/// forget, and a probe left on is no change.
+#[test]
+fn only_a_probe_that_stops_reading_an_account_without_a_pair_counts_as_switched_off() {
+    let probed = |name: &str, on: bool, paired: bool| {
+        let mut p = if paired {
+            oauth_profile_disabled(name, false)
+        } else {
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+            // A setup token stored, the one thing the probe sends.
+            p.has_long_lived_sidecar = true;
+            p
+        };
+        p.usage_probe = on;
+        p
+    };
+    let config = |profiles| crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles,
+    };
+    let before = config(
+        ["off", "routed", "paired_on", "paired_off", "gone", "stays"]
+            .iter()
+            .map(|name| probed(name, true, false))
+            .collect(),
+    );
+    let mut routed = probed("routed", true, false);
+    routed.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    routed.api_key = Some("zai-key".to_string());
+    let after = config(vec![
+        probed("off", false, false),
+        routed,
+        probed("paired_on", true, true),
+        probed("paired_off", false, true),
+        probed("stays", true, false),
+    ]);
+    assert_eq!(
+        super::probes_switched_off(&before, &after),
+        vec![
+            crate::profile::ProfileName::from("off"),
+            crate::profile::ProfileName::from("routed")
+        ]
+    );
+}
+
+/// A probe that cleared its switch check before the switch went off lands
+/// after the switch-off's clear. The clear moves the account's epoch, so the
+/// landing's own gate drops the reading and its `Fresh` status; nothing would
+/// probe the name again to move them later.
+#[test]
+fn a_probe_landing_after_the_switch_off_lands_nothing() {
+    use super::{FetchOutcome, FetchStatus, apply_outcome};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("off");
+    crate::testutil::write_long_lived_sidecar(&name);
+    let stores = crate::usage::MemoryStores::empty_for_test();
+    // Read when the entry was built, while the probe was still on.
+    let epoch_at_spawn = crate::usage::epoch_value(&name, crate::usage::Half::OAuth);
+
+    crate::usage::forget_probe_reading(&stores, &name);
+
+    let mut outcome = FetchOutcome::live(
+        &name,
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 31.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        },
+        None,
+    );
+    outcome.oauth_identity = crate::usage::read_oauth_for_compare(&name).0;
+    outcome.epoch_at_spawn = epoch_at_spawn;
+    apply_outcome(
+        outcome,
+        &stores.usage,
+        &stores.usage_status,
+        &stores.last_fetched,
+        &stores.poll_streaks,
+        90_000,
+        false,
+        false,
+        &stores.weekly_reset_kicks,
+    );
+
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("off"),
+        "no reading lands after the switch-off"
+    );
+    assert_eq!(
+        stores.usage_status.lock().unwrap().get("off").copied(),
+        None::<FetchStatus>,
+        "and no status at all, `Failed`, `RateLimited` and `AuthExpired` included"
+    );
+}
+
+/// Switching the probe off keeps a refused token's verdict: the token is no
+/// less refused for nothing probing it, so the account stays a dead login
+/// until a re-mint or a reading lifts it.
+#[test]
+fn switching_the_probe_off_keeps_a_refused_tokens_verdict() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dead");
+    let state = probe_state("dead", 60_000, true);
+    let digest = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+        p.setup_token_digest = digest;
+    }
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    crate::usage::forget_probe_reading(&state.memory_stores(), &name);
+    let broken = state.third_party_broken.lock().unwrap().clone();
+    let config = state.config.lock().unwrap();
+    assert!(super::current_key_rejected_names(&broken, &config.profiles).contains(&name));
+    assert!(crate::profile_cache::auth_expired_matches(
+        &name,
+        digest.expect("a digest")
+    ));
+}
+
+/// Re-seeding over a later cadence stamp keeps it, so a `retry-after` wait
+/// outlives switching the probe off and on; over an earlier one, the
+/// reading's own fetch wins.
+#[test]
+fn a_reseed_keeps_the_later_of_the_two_cadence_stamps() {
+    for later in [true, false] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("probed");
+        crate::testutil::register_names(&["probed"]);
+        let fetched_at = crate::usage::now_ms() - 60_000;
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(fetched_at),
+                ..spent_reading()
+            },
+        );
+        let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+        let held = if later {
+            FetchStamp {
+                due: EpochMs::from_millis(crate::usage::now_ms() + 600_000),
+                ladder_ms: 600_000,
+            }
+        } else {
+            FetchStamp::at(EpochMs::from_millis(fetched_at - 60_000))
+        };
+        last_fetched
+            .lock()
+            .unwrap()
+            .insert(oauth_key("probed"), held);
+        super::reseed_keeping_cadence(&store, &status, &last_fetched, &name, 450_000);
+        assert!(
+            store.lock().unwrap().contains_key("probed"),
+            "later = {later}"
+        );
+        let stamp = last_fetched.lock().unwrap()[&oauth_key("probed")];
+        if later {
+            assert_eq!(stamp, held, "the retry-after wait holds");
+        } else {
+            assert_eq!(stamp.as_millis(), fetched_at, "the reading's own fetch");
+        }
+    }
+}
+
+/// Switched off while its probe is out, the account takes nothing from the
+/// answer: no reading, no status, no countdown, and a refusal leaves no rest.
+#[test]
+fn a_probe_switched_off_in_flight_lands_nowhere() {
+    for status in [200, 401] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("flight", 60_000, true);
+        let config = state.config.clone();
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+            if let Some(p) = config
+                .lock()
+                .unwrap()
+                .find_mut(&crate::profile::ProfileName::from("flight"))
+            {
+                p.usage_probe = false;
+            }
+            let headers = if status == 200 {
+                probe_headers()
+            } else {
+                Vec::new()
+            };
+            (status, headers, "{}".into())
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        super::tick(&state);
+        assert_eq!(server.join().expect("listener").len(), 1, "{status}");
+        assert!(
+            !state.store.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state.status.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("flight")),
+            "{status}"
+        );
+        assert!(
+            !state
+                .suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key("flight"),
+            "{status}"
+        );
+    }
+}
+
+/// A stood-down instance dates a probe reading at the probe's interval: 100 s
+/// old at a 450 s probe is fresh, where the 90 s poll would call it a failed
+/// check, and it counts down to the next probe.
+#[test]
+fn a_stood_down_instance_reads_a_probe_reading_at_the_probe_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 450_000, true);
+    let fetched_at = crate::usage::now_ms() - 100_000;
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("probed"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(fetched_at),
+            ..spent_reading()
+        },
+    );
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::Fresh)
+    );
+    let stamp = state.last_fetched.lock().unwrap()[&oauth_key("probed")].as_millis();
+    assert_eq!(
+        state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")],
+        stamp + 450_000
+    );
+}
+
+/// The fetching instance's probe status never reaches a stood-down one, but a
+/// refused setup token does, through its durable record: the row reads it as
+/// refused, cached figures or none, and a record for another token is inert.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
+    for (cached, recorded_token, refused) in [
+        (true, SETUP_TOKEN, true),
+        (false, SETUP_TOKEN, true),
+        (true, "sk-ant-oat01-older", false),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("probed");
+        let state = probe_state("probed", 90_000, true);
+        if let Some(p) = state.config.lock().unwrap().find_mut(&name) {
+            p.setup_token_digest =
+                crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+        }
+        if cached {
+            crate::profile_cache::write_profile_cache(
+                &name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    fetched_at: Some(crate::usage::now_ms()),
+                    ..spent_reading()
+                },
+            );
+        }
+        let recorded = crate::usage::OAuthIdentity::for_setup_token(recorded_token)
+            .setup_token
+            .expect("a digest");
+        crate::profile_cache::write_auth_expired(&name, recorded);
+        super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+        assert_eq!(
+            state.status.lock().unwrap().get("probed") == Some(&super::FetchStatus::AuthExpired),
+            refused,
+            "cached {cached}, recorded {recorded_token}"
+        );
+    }
+}
+
+/// A stood-down TUI beside the process that fetches usage, whose probe finds
+/// the setup token refused and rests it: the TUI reads the verdict off the
+/// durable record, and its Overview leaves the countdown slot blank, as the
+/// fetching process publishes no countdown either, rather than count down to a
+/// probe that never comes and stop at `0s`.
+#[test]
+fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let fetching = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 600_000),
+            ..Default::default()
+        },
+    );
+    assert_eq!(probe_tick_answering(&home, &fetching, 401), 1);
+    fetching.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &fetching);
+    assert!(
+        !fetching
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("probed")),
+        "control: the fetching process counts no probe down for a rest"
+    );
+    // The reading predates the refusal by ten minutes, and no probe has
+    // landed a newer one since.
+    crate::testutil::set_mtime(
+        &crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("the cache path"),
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+
+    let app = crate::tui::App::new(crate::profile::load_config().expect("load the config"));
+    // The fetching process took the usage-fetch lease on its tick and keeps
+    // it, so this TUI stands down.
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    let mut stood_down = chain_state(&app.config, Vec::new());
+    stood_down.store = app.usage_store.clone();
+    stood_down.status = app.usage_status.clone();
+    stood_down.next_refresh_per_profile = app.next_refresh_per_profile.clone();
+    stood_down.activity = app.activity.clone();
+    stood_down.last_fetched = app.last_fetched.clone();
+    stood_down.display_reader = true;
+    super::standdown_tick(&stood_down, REFRESH_INTERVAL_MS);
+
+    let (w, h) = (100u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows: Vec<&[ratatui::buffer::Cell]> = buf.content.chunks(w as usize).collect();
+    let text = |r: &[ratatui::buffer::Cell]| r.iter().map(|c| c.symbol()).collect::<String>();
+    let dump: Vec<String> = rows.iter().map(|r| text(r)).collect();
+    let row = rows
+        .iter()
+        .find(|r| text(r).contains("⊘ probed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the row wears the dead-login mark off the record:\n{}",
+                dump.join("\n")
+            )
+        });
+    let line = text(row);
+    // The countdown, if any: the seconds figure and the color it is cued in.
+    let countdown = line.split_whitespace().find_map(|word| {
+        let secs = word.strip_suffix('s')?;
+        (!secs.is_empty() && secs.chars().all(|c| c.is_ascii_digit())).then(|| {
+            let padded = format!(" {line} ");
+            let byte = padded.find(&format!(" {word} ")).expect("the word");
+            (word.to_string(), row[padded[..byte].chars().count()].fg)
+        })
+    });
+    assert_eq!(countdown, None, "{line}");
+    assert!(
+        !line.contains('⋯')
+            && !crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| line.contains(*f)),
+        "the slot stays blank: {line}"
+    );
+}
+
+/// A stood-down TUI reads a refused setup token beside a stored pair as the
+/// refusal it is: the pair's reading it hydrates off the fetching process's
+/// cache leaves its status store with the pair's status, and the merge the
+/// Usage card reads takes the dead-login set the `⊘` reads.
+#[test]
+fn a_stood_down_tui_reads_a_refused_setup_token_beside_a_pair_as_refused() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("paired");
+    crate::testutil::register_names(&["paired"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("paired"));
+    crate::testutil::refuse_setup_token(&mut profile);
+    // The fetching process's latest reading of the pair, a minute old.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 60_000),
+            ..Default::default()
+        },
+    );
+    let fetching = crate::daemon::FetchLease::new();
+    assert!(fetching.acquire(), "another process fetches usage");
+
+    let app = crate::tui::App::new(crate::profile::load_config().expect("load the config"));
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    let mut stood_down = chain_state(&app.config, Vec::new());
+    stood_down.store = app.usage_store.clone();
+    stood_down.status = app.usage_status.clone();
+    stood_down.next_refresh_per_profile = app.next_refresh_per_profile.clone();
+    stood_down.activity = app.activity.clone();
+    stood_down.last_fetched = app.last_fetched.clone();
+    stood_down.display_reader = true;
+    super::standdown_tick(&stood_down, REFRESH_INTERVAL_MS);
+
+    let hydrated = app.usage_status.lock().unwrap().get("paired").copied();
+    assert!(
+        hydrated.is_some_and(|s| s != super::FetchStatus::AuthExpired),
+        "control: the store holds the pair's status, {hydrated:?}"
+    );
+    assert_eq!(
+        app.readings_snapshot().status_of("paired"),
+        Some(super::FetchStatus::AuthExpired)
+    );
+}
+
+/// A process that takes the usage-fetch lease over replaces the dead-login
+/// verdicts it seeded while it stood down with the records the old holder
+/// left: a refusal the old holder recorded reaches its walk, the probe off so
+/// nothing here would learn it anew, and a verdict the old holder lifted no
+/// longer keeps the walk off a healthy member.
+#[test]
+fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut alpha = crate::testutil::blank_profile(&ProfileName::from("alpha"));
+    alpha.credentials = Some(crate::testutil::oauth_pair("at-alpha"));
+    crate::profile::save_profile(&alpha).expect("save alpha");
+    let mut profiles = vec![alpha];
+    for name in ["dead", "lifted"] {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        crate::testutil::make_probed_account(&mut p);
+        p.usage_probe = false;
+        crate::profile::save_profile(&p).expect("switch the probe off");
+        profiles.push(p);
+    }
+    let digest = |name: &str| {
+        profiles
+            .iter()
+            .find(|p| p.name.as_str() == name)
+            .and_then(|p| p.setup_token_digest)
+            .expect("the setup token's digest")
+    };
+    let (dead, lifted) = (digest("dead"), digest("lifted"));
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let app_state = AppState {
+        active_profile: Some("alpha".into()),
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&app_state).expect("persist the chain");
+    crate::claude::force_link_profile_credentials(&ProfileName::from("alpha"))
+        .expect("link the active");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: app_state,
+        profiles,
+    }));
+
+    // The old holder fetches usage. This process starts while its verdict on
+    // `lifted` stands, seeds it as every process does at its start, and
+    // stands down.
+    let old_holder = crate::daemon::FetchLease::new();
+    assert!(old_holder.acquire(), "the old holder takes the lease");
+    crate::profile_cache::write_auth_expired(&"lifted".into(), lifted);
+    let state = chain_state(&config, Vec::new());
+    let seed = crate::fallback::durable_key_rejected_seed(&config.lock().unwrap().profiles);
+    state.third_party_broken.lock().unwrap().extend(seed);
+    probe_tick_expecting_none(&home, &state);
+    assert!(state.pending_switch.lock().unwrap().is_empty());
+
+    // While it stands down the old holder records `dead` refused and lifts
+    // `lifted`, then exits.
+    crate::profile_cache::write_auth_expired(&"dead".into(), dead);
+    crate::profile_cache::clear_auth_expired(&"lifted".into());
+    drop(old_holder);
+
+    let now = crate::usage::now_epoch_secs();
+    for (name, utilization) in [("alpha", 100.0), ("dead", 10.0), ("lifted", 10.0)] {
+        state.store.lock().unwrap().insert(
+            name.to_string(),
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
+        state
+            .status
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), super::FetchStatus::Fresh);
+    }
+    probe_tick_expecting_none(&home, &state);
+    let queued: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.target.clone())
+        .collect();
+    assert_eq!(queued, vec!["lifted".to_string()]);
+}
+
+/// With `refresh_spent_accounts` off the fetching instance skips a spent
+/// probed account, so a stood-down one shows no countdown for it either.
+#[test]
+fn a_stood_down_instance_counts_down_a_spent_probed_account_only_if_it_is_probed() {
+    for refresh_spent in [false, true] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let state = spent_probe_state(refresh_spent);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("spent"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &spent_reading(),
+        );
+        super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+        assert_eq!(
+            state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("spent")),
+            refresh_spent,
+            "refresh_spent_accounts = {refresh_spent}"
+        );
+    }
+}
+
+// ── a probed home account and the credit cap ────────────────────────────────
+
+/// Drives a fable session that starts on the preferred member `a` through six
+/// scans, a fresh spend-cap 429 before every scan it spends on `a`, and
+/// executes each decision the way the session's watchdog would. Returns how
+/// often the session changed member.
+fn credit_capped_home_moves(cap_in_reading: bool) -> usize {
+    credit_capped_home_moves_launched(cap_in_reading, Some(vec!["fable".to_string()]))
+}
+
+/// [`credit_capped_home_moves`] for a session whose row records
+/// `launch_families`.
+fn credit_capped_home_moves_launched(
+    cap_in_reading: bool,
+    launch_families: Option<Vec<String>>,
+) -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        let a = cfg
+            .profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "a")
+            .unwrap();
+        a.preferred = true;
+        crate::testutil::make_probed_account(a);
+    }
+    // `a` as the probe lands it: windows, no credit block, `Fresh`.
+    let capped: &[&str] = if cap_in_reading { &["a"] } else { &[] };
+    let store = credit_store(&["a", "b"], capped);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8100-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = launch_families;
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8100-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = proj.join("conv-a.jsonl");
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(f, "{}", spend_cap_row(0)).unwrap();
+            drop(f);
+            tail_transcripts();
+        }
+        scan_sessions(&config, &store, &status);
+        let (intended, _) = decision_of("8100-0");
+        if let Some(target) = intended.filter(|t| *t != on) {
+            // Past the in-flight grace, so the next 429 on `a` latches.
+            let at = crate::usage::now_ms() - 40_000;
+            crate::live_sessions::update_as_session("8100-0", |f| {
+                f.set_current_member(target.clone());
+                f.set_last_swap_at(at);
+            })
+            .expect("execute the swap");
+            on = target;
+            moves += 1;
+        }
+    }
+    moves
+}
+
+/// A probe reading carries no credit block, so it cannot say the credits are
+/// free: the home pass must not pull a credit-billed session back onto the
+/// probed member its own 429 just moved it off.
+#[test]
+fn a_spend_cap_429_on_a_probed_home_moves_the_session_once() {
+    assert_eq!(credit_capped_home_moves(false), 1);
+}
+
+/// The control: a reading whose credit block is capped keeps the session off.
+#[test]
+fn a_spend_cap_429_on_a_capped_home_moves_the_session_once() {
+    assert_eq!(credit_capped_home_moves(true), 1);
+}
+
+/// With no launch family on the row, only the session's own 429 gives it
+/// credit demand, and that alone keeps the probed home from pulling it back.
+#[test]
+fn a_spend_cap_429_on_a_probed_home_moves_a_session_of_unknown_launch_once() {
+    assert_eq!(credit_capped_home_moves_launched(false, None), 1);
+}
+
+/// A 429 that carries the window headers is a reading, and the server's
+/// `retry-after` holds for it too: a spent account is probed again when the
+/// server says, capped at `MAX_RETRY_AFTER_MS`, never at its own interval.
+#[test]
+fn a_spent_window_429_reading_waits_out_retry_after() {
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    // The recorded window-exhaustion 429: 5h at 100%, `retry-after: 6072`.
+    let headers = crate::testutil::window_exhaustion_429_headers(now + 6073, now + 383_473);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+        (429, headers.clone(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("spent", 120_000, true);
+
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    let landed = state.store.lock().unwrap().get("spent").cloned();
+    assert_eq!(
+        landed.and_then(|i| i.five_hour).map(|w| w.utilization),
+        Some(100.0),
+        "the spent window lands as a reading"
+    );
+    assert!(
+        !state.kick_blocks.lock().unwrap().contains_key("spent"),
+        "the spent window says why the limiter refuses, so no kick block reads \
+         `claude code blocked` over `5h 100%`"
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("spent")];
+    assert!(
+        next >= before + super::MAX_RETRY_AFTER_MS,
+        "the next probe waits out retry-after, not the 2 min interval: {next}, {before}"
+    );
+    assert!(
+        next < after + super::MAX_RETRY_AFTER_MS + 120_000 / 4,
+        "and no longer than the 15 min cap plus the spread, never the raw 6072s \
+         `retry-after` or the 5h reset: {next}, {after}"
+    );
+}
+
+/// The limiter's `rejected` on a 429 whose windows sit below the cap refuses
+/// the account all the same. A probed account never kicks, so its probe feeds
+/// the kick-block axis the chain routes around, and a 2xx reading lifts it.
+#[test]
+fn a_rejected_429_below_the_cap_blocks_the_probed_account_until_a_2xx() {
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let rejected: Vec<(String, String)> = probe_headers()
+        .into_iter()
+        .filter(|(k, _)| k != "anthropic-ratelimit-unified-status")
+        .chain([
+            (
+                "anthropic-ratelimit-unified-status".to_string(),
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-reset".to_string(),
+                (now + 3600).to_string(),
+            ),
+            ("retry-after".to_string(), "3600".to_string()),
+        ])
+        .collect();
+    // Room for a third request, so a probe sent twice on the second tick shows.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
+        if i == 0 {
+            (429, rejected.clone(), "{}".into())
+        } else {
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("refused", 120_000, true);
+
+    super::tick(&state);
+    let block = state.kick_blocks.lock().unwrap().get("refused").copied();
+    assert!(
+        block.is_some_and(|b| b.rejected && b.until == Some(now + 3600)),
+        "the limiter's verdict is recorded, not dropped with the reading: {block:?}"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<super::KickBlock>(
+            &crate::profile::ProfileName::from("refused"),
+            super::KICK_BLOCK_CACHE_FILE,
+        )
+        .is_some(),
+        "and on disk, where a stood-down instance reads it"
+    );
+
+    // Due again at once, and the next probe goes through.
+    state.last_fetched.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 2);
+    assert!(
+        !state.kick_blocks.lock().unwrap().contains_key("refused"),
+        "a 2xx reading lifts the block"
+    );
+}
+
+/// An organization's refusal holds until its subscription changes, and each
+/// landing of it rewrites the usage cache: the probe backs off on it as far as
+/// any answer's wait goes, rather than ask again at its own interval.
+#[test]
+fn an_organization_refusal_backs_the_probe_off_as_far_as_any_wait_goes() {
+    let home = crate::testutil::HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#;
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+        (403, Vec::new(), body.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("org", 60_000, true);
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+    assert_eq!(server.join().expect("listener").len(), 1);
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("org")];
+    assert!(
+        next >= before + super::MAX_RETRY_AFTER_MS,
+        "each landing of the refusal rewrites the usage cache, so the next probe \
+         waits the longest wait any answer gets, not the 60s interval: {next}, {before}"
+    );
+    assert!(
+        next <= after + super::MAX_RETRY_AFTER_MS,
+        "and no longer: the refusal may lift with the next probe: {next}, {after}"
+    );
+}
+
+/// A 403 naming the organization lands as the canceled plan a `/usage` 429 on
+/// a canceled account lands, so the account reads canceled, rests under no
+/// verdict a re-mint would lift, and a later reading carries no plan.
+#[test]
+fn an_organization_refusal_lands_as_a_canceled_plan_and_a_reading_lifts_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#;
+    // Room for a third request, so a probe sent twice on the second tick shows.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
+        if i == 0 {
+            (403, Vec::new(), body.to_string())
+        } else {
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("org", 120_000, true);
+
+    super::tick(&state);
+    let plan = |state: &super::SchedulerState| {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get("org")
+            .and_then(|i| i.plan.clone())
+    };
+    assert!(
+        plan(&state).is_some_and(|p| p.is_canceled()),
+        "the account reads canceled"
+    );
+    assert_ne!(
+        state.status.lock().unwrap().get("org").copied(),
+        Some(super::FetchStatus::AuthExpired),
+        "no refused token"
+    );
+    assert!(
+        !state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .contains_key("org"),
+        "and no rest under the token"
+    );
+
+    state.last_fetched.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 2);
+    assert!(plan(&state).is_none(), "a reading carries no plan");
+}
+
+/// Any other organization code, an organization on hold say, lands as a plan
+/// its organization refuses, named apart from a canceled one: the account
+/// still reads unable to serve, which the walk skips
+/// (`an_organization_refused_member_is_no_walk_target`), and a later reading
+/// lifts it as it lifts a canceled plan.
+#[test]
+fn an_organization_on_hold_lands_as_a_refused_plan_named_apart_from_canceled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let body = r#"{"type":"error","error":{"type":"permission_error","details":{"error_code":"organization_on_hold"}}}"#;
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, i| {
+        if i == 0 {
+            (403, Vec::new(), body.to_string())
+        } else {
+            (200, probe_headers(), "{}".into())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("org", 120_000, true);
+
+    super::tick(&state);
+    let plan = |state: &super::SchedulerState| {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get("org")
+            .and_then(|i| i.plan.clone())
+    };
+    let refused = plan(&state).expect("a plan landed");
+    assert!(
+        refused.is_org_refused() && !refused.is_canceled() && refused.refuses_service(),
+        "the organization refuses it, and it is no canceled plan: {refused:?}"
+    );
+    let usage = state.store.lock().unwrap().get("org").cloned();
+    assert!(crate::fallback::refuses_service_from_info(usage.as_ref()));
+    assert!(!crate::fallback::is_canceled_from_info(usage.as_ref()));
+    assert!(crate::fallback::is_org_refused_from_info(usage.as_ref()));
+
+    state.last_fetched.lock().unwrap().clear();
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 2);
+    assert!(plan(&state).is_none(), "a reading carries no plan");
+}
+
+/// A chain member at the walks' defaults, for the reset clear to judge.
+fn reset_member(name: &str) -> crate::fallback::ChainMember {
+    crate::fallback::ChainMember {
+        name: name.into(),
+        oauth: true,
+        threshold: 95.0,
+        last_resort: false,
+        preferred: true,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
+    }
+}
+
+/// A reading as of now: the 5h window at `five`, resetting `five_reset` seconds
+/// from now or showing no reset, and the 7d at 20%, three days from its reset.
+fn reset_info(five: f64, five_reset: Option<i64>) -> crate::usage::UsageInfo {
+    let now = crate::usage::now_epoch_secs();
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: five,
+            resets_at: five_reset.map(|s| crate::usage::epoch_secs_to_iso(now + s)),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 20.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 86_400)),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Land `reading` of `name` through the landing section, `fresh` off the live
+/// API or a cached fallback, with the reading the store held before it at a 5h
+/// reset ten minutes ago, judged as [`reset_member`].
+fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
+    let pn = crate::profile::ProfileName::from(name);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), reset_info(60.0, Some(-600)));
+    let outcome = super::FetchOutcome {
+        name: pn.clone(),
+        info: Some(reading),
+        status: if fresh {
+            super::FetchStatus::Fresh
+        } else {
+            super::FetchStatus::Cached
+        },
+        rotated: None,
+        from_fetch: fresh,
+        refresh_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    super::apply_outcome_flagged(
+        outcome,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
+        Some(&reset_member(name)),
+    );
+}
+
+/// `land_reading_after_a_reset` with a reading under every line that shows no
+/// live 5h window, so only the store's last reading names a reset.
+fn land_after_a_reset(name: &str, fresh: bool) {
+    land_reading_after_a_reset(name, reset_info(0.0, None), fresh);
+}
+
+/// An idle chain member refused three hours ago: its last reading named a 5h
+/// reset ten minutes ago, and a fresh reading shows it under its lines, so the
+/// record goes, with no turn landing on it.
+#[test]
+fn a_fresh_reading_after_a_window_reset_clears_a_chain_members_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    assert!(refusal_on("a").is_some(), "fixture control: a refused");
+    land_after_a_reset("a", true);
+    assert!(refusal_on("a").is_none());
+}
+
+/// A cached fallback snapshot clears nothing, even one showing a 5h window
+/// that opened after the refusal (it resets in four hours, so it opened an hour
+/// ago, against a refusal three hours old): only a reading off the live API
+/// shows the member's headroom now. The control: the same reading fresh clears.
+#[test]
+fn a_cached_reading_clears_no_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    let opened_after = reset_info(1.0, Some(4 * 3_600));
+    land_reading_after_a_reset("a", opened_after.clone(), false);
+    assert!(
+        refusal_on("a").is_some(),
+        "a cached reading leaves the record"
+    );
+    land_reading_after_a_reset("a", opened_after, true);
+    assert!(
+        refusal_on("a").is_none(),
+        "control: the same reading fresh clears it"
+    );
+}
+
+/// The reset clear floors the record at the reset: a refusal stamped before it,
+/// drained late, goes on no record, and one stamped after it does.
+#[test]
+fn a_reset_clear_keeps_a_refusal_from_before_the_reset_off_the_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    record_refusal("a", 3 * 3_600_000);
+    land_after_a_reset("a", true);
+    assert!(
+        refusal_on("a").is_none(),
+        "fixture control: the reset cleared it"
+    );
+    record_refusal("a", 20 * 60_000);
+    assert!(
+        refusal_on("a").is_none(),
+        "a refusal before the reset stays off"
+    );
+    record_refusal("a", 5 * 60_000);
+    assert!(
+        refusal_on("a").is_some(),
+        "a refusal after the reset goes on record"
+    );
+}
+
+/// The `/usage` leg resolves the member under its config hold: a reading whose
+/// 5h window opened after the refusal clears the profile's record on the tick.
+/// Returns whether it was cleared, `in_chain` or not.
+fn usage_reset_clears(in_chain: bool) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["z"]);
+    let login = save_unanchored_login("z", "z-tok");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState {
+                fallback_chain: if in_chain {
+                    vec![crate::profile::ProfileName::from("z")]
+                } else {
+                    Vec::new()
+                },
+                ..crate::profile::AppState::default()
+            },
+            profiles: vec![login],
+        }));
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    record_refusal("z", 6 * 3_600_000);
+    assert!(refusal_on("z").is_some(), "fixture control: z refused");
+    let tokens = collect_tokens(&config.lock().unwrap());
+    let state = chain_state(&config, tokens);
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+    assert!(
+        state.store.lock().unwrap().contains_key("z"),
+        "fixture control: the reading landed"
+    );
+    refusal_on("z").is_none()
+}
+
+/// The `/usage` leg clears a credit refusal on a window reset, in the chain or
+/// not: a profile outside it is judged at its own threshold and weekly line.
+#[test]
+fn the_usage_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not() {
+    assert!(usage_reset_clears(true), "a chain member is cleared");
+    assert!(
+        usage_reset_clears(false),
+        "a profile in no chain is cleared"
+    );
+}
+
+/// The probe leg does the same off a probe reading. Returns whether the record
+/// was cleared, `in_chain` or not.
+fn probe_reset_clears(in_chain: bool) -> bool {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("probed", 300_000, true);
+    if in_chain {
+        state.config.lock().unwrap().state.fallback_chain =
+            vec![crate::profile::ProfileName::from("probed")];
+    }
+    record_refusal("probed", 6 * 3_600_000);
+    assert!(
+        refusal_on("probed").is_some(),
+        "fixture control: probed refused"
+    );
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "fixture control: the probe reading landed"
+    );
+    refusal_on("probed").is_none()
+}
+
+/// The probe leg does the same, in the chain or not.
+#[test]
+fn the_probe_leg_clears_a_credit_refusal_on_a_window_reset_in_the_chain_or_not() {
+    assert!(probe_reset_clears(true), "a chain member is cleared");
+    assert!(
+        probe_reset_clears(false),
+        "a profile in no chain is cleared"
+    );
 }

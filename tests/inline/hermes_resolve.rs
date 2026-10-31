@@ -208,7 +208,7 @@ fn version_read_from_metadata_warns_or_refuses_per_policy() {
     assert_eq!(
         version_verdict("or-main", "0.20.1", VersionPolicy::Warn),
         VersionVerdict::Warn(
-            "tollgate: note — Hermes 0.20.1 is installed; tollgate's guards were verified against \
+            "tollgate: note: Hermes 0.20.1 is installed; tollgate's guards were verified against \
              0.19.x"
                 .into()
         )

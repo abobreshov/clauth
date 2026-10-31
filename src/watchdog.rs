@@ -121,7 +121,7 @@ pub(crate) struct WatchSpec {
 impl WatchSpec {
     pub(crate) fn new(dir: impl Into<PathBuf>, interest: Interest) -> Self {
         let dir = dir.into();
-        let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let canonical_dir = crate::canonical::identity(&dir).unwrap_or_else(|_| dir.clone());
         Self {
             dir,
             canonical_dir,
@@ -242,10 +242,14 @@ impl FilterHealth {
         let dirs = specs
             .iter()
             .map(|s| {
-                if s.canonical_dir == s.dir {
+                if crate::canonical::display(&s.canonical_dir) == s.dir.as_path() {
                     s.dir.display().to_string()
                 } else {
-                    format!("{} (as {})", s.dir.display(), s.canonical_dir.display())
+                    format!(
+                        "{} (as {})",
+                        s.dir.display(),
+                        crate::canonical::display(&s.canonical_dir).display()
+                    )
                 }
             })
             .collect::<Vec<_>>()

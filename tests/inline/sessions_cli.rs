@@ -51,6 +51,7 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 }],
                 effective_at: None,
@@ -395,14 +396,11 @@ fn the_age_tokens_and_cost_columns_widen_to_their_widest_cell() {
     let alpha = lines.iter().find(|l| l.contains("alpha")).unwrap();
     let beta = lines.iter().find(|l| l.contains("beta")).unwrap();
     let alpha_tail = format!(
-        "· 1d 1h ago  {}150  {}$1.05  alpha | alpha",
-        " ".repeat(8),
+        "(1d ago)  {}150  {}$1.05  alpha | alpha",
+        " ".repeat(10),
         " ".repeat(4)
     );
-    let beta_tail = format!(
-        "· 5s ago{}  12345678901  $12345.67  beta | beta",
-        " ".repeat(3)
-    );
+    let beta_tail = "(just now)  12345678901  $12345.67  beta | beta".to_string();
     assert!(alpha.ends_with(&alpha_tail), "{alpha:?}");
     assert!(beta.ends_with(&beta_tail), "{beta:?}");
 }
@@ -437,7 +435,7 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        row.contains(&format!("{local} · 3h 12m ago")),
+        row.contains(&format!("{local} (3h ago)")),
         "the row renders the local stamp paired with its age: {row}"
     );
     assert!(
@@ -461,12 +459,12 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
     }
 }
 
-/// The age half of the pairing: a zero or negative age renders `· now`, never
-/// `now ago` — `humanize_duration` spells ≤0 `now`, so the generic ` ago`
-/// pairing would stutter over a sub-second-fresh file or a future mtime, both
-/// routine rows. A positive age keeps the full `· 3h 12m ago` pairing.
+/// The age half of the pairing: a zero or negative age renders `· just now`,
+/// never `now ago` — the shared formatter spells ≤0 `just now`, so the generic
+/// ` ago` pairing would stutter over a sub-second-fresh file or a future mtime,
+/// both routine rows. A positive age keeps the one-unit `· 3h ago` pairing.
 #[test]
-fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
+fn the_stamp_age_renders_just_now_for_non_positive_ages_and_ago_for_positive() {
     let sb = HomeSandbox::new();
     let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
     write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
@@ -479,7 +477,10 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
     // Zero age: `now` sits exactly on the mtime, the same whole-second a
     // sub-second-fresh file truncates to.
     let zero = session_row(session, false, updated, Columns::FLOOR);
-    assert!(zero.contains("· now"), "zero age renders `now`: {zero}");
+    assert!(
+        zero.contains("(just now)"),
+        "zero age renders `just now`: {zero}"
+    );
     assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
 
     // Negative age: a future mtime (the clock behind the file) is the same
@@ -487,20 +488,174 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
     let behind = updated - Duration::from_secs(60);
     let future = session_row(session, false, behind, Columns::FLOOR);
     assert!(
-        future.contains("· now"),
-        "a future mtime renders `now`: {future}"
+        future.contains("(just now)"),
+        "a future mtime renders `just now`: {future}"
     );
     assert!(
         !future.contains("now ago"),
         "a future mtime never stutters: {future}"
     );
 
-    // Positive age: the full pairing survives the ≤0 branch.
+    // Positive age: the full one-unit pairing survives the ≤0 branch.
     let ahead = updated + Duration::from_secs(11_520);
     let positive = session_row(session, false, ahead, Columns::FLOOR);
     assert!(
-        positive.contains("· 3h 12m ago"),
-        "a positive age keeps the full pairing: {positive}"
+        positive.contains("(3h ago)"),
+        "a positive age keeps the one-unit pairing: {positive}"
+    );
+}
+
+/// The stamp-paired cell drops the age half once the age would be a date (30
+/// days and past): the full local stamp already carries the date, so a second
+/// copy reads as a duplicate. Younger rows keep the `stamp · age` pairing.
+#[test]
+fn the_stamp_cell_drops_the_age_half_once_it_would_be_a_date() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    // 29 days: the one-unit age pairs with the stamp (`4w ago`, never `4w 1d`).
+    let twenty_nine = session_row(
+        session,
+        false,
+        updated + Duration::from_secs(29 * 86_400),
+        Columns::FLOOR,
+    );
+    assert!(
+        twenty_nine.contains(&format!("{local} (4w ago)")),
+        "29 days keeps the pairing: {twenty_nine}"
+    );
+
+    // 30 days: the age would repeat the stamp's own date, so the cell prints the
+    // stamp alone — no `( )` age wrap, no date duplicate.
+    let thirty = session_row(
+        session,
+        false,
+        updated + Duration::from_secs(30 * 86_400),
+        Columns::FLOOR,
+    );
+    assert!(thirty.contains(&local), "the stamp survives: {thirty}");
+    assert!(
+        !thirty.contains(" ("),
+        "the age half drops once it would be a date: {thirty}"
+    );
+}
+
+/// A mixed listing — one 40-day (stamp-alone) session, one 3-hour session —
+/// keeps the stamp-alone row's token, cost and preview columns in the same
+/// cells as the `stamp (age)` row's: the age column and `( )` wrap stay
+/// reserved even though the old row's age half is empty, so whole-row equality
+/// reds on a reservation that drops any of that width.
+#[test]
+fn the_stamp_alone_row_keeps_its_columns_aligned_with_its_age_sibling() {
+    let sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for (id, text, age) in [
+        ("aaaa-1111", "alpha", 40 * 86_400),
+        ("bbbb-2222", "beta", 3 * 3600),
+    ] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", text)]);
+        set_mtime(&path, now - Duration::from_secs(age as u64));
+    }
+    let mut groups = build_listing(false);
+    for s in &mut groups[0].sessions {
+        (s.tokens, s.cost) = if s.id == "aaaa-1111" {
+            (Some(150), Some(1.05))
+        } else {
+            (Some(12_345_678_901), Some(12_345.67))
+        };
+    }
+
+    // Columns measured over both rows: id 9 (both stems are non-uuid), profile
+    // 12, age 6 (`3h ago`), tokens 11, cost 9. The young row's usage fills both
+    // figure widths exactly, so it carries no left pad.
+    let lines = table_lines(&groups, true, now);
+    let young_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 3 * 3600, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let old_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 40 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let expected_young = format!(
+        "  bbbb-2222  {prof}  {stamp} (3h ago)  12345678901  $12345.67  beta | beta",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = young_stamp,
+    );
+    // The stamp-alone cell reserves the `( )` wrap (3) + the age column (6), so
+    // the old row's 3-digit token total left-pads 8 into the same 11-cell column.
+    let expected_old = format!(
+        "  aaaa-1111  {prof}  {stamp}{reserve}  {tok}150  {cost}$1.05  alpha | alpha",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = old_stamp,
+        reserve = " ".repeat(3 + 6),
+        tok = " ".repeat(8),
+        cost = " ".repeat(4),
+    );
+    assert_eq!(
+        lines,
+        vec!["/ws/a".to_string(), expected_young, expected_old],
+        "the stamp-alone row keeps the age sibling's column starts"
+    );
+}
+
+/// A listing whose every session is ≥30 days prints the stamp alone with no
+/// reserved age column: the preview follows the stamp after the normal column
+/// gap, never `3 + age` blank cells when no row carries an age half.
+#[test]
+fn an_all_stamp_alone_listing_reserves_no_age_column() {
+    let sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for (id, text, age) in [
+        ("aaaa-1111", "alpha", 40 * 86_400),
+        ("bbbb-2222", "beta", 31 * 86_400),
+    ] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", text)]);
+        set_mtime(&path, now - Duration::from_secs(age as u64));
+    }
+    let groups = build_listing(false);
+    let lines = table_lines(&groups, false, now);
+    let beta_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 31 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let alpha_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 40 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    // Newest first: the 31-day session leads. Each row is the stamp plus the
+    // normal two-space column gap before the preview — no reserved age column.
+    let expected_beta = format!(
+        "  bbbb-2222  {prof}  {stamp}  beta | beta",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = beta_stamp,
+    );
+    let expected_alpha = format!(
+        "  aaaa-1111  {prof}  {stamp}  alpha | alpha",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = alpha_stamp,
+    );
+    assert_eq!(
+        lines,
+        vec!["/ws/a".to_string(), expected_beta, expected_alpha],
+        "an all-stamp-alone listing keeps only the normal column gap"
     );
 }
 
@@ -536,7 +691,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        human.contains(&format!("{local} · 3h 12m ago")),
+        human.contains(&format!("{local} (3h ago)")),
         "the human row renders the local stamp and its age: {human}"
     );
     assert!(
@@ -554,7 +709,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
 #[test]
 fn no_sessions_found_maps_to_exit_one() {
     let _sb = HomeSandbox::new(); // empty tree ⇒ empty index
-    let err = run_sessions(true, false).expect_err("empty index must error");
+    let err = run_sessions(true, false, false).expect_err("empty index must error");
     assert!(
         err.to_string().contains("no sessions"),
         "error must say no sessions were found: {err}"
@@ -761,6 +916,44 @@ fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest
     assert!(
         matches!(resolved, Resolved::Ready(ref s) if s.id == "sglobal"),
         "an older isolated transcript shadows nothing"
+    );
+}
+
+/// A workflow journal is a run log the listing never shows, so naming one an
+/// isolated run holds answers "no session found", never "held"; the agent
+/// transcript beside it stays a held session.
+#[test]
+fn an_isolated_workflow_journal_is_no_held_session() {
+    let sb = HomeSandbox::new();
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let workflow = sb.home().join(
+        ".tollgate/profiles/iso/runtime-isolated/projects/-w-iso/siso/subagents/workflows/wf_y",
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-e5f6a7b8", "key": "y", "type": "started"}).to_string()],
+    );
+    write_jsonl(
+        &workflow.join("agent-e5f6a7b8.jsonl"),
+        &[user_line("siso", &ws.to_string_lossy(), "subagent")],
+    );
+    let sessions_dir = sb.home().join(".tollgate/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    let journal = resolve_session("journal");
+    let agent = resolve_session("agent-e5f6a7b8");
+    drop(lock_file);
+
+    assert!(
+        matches!(journal, Resolved::Missing),
+        "a workflow journal an isolated run holds is no session"
+    );
+    assert!(
+        matches!(agent, Resolved::Held(ref h) if h.session.id == "agent-e5f6a7b8"),
+        "the agent transcript beside it is still reported held"
     );
 }
 
@@ -1000,12 +1193,16 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         start_profile: profile.to_string(),
         harness,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 0,
         cwd: None,
         isolated: false,
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -1047,7 +1244,7 @@ fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
             .expect_err("an unknown sid must be refused");
         assert_eq!(
             err.to_string(),
-            format!("no live session '{sid}'\nsee `tollgate sessions`"),
+            format!("no live session '{sid}'\nsee `tollgate sessions --live`"),
             "the refusal names the sid and the listing verb"
         );
         assert!(
@@ -1071,7 +1268,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
         .expect_err("a profile name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'work'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch work`"
+        "no live session 'work'\nsee `tollgate sessions --live`\nto switch the global account: `tollgate switch work`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1082,17 +1279,14 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
 #[test]
 fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() {
     let _sb = HomeSandbox::new();
-    crate::codex_profiles::CodexState::update(|state| {
-        state.add_profile("cx");
-        Ok(())
-    })
-    .expect("seed codex roster");
+    crate::codex_profiles::CodexState::update(|state| state.add_profile("cx"))
+        .expect("seed codex roster");
 
     let err = run_switch("cx", "spare", &SwitchFlags::default())
         .expect_err("a codex name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'cx'\nsee `tollgate sessions`\nto switch the global account: `tollgate switch cx`"
+        "no live session 'cx'\nsee `tollgate sessions --live`\nto switch the global account: `tollgate switch cx`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1114,6 +1308,64 @@ fn switch_refuses_a_dead_session_row() {
         "a dead row is a runtime error, not a usage error"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// A background session is fixed-account (cloudy's T33b1 ruling): both its
+/// rows, the daemon's hold and a launcher's, refuse with the copy cloudy
+/// approved 2026-10-22, and no intent is written for the executor to refuse.
+#[test]
+fn switch_refuses_a_background_session_row() {
+    for hold in [true, false] {
+        let _sb = HomeSandbox::new();
+        let row = crate::live_sessions::LiveSession {
+            session_id: "4242-0".to_string(),
+            start_profile: "work".to_string(),
+            harness: crate::harness::Harness::Claude,
+            pid: 4242,
+            claude_pid: None,
+            launch_families: None,
+            started_at: 0,
+            cwd: None,
+            isolated: false,
+            follows_chain: false,
+            intended_member: None,
+            chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
+            current_member: None,
+            last_swap_at: None,
+            launch_store: None,
+            boot_transport: None,
+            is_delegate: false,
+            background: true,
+            background_hold: hold,
+            visited_members: vec![],
+            ..crate::testutil::live_row("0-0", "-")
+        };
+        crate::live_sessions::register(&row).expect("register row");
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("profile dir")
+            .join("sessions-bg");
+        std::fs::create_dir_all(&sessions).expect("sessions-bg");
+        let marker = crate::runtime::open_pid_file(&sessions.join("4242-0")).expect("marker");
+        marker.lock().expect("hold the marker");
+
+        let err = run_switch("4242-0", "spare", &SwitchFlags::default())
+            .expect_err("a background row must be refused");
+        assert_eq!(
+            err.to_string(),
+            "session '4242-0' is a background session and cannot be switched from 'work'",
+            "hold: {hold}"
+        );
+        assert_eq!(crate::exit_code(Err(err)), 1);
+        assert!(
+            crate::live_sessions::get("4242-0")
+                .expect("row")
+                .intended_member
+                .is_none(),
+            "hold: {hold}: a refused swap writes nothing"
+        );
+    }
 }
 
 /// Test 35a: a Hermes row has no executor; the switch refuses with the shared
@@ -1214,12 +1466,39 @@ fn switch_points_the_row_at_the_named_profile_through_the_registry_seam() {
     );
 }
 
+/// A manual move is never a credit-cap leave: it clears a stale daemon reason,
+/// so the executor keeps the models-equal rule whatever the last daemon write
+/// recorded.
+#[test]
+fn switch_clears_a_stale_credit_leave_reason() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    crate::live_sessions::update_as_daemon("4242-0", |d| d.set_credit_leave(true))
+        .expect("seed the daemon's credit-leave reason");
+    assert!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .credit_leave,
+        "fixture control: the row carries the reason"
+    );
+
+    run_switch("4242-0", "spare", &SwitchFlags::default()).expect("the switch records the intent");
+
+    let row = crate::live_sessions::get("4242-0").expect("row");
+    assert_eq!(row.intended_member.as_deref(), Some("spare"));
+    assert!(
+        !row.credit_leave,
+        "a manual switch is never a credit leave, so the models-equal rule stands"
+    );
+}
+
 #[test]
 fn switch_receipt_names_when_the_move_lands() {
     assert_eq!(
         switch_receipt("4242-0", "spare"),
         "tollgate: pointed session '4242-0' at 'spare'\nthe switch lands at the session's next \
-         request, never before it — a refused move is logged and the session stays put"
+         request, never before it. A refused move is logged and the session stays put"
     );
 }
 
@@ -1274,7 +1553,11 @@ fn switch_leaves_the_go_no_go_with_the_sessions_executor() {
         "nothing executed: this process never swaps"
     );
     assert_eq!(
-        crate::runtime::swap_eligible(&keyed, &crate::runtime::LaunchTransport::of(&launch)),
+        crate::runtime::swap_eligible(
+            &keyed,
+            &crate::runtime::LaunchTransport::of(&launch),
+            crate::runtime::ModelsRule::Equal,
+        ),
         Err(crate::runtime::SwapRefused::NotOauth),
         "the executor's own grounds still refuse this member, so the intent \
          stays an intent"
@@ -1297,6 +1580,626 @@ fn the_sessions_listing_rejects_extra_arguments() {
     let err = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--json", "extra"])
         .expect_err("extra args must be a usage error");
     assert_eq!(err.exit_code(), 2);
+}
+
+// ── tollgate sessions --live ──────────────────────────────────────────────────
+//
+// The live roster reads the registry and Claude Code's per-pid session
+// records only; transcripts stay closed.
+
+/// Fixed instant every `--live` fixture is aged against: 2027-01-15T08:00:00Z.
+const LIVE_NOW_SECS: u64 = 1_800_000_000;
+
+/// A registry row started `ago_secs` before [`LIVE_NOW_SECS`], dead until a
+/// marker is held for it.
+fn live_fixture_row(sid: &str, profile: &str, ago_secs: u64) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: profile.to_string(),
+        harness: crate::harness::Harness::Claude,
+        pid: 4242,
+        claude_pid: None,
+        launch_families: None,
+        started_at: (LIVE_NOW_SECS - ago_secs) * 1000,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
+        current_member: None,
+        visited_members: vec![],
+        last_swap_at: None,
+        launch_store: None,
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+        ..crate::testutil::live_row("0-0", "-")
+    }
+}
+
+/// Register `row` and hold its marker under `marker_profile` (where a running
+/// session holds it: its current member once moved, else its start profile).
+fn register_live(row: &crate::live_sessions::LiveSession, marker_profile: &str) -> std::fs::File {
+    crate::live_sessions::register(row).expect("register row");
+    crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from(marker_profile),
+        false,
+        &row.session_id,
+    )
+    .expect("hold the session's marker")
+}
+
+/// Claude Code's own record for the process `pid`, naming its transcript.
+fn seed_cc_record(sb: &HomeSandbox, pid: u32, transcript: &str) {
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        json!({ "sessionId": transcript, "pid": pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// Seeds every row shape the roster must tell apart and returns the marker
+/// handles that keep the live ones live:
+/// - `100-0` moved `cld1 → cld2` (marker under `cld2`), transcript known
+/// - `200-0` never moved, no Claude Code record yet, no cwd
+/// - `300-1` codex
+/// - `400-0` delegate, joined on its re-keyed `pid`
+/// - `500-0` background
+/// - `600-0` dead (no marker), `700-0` the daemon's hold on the account's fixed
+///   background tree, `800-0` torn
+fn seed_live_roster(sb: &HomeSandbox) -> Vec<std::fs::File> {
+    let mut held = Vec::new();
+
+    let mut moved = live_fixture_row("100-0", "cld1", 7200);
+    moved.current_member = Some("cld2".to_string());
+    moved.claude_pid = Some(7001);
+    moved.cwd = Some(std::path::PathBuf::from("/w/a"));
+    held.push(register_live(&moved, "cld2"));
+    seed_cc_record(sb, 7001, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
+
+    let mut fresh = live_fixture_row("200-0", "cld1", 720);
+    fresh.claude_pid = Some(7002);
+    held.push(register_live(&fresh, "cld1"));
+
+    let mut codex = live_fixture_row("300-1", "cx0", 240);
+    codex.harness = crate::harness::Harness::Codex;
+    codex.cwd = Some(std::path::PathBuf::from("/w/c"));
+    held.push(register_live(&codex, "cx0"));
+
+    let mut delegate = live_fixture_row("400-0", "D1", 180);
+    delegate.is_delegate = true;
+    delegate.pid = 7004;
+    delegate.cwd = Some(std::path::PathBuf::from("/w/d"));
+    held.push(register_live(&delegate, "D1"));
+    seed_cc_record(sb, 7004, "dddddddd-4444-4444-8444-dddddddddddd");
+
+    let mut background = live_fixture_row("500-0", "cld1", 60);
+    background.background = true;
+    background.claude_pid = Some(7005);
+    background.cwd = Some(std::path::PathBuf::from("/w/e"));
+    held.push(register_live(&background, "cld1"));
+
+    crate::live_sessions::register(&live_fixture_row("600-0", "cld1", 30)).expect("dead row");
+
+    let mut hold = live_fixture_row("700-0", "cld1", 30);
+    hold.background = true;
+    hold.background_hold = true;
+    held.push(register_live(&hold, "cld1"));
+
+    let registry = sb.home().join(".tollgate").join("live_sessions");
+    fs::write(
+        registry.join("800-0.json"),
+        "{\"session_id\": \"800-0\", \"start_pro",
+    )
+    .unwrap();
+
+    held
+}
+
+/// The reader keeps exactly the rows whose session still runs: a dead row, the
+/// daemon's background hold and a torn file drop out; a moved session counts
+/// by the marker its current member holds.
+#[test]
+fn live_rows_keep_only_the_running_sessions() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let mut sids: Vec<String> = crate::live_sessions::live_rows()
+        .expect("the registry lists")
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect();
+    sids.sort();
+    assert_eq!(sids, ["100-0", "200-0", "300-1", "400-0", "500-0"]);
+}
+
+/// A `--with-fallback` background session the daemon adopted is a session
+/// following the chain, which `tollgate switch <sid>` moves, so the roster lists
+/// it: the daemon's hold on it is not the account's fixed background tree.
+#[test]
+fn live_rows_list_an_adopted_with_fallback_session() {
+    let _sb = HomeSandbox::new();
+    let mut adopted = live_fixture_row("900-0", "cld1", 30);
+    adopted.follows_chain = true;
+    adopted.background_hold = true;
+    let _held = register_live(&adopted, "cld1");
+    let mut fixed = live_fixture_row("950-0", "cld1", 30);
+    fixed.background = true;
+    fixed.background_hold = true;
+    let _fixed = register_live(&fixed, "cld1");
+
+    let sids: Vec<String> = crate::live_sessions::live_rows()
+        .expect("the registry lists")
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect();
+    assert_eq!(sids, ["900-0"]);
+}
+
+/// One line per live session, newest first: sid, account (`start → current`
+/// once moved), harness, age, transcript id, cwd, and a `delegate` or
+/// `background` tag naming the session's kind; `-` fills a missing transcript
+/// id or cwd.
+#[test]
+fn live_table_lists_each_running_session_newest_first() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        [
+            "500-0  cld1         claude  1m ago   -                                     /w/e  background",
+            "400-0  D1           claude  3m ago   dddddddd-4444-4444-8444-dddddddddddd  /w/d  delegate",
+            "300-1  cx0          codex   4m ago   -                                     /w/c",
+            "200-0  cld1         claude  12m ago  -                                     -",
+            "100-0  cld1 → cld2  claude  2h ago   aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/a",
+        ]
+    );
+}
+
+/// `--json` carries the same rows, newest first, with absent cells as `null`.
+#[test]
+fn live_json_carries_the_same_rows() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let row = |sid: &str,
+               start: &str,
+               current: &str,
+               harness: &str,
+               cwd: Option<&str>,
+               started: &str,
+               transcript: Option<&str>,
+               delegate: bool,
+               background: bool| {
+        json!({
+            "sid": sid,
+            "start_profile": start,
+            "current_profile": current,
+            "harness": harness,
+            "cwd": cwd,
+            "started_at": started,
+            "transcript_id": transcript,
+            "delegate": delegate,
+            "background": background,
+        })
+    };
+    assert_eq!(
+        live_json(),
+        json!([
+            row(
+                "500-0",
+                "cld1",
+                "cld1",
+                "claude",
+                Some("/w/e"),
+                "2027-01-15T07:59:00+00:00",
+                None,
+                false,
+                true
+            ),
+            row(
+                "400-0",
+                "D1",
+                "D1",
+                "claude",
+                Some("/w/d"),
+                "2027-01-15T07:57:00+00:00",
+                Some("dddddddd-4444-4444-8444-dddddddddddd"),
+                true,
+                false
+            ),
+            row(
+                "300-1",
+                "cx0",
+                "cx0",
+                "codex",
+                Some("/w/c"),
+                "2027-01-15T07:56:00+00:00",
+                None,
+                false,
+                false
+            ),
+            row(
+                "200-0",
+                "cld1",
+                "cld1",
+                "claude",
+                None,
+                "2027-01-15T07:48:00+00:00",
+                None,
+                false,
+                false
+            ),
+            row(
+                "100-0",
+                "cld1",
+                "cld2",
+                "claude",
+                Some("/w/a"),
+                "2027-01-15T06:00:00+00:00",
+                Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"),
+                false,
+                false
+            ),
+        ])
+    );
+}
+
+/// No live session is the listing's empty case: exit 1 with a named error,
+/// the same scripting contract as an empty `tollgate sessions`.
+#[test]
+fn live_listing_with_nothing_running_is_a_named_error() {
+    let _sb = HomeSandbox::new();
+    crate::live_sessions::register(&live_fixture_row("600-0", "cld1", 30)).expect("dead row");
+
+    let err = run_sessions(false, false, true).expect_err("an empty roster is an error");
+    assert_eq!(err.to_string(), "no live sessions found");
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// A registry that cannot be listed is not an empty one: the reader says so,
+/// and the listing names the directory instead of claiming nothing runs.
+#[test]
+fn live_listing_names_an_unreadable_registry() {
+    let sb = HomeSandbox::new();
+    let tollgate = sb.home().join(".tollgate");
+    fs::create_dir_all(&tollgate).unwrap();
+    let registry = tollgate.join("live_sessions");
+    fs::write(&registry, "not a directory").unwrap();
+
+    assert!(crate::live_sessions::live_rows().is_none());
+    for json in [false, true] {
+        let err = run_sessions(json, false, true).expect_err("an unlistable registry is an error");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "cannot list live sessions: {} is unreadable",
+                registry.display()
+            ),
+            "json {json}"
+        );
+        assert_eq!(crate::exit_code(Err(err)), 1);
+    }
+}
+
+/// A cwd that is not UTF-8 still lists: both shapes show it lossily instead
+/// of failing the whole listing.
+#[cfg(unix)]
+#[test]
+fn live_listing_shows_a_non_utf8_cwd_lossily() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let _sb = HomeSandbox::new();
+    let mut row = live_fixture_row("950-0", "cld1", 60);
+    row.cwd = Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        b"/w/\xff",
+    )));
+    let _held = register_live(&row, "cld1");
+
+    assert_eq!(live_json()[0]["cwd"], json!("/w/\u{fffd}"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        ["950-0  cld1  claude  1m ago  -  /w/\u{fffd}"]
+    );
+}
+
+/// Sessions started in the same millisecond keep one order on every run:
+/// newest first, then by sid.
+#[test]
+fn live_rows_started_together_order_by_sid() {
+    let _sb = HomeSandbox::new();
+    let mut held = Vec::new();
+    for sid in ["930-0", "910-0", "920-0"] {
+        held.push(register_live(&live_fixture_row(sid, "cld1", 60), "cld1"));
+    }
+    held.push(register_live(
+        &live_fixture_row("900-0", "cld1", 30),
+        "cld1",
+    ));
+
+    let sids: Vec<String> = live_json()
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["sid"].as_str().expect("a sid").to_string())
+        .collect();
+    assert_eq!(sids, ["900-0", "910-0", "920-0", "930-0"]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    let line_sids: Vec<String> = live_lines(now)
+        .iter()
+        .map(|line| line[..5].to_string())
+        .collect();
+    assert_eq!(line_sids, sids);
+}
+
+/// `--live` reads no transcript, so it cannot carry `--tokens`, which reads
+/// every one in full.
+#[test]
+fn the_live_listing_refuses_tokens() {
+    use clap::Parser as _;
+
+    let live = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--live", "--json"])
+        .expect("--live --json parses");
+    match live.command {
+        Some(crate::cli::Command::Sessions {
+            live: true,
+            json: true,
+            tokens: false,
+        }) => {}
+        other => panic!("`sessions --live --json` must parse to the live listing: {other:?}"),
+    }
+    let err = crate::cli::Cli::try_parse_from(["tollgate", "sessions", "--live", "--tokens"])
+        .expect_err("--live with --tokens must refuse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// `--live` opens no transcript: the registry and Claude Code's per-pid
+/// session records are its only reads. A thread-local ledger counts every
+/// preview/history transcript read in [`crate::sessions`]; the live listing
+/// must leave it at zero while the full listing over the same fixture moves it
+/// — the control that proves the ledger counts. Opens through `crate::tokens`
+/// / `crate::tps` and the rescue/move paths are not counted.
+#[test]
+fn live_listing_opens_no_transcript() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    // Real transcripts named for the LIVE rows' own ids, so a by-id read of a
+    // live row's transcript id actually opens one and moves the ledger.
+    for (id, slug, cwd) in [
+        ("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "-w-a", "/w/a"),
+        ("dddddddd-4444-4444-8444-dddddddddddd", "-w-d", "/w/d"),
+    ] {
+        let path = sb
+            .home()
+            .join(format!(".claude/projects/{slug}/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, cwd, "hi")]);
+    }
+
+    crate::sessions::reset_transcript_opens();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    let _ = live_lines(now);
+    let _ = live_json();
+    run_sessions(false, false, true).expect("a non-empty live roster lists");
+    run_sessions(true, false, true).expect("a non-empty live roster lists as json");
+    assert_eq!(
+        crate::sessions::transcript_opens(),
+        0,
+        "the live listing must open no transcript"
+    );
+
+    // Control: the full listing reads the same fixture's transcripts, so the
+    // same ledger reports the opens — proving it would have caught one.
+    let _ = build_listing(false);
+    assert!(
+        crate::sessions::transcript_opens() > 0,
+        "the full listing opens a transcript, so the ledger counts"
+    );
+}
+
+/// Claude Code's own record for the process `pid` under `rel` (relative to the
+/// sandbox home), naming its transcript — the form for fixtures whose record
+/// lives in a runtime tree.
+fn seed_cc_record_in(sb: &HomeSandbox, rel: &str, pid: u32, transcript: &str) {
+    let dir = sb.home().join(rel);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        json!({ "sessionId": transcript, "pid": pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A moved session's record lives in the tree of its START profile (the swap
+/// re-stamps markers, never the config dir), and an isolated session's in the
+/// isolated tree: the join must pick those, not `current_member`'s tree or the
+/// global store.
+#[test]
+fn live_rows_read_their_runtime_tree_records() {
+    let sb = HomeSandbox::new();
+
+    let mut moved = live_fixture_row("111-0", "cld1", 7200);
+    moved.current_member = Some("cld2".to_string());
+    moved.claude_pid = Some(7101);
+    let _moved_held = register_live(&moved, "cld2");
+    seed_cc_record_in(
+        &sb,
+        ".tollgate/profiles/cld1/runtime-111-0/sessions",
+        7101,
+        "eeeeeeee-1111-4111-8111-eeeeeeeeeeee",
+    );
+
+    let mut isolated = live_fixture_row("222-0", "cld1", 3600);
+    isolated.isolated = true;
+    isolated.claude_pid = Some(7102);
+    crate::live_sessions::register(&isolated).expect("register row");
+    let _isolated_held = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("cld1"),
+        true,
+        "222-0",
+    )
+    .expect("hold the session's marker");
+    seed_cc_record_in(
+        &sb,
+        ".tollgate/profiles/cld1/runtime-isolated-222-0/sessions",
+        7102,
+        "ffffffff-2222-4222-8222-ffffffffffff",
+    );
+
+    let rows = live_json();
+    let transcript = |sid: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["sid"] == sid)
+            .expect("row")["transcript_id"]
+            .as_str()
+            .expect("a transcript id")
+            .to_string()
+    };
+    assert_eq!(transcript("111-0"), "eeeeeeee-1111-4111-8111-eeeeeeeeeeee");
+    assert_eq!(transcript("222-0"), "ffffffff-2222-4222-8222-ffffffffffff");
+}
+
+/// A session that moved its working dir after launch (`--worktree`) lists the
+/// dir its Claude Code record names, never the launcher's; a record with an
+/// empty `cwd` falls back to the dir the session was launched from.
+#[test]
+fn live_rows_list_the_cwd_their_record_names() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut moved = live_fixture_row("100-0", "cld1", 120);
+    moved.claude_pid = Some(7201);
+    moved.cwd = Some(std::path::PathBuf::from("/w/launch"));
+    let _moved_held = register_live(&moved, "cld1");
+    fs::write(
+        dir.join("7201.json"),
+        json!({
+            "sessionId": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+            "pid": 7201,
+            "cwd": "/w/launch/.claude/worktrees/x",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut blank = live_fixture_row("200-0", "cld1", 60);
+    blank.claude_pid = Some(7202);
+    blank.cwd = Some(std::path::PathBuf::from("/w/b"));
+    let _blank_held = register_live(&blank, "cld1");
+    fs::write(
+        dir.join("7202.json"),
+        json!({
+            "sessionId": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+            "pid": 7202,
+            "cwd": "",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut retyped = live_fixture_row("300-0", "cld1", 180);
+    retyped.claude_pid = Some(7203);
+    retyped.cwd = Some(std::path::PathBuf::from("/w/r"));
+    let _retyped_held = register_live(&retyped, "cld1");
+    fs::write(
+        dir.join("7203.json"),
+        json!({
+            "sessionId": "cccccccc-3333-4333-8333-cccccccccccc",
+            "pid": 7203,
+            "cwd": 7,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        [
+            "200-0  cld1  claude  1m ago  bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb  /w/b",
+            "100-0  cld1  claude  2m ago  aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/launch/.claude/worktrees/x",
+            "300-0  cld1  claude  3m ago  cccccccc-3333-4333-8333-cccccccccccc  /w/r",
+        ]
+    );
+    let rows = live_json();
+    let cwd = |sid: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["sid"] == sid)
+            .expect("row")["cwd"]
+            .clone()
+    };
+    assert_eq!(cwd("100-0"), json!("/w/launch/.claude/worktrees/x"));
+    assert_eq!(cwd("200-0"), json!("/w/b"));
+    assert_eq!(cwd("300-0"), json!("/w/r"));
+}
+
+/// The table prints a record's cwd and transcript id with control characters
+/// dropped, since another program writes that record: a dir name carrying an
+/// escape sequence never reaches the terminal.
+#[test]
+fn live_table_drops_control_characters_from_record_cells() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let mut row = live_fixture_row("100-0", "cld1", 120);
+    row.claude_pid = Some(7301);
+    row.cwd = Some(std::path::PathBuf::from("/w/launch"));
+    let _held = register_live(&row, "cld1");
+    fs::write(
+        dir.join("7301.json"),
+        json!({
+            "sessionId": "aaaaaaaa-1111-4111-8111-aaaaaaaa\u{7}aaaa",
+            "pid": 7301,
+            "cwd": "/w/\u{1b}]0;pwn\u{7}x",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        ["100-0  cld1  claude  2m ago  aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/]0;pwnx"]
+    );
+}
+
+/// A background row's record is found through the account's fixed
+/// `runtime-bg` tree.
+#[test]
+fn live_rows_find_a_background_rows_record_in_the_background_tree() {
+    let sb = HomeSandbox::new();
+
+    let mut background = live_fixture_row("333-0", "cld1", 60);
+    background.background = true;
+    background.claude_pid = Some(7103);
+    let _held = register_live(&background, "cld1");
+    seed_cc_record_in(
+        &sb,
+        ".tollgate/profiles/cld1/runtime-bg/sessions",
+        7103,
+        "cccccccc-3333-4333-8333-cccccccccccc",
+    );
+
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    let row = rows.iter().find(|r| r.session_id == "333-0").expect("row");
+    assert_eq!(
+        crate::session_record::live_record(row).map(|r| r.session_id),
+        Some("cccccccc-3333-4333-8333-cccccccccccc".to_string()),
+    );
 }
 
 // ── executor B and the request core (hot-swap spec part 1) ───────────────────
@@ -1385,7 +2288,7 @@ mod hot_swap_switch {
         assert_eq!(
             committed_lines("4242-0", "sw-b", 1),
             "tollgate: session '4242-0' committed to 'sw-b' (api-key hot swap, key generation 1)\n\
-             tollgate: swapping… Claude Code picks the new key up on its next request"
+             tollgate: swapping... Claude Code picks the new key up on its next request"
         );
         // No commit inside the wait: requested.
         set_switch_waits(Some(SwitchWaits {

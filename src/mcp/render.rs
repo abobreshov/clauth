@@ -29,8 +29,10 @@ pub(crate) struct ProfileSnapshot {
 /// A profile's roster sort key, for ordering only.
 ///
 /// The variants never interleave: every windowed profile outranks every wallet
-/// one, which outranks every profile tollgate holds no figure for. That last step
-/// is what keeps "no figure" from reading as "full".
+/// one, which outranks every profile tollgate holds no figure for, which outranks
+/// a capped one. The "no figure" tier is what keeps "no figure" from reading as
+/// "full"; the capped tier sits below it, so a spent-credit account is reached
+/// only after every account the picker can judge.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RosterRank {
     /// Percent of this profile's best-known window still FREE.
@@ -41,6 +43,9 @@ pub(crate) enum RosterRank {
     Balance { currency: String, amount: f64 },
     /// Nothing cached, or nothing a wallet could be read out of.
     Unknown,
+    /// A spent usage-credit cap while the profile's credit gate is on: sorts
+    /// after every other tier, so the picker reaches it last.
+    Capped,
 }
 
 /// Host (and port) of a base url — the HOST, never the whole authority. Every
@@ -238,9 +243,9 @@ fn currency_order(profiles: &[ProfileSnapshot]) -> Vec<&str> {
 }
 
 /// Total order over [`RosterRank`] as `(tier, currency group, negated
-/// magnitude)`. Sorting ascending on it puts the freest window first and every
-/// unknown last, and negating the magnitude is what makes "more left" sort
-/// earlier without a second comparator.
+/// magnitude)`. Sorting ascending on it puts the freest window first and a
+/// capped account last, and negating the magnitude is what makes "more left"
+/// sort earlier without a second comparator.
 fn sort_key(p: &ProfileSnapshot, currencies: &[&str]) -> (u8, usize, f64) {
     match &p.rank {
         RosterRank::Window(free) => (0, 0, -free),
@@ -253,6 +258,7 @@ fn sort_key(p: &ProfileSnapshot, currencies: &[&str]) -> (u8, usize, f64) {
             -amount,
         ),
         RosterRank::Unknown => (2, 0, 0.0),
+        RosterRank::Capped => (3, 0, 0.0),
     }
 }
 
@@ -408,7 +414,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
     match auth {
         SessionAuth::Global => "repoints the global `~/.claude` credentials THIS \
-session reads; Claude Code reloads them on its next token refresh, so this session would \
+session reads; Claude Code reloads them at its next request, so this session would \
 start acting as the switched profile mid-task. To use another account \
 without disturbing this one, use the `delegate` tool."
             .to_string(),
@@ -519,15 +525,14 @@ fn identity_line(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> Option<Str
 
 /// The `switch_profile` parenthetical in the block's tool router, resolved per
 /// tier. A global session reads the very file the switch repoints, so it
-/// follows on its next token refresh; an isolated runtime and a custom config
-/// dir read their own credentials and are unaffected. The full consequence
+/// follows at its next request; an isolated runtime and a custom config dir
+/// read their own credentials and are unaffected. The full consequence
 /// sentence still rides the replies through [`switch_effect_note`]; the router
 /// holds only this one clause.
 fn switch_router_clause(auth: &SessionAuth) -> &'static str {
     match auth {
         SessionAuth::Global => {
-            "repoints the global `~/.claude` credentials; this session follows on its next token \
-refresh"
+            "repoints the global `~/.claude` credentials; this session follows at its next request"
         }
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => {
             "repoints the global `~/.claude` credentials; this session is unaffected"
@@ -851,13 +856,15 @@ fn age_clause(v: &Value) -> String {
 ///
 /// A third-party account is told it has no 5h/7d limit only when tollgate knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
-/// denial beside its figure is false; a provider answering with a wallet or a
-/// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
-/// what stops its figure reading as one more window someone can wait out. The
-/// split is the payload's `provider_windows` flag, decided from the provider
-/// plus the response's bars at the source — matching the rendered figure for a
-/// `5h` substring would make the copy decide its own meaning.
+/// Alibaba, MiniMax) HAS limits of its own whether or not this one response
+/// carried any, so a denial beside its figure is false or unknowable (Alibaba's
+/// current window is monthly with a dormant 5h pair that may return, so tollgate
+/// cannot know it has no 5h limit); a provider answering with a wallet or a counter
+/// (DeepSeek, ollama, a generic endpoint) has none, and saying so is what
+/// stops its figure reading as one more window someone can wait out. The split
+/// is the payload's `provider_windows` flag, decided from the provider plus
+/// the response's bars at the source — matching the rendered figure for a `5h`
+/// substring would make the copy decide its own meaning.
 ///
 /// A freshness clause rides the FIGURE it dates, and the `stale` word never
 /// rides an unknown: a verdict qualifies a figure, and beside one the prose
@@ -885,13 +892,16 @@ fn windows_prose(windows: &Value) -> String {
                 format!("no 5h/7d limits; {figure}")
             };
             // The wallet-burn rate rides the figure it qualifies — the same
-            // first-class-figure shape the Usage tab's rate rows carry, so a
-            // reader picking a delegate target judges the runway themselves.
+            // first-class-figure shape the Usage tab's rate rows carry.
             if let (Some(per_day), Some(currency)) = (
                 windows.get("wallet_burn_per_day").and_then(Value::as_f64),
                 windows.get("wallet_burn_currency").and_then(Value::as_str),
             ) {
                 out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+                // The runway rides the burn it is derived from, in the same
+                // phrase, so the two figures the reader would divide always
+                // sit beside their answer.
+                out.push_str(&wallet_runway_clause(windows));
             }
             out.push_str(&freshness_clause(windows));
             out
@@ -935,6 +945,44 @@ fn windows_prose(windows: &Value) -> String {
             out
         }
         _ => "usage unknown".to_string(),
+    }
+}
+
+/// The funded wallet's runway — how long its balance lasts at its own burn —
+/// appended beside the two figures it divides, so a reader picking a delegate
+/// target never divides them itself. Whole days from one day up (`~1 day`,
+/// `~2 days`), whole hours under a day (`~7 h`), each rounded to nearest;
+/// under half an hour rounds to no hour at all and reads `<1 h`. Omitted when
+/// either figure is missing, when the burn reads as zero at one decimal (`0`
+/// never runs out), when the balance is not positive (a debt is no runway), and
+/// when the ratio overflows to a non-finite number.
+fn wallet_runway_clause(windows: &Value) -> String {
+    let balance = windows.get("wallet_balance").and_then(Value::as_f64);
+    let per_day = windows.get("wallet_burn_per_day").and_then(Value::as_f64);
+    let (Some(balance), Some(per_day)) = (balance, per_day) else {
+        return String::new();
+    };
+    // The burn as rendered (one decimal): one reading `~0.0` is no burn to the
+    // reader.
+    if !(balance > 0.0 && (per_day * 10.0).round() > 0.0) {
+        return String::new();
+    }
+    let days = balance / per_day;
+    // A ratio that overflows to infinity names no runway a reader can use.
+    if !days.is_finite() {
+        return String::new();
+    }
+    if days >= 1.0 {
+        let whole = days.round();
+        let unit = if whole == 1.0 { "day" } else { "days" };
+        format!(" (~{whole:.0} {unit} left)")
+    } else {
+        let hours = (days * 24.0).round();
+        if hours < 1.0 {
+            " (<1 h left)".to_string()
+        } else {
+            format!(" (~{hours:.0} h left)")
+        }
     }
 }
 
@@ -1034,8 +1082,23 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
-    // The three account-state markers render as one contiguous run, so a
-    // reader meets one group rather than three scattered through the line.
+    // Model binds ride only a row the call named (a `names` filter or the
+    // session scope), so the unfiltered roster renders none; only set binds
+    // reach the row (`model_binds_row` omits the rest), so nothing renders
+    // empty.
+    if let Some(models) = row.get("models").and_then(Value::as_object)
+        && !models.is_empty()
+    {
+        let binds = models
+            .iter()
+            .filter_map(|(tier, id)| id.as_str().map(|id| format!("{tier} -> {id}")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str("; models: ");
+        out.push_str(&binds);
+    }
+    // The account-state markers render as one contiguous run, so a reader
+    // meets one group rather than several scattered through the line.
     // Which of them refuses a delegate, and on which exemption, is
     // `preflight_target`'s rule. `canceled` follows them because tollgate has no
     // cancel gate: it informs the pick, it does not block it.
@@ -1057,11 +1120,41 @@ fn profile_line(row: &Value) -> String {
         out.push_str("; no api key");
     }
     if row
+        .get("key_rejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; ");
+        out.push_str(crate::format::DIAG_KEY_REJECTED);
+    }
+    if row
+        .get("token_rejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; ");
+        out.push_str(crate::format::DIAG_TOKEN_REJECTED);
+    }
+    if row
         .get("canceled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         out.push_str("; subscription canceled");
+    }
+    if row
+        .get("org_refused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; org refused");
+    }
+    if row
+        .get("credit_capped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; credit cap spent");
     }
     if let Some(rows) = row.get("throughput").and_then(Value::as_array)
         && !rows.is_empty()
@@ -1439,14 +1532,16 @@ fn fmt_cost(cost: f64) -> String {
         .to_string()
 }
 
-/// The `permission_denials` field as a clause body, or `None` when the clause
-/// drops (absent, null, an empty list, or an empty string). A string renders
-/// as its own text. A list renders named tools once in first-seen order with
-/// a `N times` count when repeated, then any nameless entries as `N unnamed
-/// entries` after the named ones — `unnamed` is a spellable tool name, so the
-/// count keeps the synthetic group out of that namespace, and `entry` /
-/// `entries` pluralizes the group's own count. A present value of any other
-/// shape reads `(unreadable)`, so a denial the envelope carried is never
+/// The envelope field the finalize-time classification stamps: the
+/// `tool_use_id`s whose transcript `tool_result` is a user `PreToolUse` hook
+/// refusal. It rides the stored job record, so rendering a collected envelope
+/// never re-reads a transcript.
+pub(crate) const HOOK_REFUSAL_IDS: &str = "hook_refusal_ids";
+
+/// A denial list as a clause body, or `None` when the clause drops (absent,
+/// null, an empty list, or an empty string). A string renders as its own text.
+/// A list renders through [`denial_entries_names`]. A present value of any
+/// other shape reads `(unreadable)`, so a denial the envelope carried is never
 /// invisible.
 fn denial_names(denials: Option<&Value>) -> Option<String> {
     let value = denials?;
@@ -1459,12 +1554,22 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
     let Some(arr) = value.as_array() else {
         return Some("(unreadable)".to_string());
     };
-    if arr.is_empty() {
+    denial_entries_names(&arr.iter().collect::<Vec<_>>())
+}
+
+/// A set of denial entries as a clause body, or `None` when the set is empty.
+/// Named tools render once in first-seen order with a `N times` count when
+/// repeated, then any nameless entries as `N unnamed entries` after the named
+/// ones — `unnamed` is a spellable tool name, so the count keeps the synthetic
+/// group out of that namespace, and `entry` / `entries` pluralizes the group's
+/// own count.
+fn denial_entries_names(entries: &[&Value]) -> Option<String> {
+    if entries.is_empty() {
         return None;
     }
     let mut named: Vec<(String, usize)> = Vec::new();
     let mut unnamed = 0usize;
-    for entry in arr {
+    for entry in entries {
         let name = entry
             .get("tool_name")
             .and_then(Value::as_str)
@@ -1490,6 +1595,45 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
         });
     }
     Some(parts.join(", "))
+}
+
+/// The receipt's denial clauses split by layer, as `(hook refusals, permission
+/// denials)`, each `None` when empty.
+///
+/// An entry whose `tool_use_id` sits in [`HOOK_REFUSAL_IDS`] was refused by a
+/// user `PreToolUse` hook — enforcement the `--dangerously-skip-permissions`
+/// flag does not bypass, and one the agent usually retried past. Every other
+/// entry, a `permissions.deny` rule's or one carrying no id to look up, stays a
+/// permission denial. Without the stamp (no transcript found, an unreadable
+/// one, or a denial value that is not a list) the whole list stays in the
+/// permission clause.
+fn denial_clauses(e: &Value) -> (Option<String>, Option<String>) {
+    let denials = e.get("permission_denials");
+    let hook_ids: Vec<&str> = e
+        .get(HOOK_REFUSAL_IDS)
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(arr) = denials.and_then(Value::as_array) else {
+        return (None, denial_names(denials));
+    };
+    if hook_ids.is_empty() {
+        return (None, denial_names(denials));
+    }
+    let mut hooks: Vec<&Value> = Vec::new();
+    let mut others: Vec<&Value> = Vec::new();
+    for entry in arr {
+        let is_hook = entry
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| hook_ids.contains(&id));
+        if is_hook {
+            hooks.push(entry);
+        } else {
+            others.push(entry);
+        }
+    }
+    (denial_entries_names(&hooks), denial_entries_names(&others))
 }
 
 /// The cost clause an envelope earns: ` (cost $X)`, ` (equivalent Anthropic API
@@ -1518,10 +1662,77 @@ pub(crate) fn cost_clause(e: &Value) -> String {
     }
 }
 
-/// Prose for a `result: "file"` reply: the path, the sha256, and the envelope's
-/// cost clause — the model Reads the file for the body.
+/// The character budget a result's first line gets in a reply: wide enough to
+/// carry a real first line, narrow enough that a 256-id batch stays bounded.
+const FIRST_LINE_MAX_CHARS: usize = 200;
+
+/// `line` with every control character and every bidi formatting character
+/// written as its `\u{..}` escape (delegate output is untrusted: it can
+/// neither drive the terminal nor reorder the line), held to `max` characters
+/// of the ESCAPED spelling with `format::truncate`'s `...` marker. The cut is taken per raw character, so it never splits an escape
+/// and never mistakes a literal `\` in the text for one; the work stops one
+/// character past the bound, whatever the line's length.
+fn escape_within(line: &str, max: usize) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut used = 0;
+    for c in line.chars() {
+        let piece = crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !c.is_control() && !crate::format::reorders_display(c)
+        });
+        used += piece.chars().count();
+        pieces.push(piece);
+        if used > max {
+            break;
+        }
+    }
+    if used <= max {
+        return pieces.concat();
+    }
+    let budget = max.saturating_sub(3);
+    let mut out = String::new();
+    let mut len = 0;
+    for piece in &pieces {
+        let n = piece.chars().count();
+        if len + n > budget {
+            break;
+        }
+        out.push_str(piece);
+        len += n;
+    }
+    out.push_str(&"..."[..max.min(3)]);
+    out
+}
+
+/// The first non-empty line of a delegate envelope's `result`, trimmed, every
+/// control and bidi formatting character written as its `\u{..}` escape, cut to
+/// [`FIRST_LINE_MAX_CHARS`] characters of the ESCAPED spelling with
+/// `format::truncate`'s `...` marker. A non-string result renders its literal
+/// and a missing one reads `unknown`, matching `envelope_prose`. A
+/// path-bearing reply carries this beside the result file, so the model can
+/// judge the answer without paying a Read for the body.
+pub(crate) fn result_first_line(e: &Value) -> String {
+    let text = match e.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown");
+    escape_within(line, FIRST_LINE_MAX_CHARS)
+}
+
+/// Prose for a `result: "file"` reply: the path, the sha256, the result's
+/// first line, and the envelope's cost clause — the model Reads the file for
+/// the body, and the first line tells it whether it needs to.
 pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
-    let mut out = format!("result written to {path} (sha256 {sha256})");
+    let mut out = format!(
+        "result written to {path} (sha256 {sha256}); first line: {}",
+        result_first_line(e)
+    );
     let cost = cost_clause(e);
     if !cost.is_empty() {
         out.push(';');
@@ -1594,7 +1805,11 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
     if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
         out.push_str(&format!("; resume with session id `{sid}`"));
     }
-    if let Some(names) = denial_names(e.get("permission_denials")) {
+    let (hook_refusals, permission_denials) = denial_clauses(e);
+    if let Some(names) = hook_refusals {
+        out.push_str(&format!("; hook refusals: {names}"));
+    }
+    if let Some(names) = permission_denials {
         out.push_str(&format!("; permission denials: {names}"));
     }
     out
@@ -1875,6 +2090,7 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
             }
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
             match r.get("status").and_then(Value::as_str) {
+                Some("done") if r.get("result_file").is_some() => compact_done_row(job_id, r),
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
                 Some("running") => running_status_prose(r),
                 _ => format!("job `{job_id}` unknown"),
@@ -1900,6 +2116,36 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
                 "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
             ),
         );
+    }
+    out
+}
+
+/// One done batch row whose envelope went to a result file: the verdict word,
+/// the result's first line, then the path and sha256 the body lives under, plus
+/// the cost clause. The entry carries only the fields this line and
+/// `cost_clause` read, so a batch of oversized envelopes never inlines their
+/// bodies; the file is the body's one delivery. A row without a
+/// `result_file` (a write that fell back inline) never reaches here.
+fn compact_done_row(job_id: &str, r: &Value) -> String {
+    let verdict = if r.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        "failed"
+    } else {
+        "finished"
+    };
+    let mut out = format!(
+        "job `{job_id}` {verdict}: {}; result written to {} (sha256 {})",
+        r.get("first_line")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("result_file")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),
+    );
+    let cost = cost_clause(r);
+    if !cost.is_empty() {
+        out.push(';');
+        out.push_str(&cost);
     }
     out
 }

@@ -774,7 +774,6 @@ fn self_heal_hook_is_a_no_op_in_an_upstream_session() {
 fn self_heal_hook_runs_in_a_tollgate_guest_session() {
     use crate::testutil::{ConfigDirSandbox, FakeClaude};
     let home = HomeSandbox::new();
-    stage_upstream(home.home());
     let own = home
         .home()
         .join(crate::identity::DATA_DIR_NAME)
@@ -782,11 +781,32 @@ fn self_heal_hook_runs_in_a_tollgate_guest_session() {
     std::fs::create_dir_all(own.join("plugins")).unwrap();
     let _dir = ConfigDirSandbox::new(&home, &own);
     let fake = FakeClaude::new(&home);
+    // The heal's spawn-free pre-check skips a healthy registration, so pose
+    // the broken shape it exists for: a registration whose installPath died.
+    // The fixture install lands before guest mode is staged: in guest mode the
+    // explicit install refuses a session config dir (`plugin_host::install`),
+    // a guard this test is not about; the heal of tollgate's own session copy
+    // is.
+    crate::testutil::healthy_install(&own);
+    let installed_path = own.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).unwrap()).unwrap();
+    installed["plugins"]["tollgate@tollgate"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).unwrap(),
+    )
+    .unwrap();
+    stage_upstream(home.home());
+    assert!(crate::identity::upstream_active());
+    let baseline = fake.log();
 
     crate::plugin_host::self_heal().expect("heal");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
     assert!(
-        fake.log().lines().any(|l| l == "plugin list --json"),
-        "the heal probed the registration: {}",
-        fake.log()
+        grown.lines().any(|l| l == "plugin list --json"),
+        "the heal probed the registration: {grown}"
     );
 }

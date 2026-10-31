@@ -267,27 +267,32 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
 /// consume says so only on a 401 — every other failure leaves the outcome open.
 #[test]
 fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
-    for err in [
-        ResetCallError::Unauthorized,
-        ResetCallError::Status(503),
-        ResetCallError::Transport,
-        ResetCallError::Parse,
+    let rejected_line = "codex rejected the stored access token for 'work'. The daemon \
+                         refreshes it for a parked account and codex does for the one in use. \
+                         Try again after that. No reset was used";
+    for (err, want) in [
+        (ResetCallError::Unauthorized, rejected_line),
+        (
+            ResetCallError::Status(503),
+            "codex answered the reset list for 'work' with HTTP 503; no reset was used",
+        ),
+        (
+            ResetCallError::Transport,
+            "could not reach codex to list the resets on 'work'; no reset was used",
+        ),
+        (
+            ResetCallError::Parse,
+            "codex answered the reset list for 'work' in a shape tollgate does not read; \
+             no reset was used",
+        ),
     ] {
-        let line = list_failure("work", &err);
-        assert!(line.ends_with("no reset was used"), "{err:?}: {line}");
+        assert_eq!(list_failure("work", &err), want, "{err:?}");
     }
-    assert!(list_failure("work", &ResetCallError::Status(503)).contains("HTTP 503"));
-    assert!(
-        list_failure("work", &ResetCallError::Unauthorized)
-            .contains("rejected the stored access token")
-    );
 
-    let rejected = consume_failure("work", &ResetCallError::Unauthorized);
-    assert!(
-        rejected.contains("rejected the stored access token"),
-        "{rejected}"
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Unauthorized),
+        rejected_line
     );
-    assert!(rejected.ends_with("no reset was used"), "{rejected}");
     let transport = consume_failure("work", &ResetCallError::Transport);
     assert!(
         transport.contains("may or may not have gone through"),
@@ -309,9 +314,247 @@ fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
     );
 }
 
+/// An untitled credit's prompt names no credit: the question already says a
+/// usage-limit reset is spent, so the expiry clause opens the next sentence.
+/// A titled credit keeps its title in front.
+#[test]
+fn limit_reset_prompt_opens_on_the_expiry_when_the_credit_has_no_title() {
+    let untitled = credit(
+        "u",
+        "codex_rate_limits",
+        "available",
+        "2026-01-01T00:00:00Z",
+        None,
+    );
+    let mut titled = untitled.clone();
+    titled.id = "t".to_string();
+    titled.title = Some("Full reset".to_string());
+    let credits = list_of(vec![untitled.clone(), titled.clone()], 2);
+
+    assert_eq!(
+        limit_reset_prompt("work", &credits, &untitled),
+        "tollgate: use a usage-limit reset on 'work'? No expiry, 1 of 2 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+    assert_eq!(
+        limit_reset_prompt("work", &credits, &titled),
+        "tollgate: use a usage-limit reset on 'work'? Full reset, no expiry, 1 of 2 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+}
+
+/// The prompt for one credit, the only one in its list, under a server count
+/// (3) that differs from the list's length, so the "1 of N" figure is pinned
+/// to the server's count and never to the list.
+fn sole_prompt(credit: &ResetCredit) -> String {
+    limit_reset_prompt("work", &list_of(vec![credit.clone()], 3), credit)
+}
+
+/// The `--list` row for one credit, the only one in its list.
+fn sole_list_row(credit: &ResetCredit) -> String {
+    describe_reset_credits("work", &list_of(vec![credit.clone()], 3))[1].clone()
+}
+
+/// A credit whose grant stamp does not parse, so its `--list` row is shown
+/// verbatim and every byte of it can be pinned.
+fn fixed_credit(expires_at: Option<&str>) -> ResetCredit {
+    credit(
+        "a",
+        "codex_rate_limits",
+        "available",
+        "not-a-stamp",
+        expires_at,
+    )
+}
+
+const PROMPT_TAIL: &str =
+    ", 1 of 3 available. It reopens the account's usage windows now and cannot be undone.";
+
+fn titled_credit(title: &str) -> ResetCredit {
+    ResetCredit {
+        title: Some(title.to_string()),
+        ..fixed_credit(None)
+    }
+}
+
+/// What the server sends is shown as sent, minus what would hide or reorder
+/// the confirm line: a lowercase title stays lowercase, a title that is only
+/// blanks and control characters is no title, a long one is capped, and the
+/// bidi controls that reorder a terminal line are dropped.
+#[test]
+fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
+    let titled = titled_credit;
+    let tail = PROMPT_TAIL;
+
+    assert_eq!(
+        sole_prompt(&titled("weekly reset")),
+        format!("tollgate: use a usage-limit reset on 'work'? weekly reset, no expiry{tail}")
+    );
+
+    let blank = titled(" \u{7} ");
+    assert_eq!(
+        sole_prompt(&blank),
+        format!("tollgate: use a usage-limit reset on 'work'? No expiry{tail}")
+    );
+    assert_eq!(
+        sole_list_row(&blank),
+        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+
+    let long = titled(&"x".repeat(70));
+    assert_eq!(
+        sole_prompt(&long),
+        format!(
+            "tollgate: use a usage-limit reset on 'work'? {}..., no expiry{tail}",
+            "x".repeat(57)
+        )
+    );
+
+    let bidi = titled("Full\u{202e} reset\u{2066}");
+    assert_eq!(
+        sole_prompt(&bidi),
+        format!("tollgate: use a usage-limit reset on 'work'? Full reset, no expiry{tail}")
+    );
+    assert_eq!(
+        sole_list_row(&bidi),
+        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A title a terminal draws as nothing is no title, whichever invisible
+/// characters it is made of; one visible character keeps it a title, shown
+/// as sent.
+#[test]
+fn limit_reset_invisible_title_reads_as_untitled() {
+    let titled = titled_credit;
+    for invisible in [
+        "\u{200b}",
+        "\u{3164}",
+        "\u{feff}\u{2060}",
+        " \u{e0041} \u{ad}",
+    ] {
+        let c = titled(invisible);
+        assert_eq!(
+            sole_prompt(&c),
+            "tollgate: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+             It reopens the account's usage windows now and cannot be undone.",
+            "title {invisible:?}"
+        );
+        assert_eq!(
+            sole_list_row(&c),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "title {invisible:?}"
+        );
+    }
+    assert_eq!(
+        sole_prompt(&titled("a\u{200b}")),
+        "tollgate: use a usage-limit reset on 'work'? a\u{200b}, no expiry, 1 of 3 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+}
+
+/// Both ends of every `Default_Ignorable_Code_Point` range, typed from Unicode
+/// 18.0.0 `DerivedCoreProperties.txt` rather than from the code: each one
+/// alone, as a title, reads untitled.
+#[test]
+fn limit_reset_every_ignorable_range_end_reads_as_untitled() {
+    let ranges: [(u32, u32); 17] = [
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    ];
+    for (lo, hi) in ranges {
+        for cp in [lo, hi] {
+            let ch = char::from_u32(cp).expect("a scalar value");
+            let c = ResetCredit {
+                title: Some(ch.to_string()),
+                ..fixed_credit(None)
+            };
+            assert_eq!(
+                sole_prompt(&c),
+                "tollgate: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+                 It reopens the account's usage windows now and cannot be undone.",
+                "U+{cp:04X}"
+            );
+        }
+    }
+}
+
+/// A `--list` row drops a status or a grant stamp that shows nothing instead
+/// of printing an empty clause; the codex body that sends neither (a credit
+/// with only an id) still lists.
+#[test]
+fn limit_reset_list_row_drops_a_status_or_grant_that_shows_nothing() {
+    for blank in ["", "   ", "\u{7}", "\u{200b}"] {
+        let no_status = credit("c", "codex_rate_limits", blank, "not-a-stamp", None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
+            "    usage-limit reset: no expiry, granted not-a-stamp",
+            "status {blank:?}"
+        );
+        let no_grant = credit("c", "codex_rate_limits", "available", blank, None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_grant], 1))[1],
+            "  * usage-limit reset: available, no expiry  (used next)",
+            "granted_at {blank:?}"
+        );
+    }
+    let sparse: ResetCredits =
+        serde_json::from_str(r#"{"credits": [{"id": "c"}]}"#).expect("a sparse credit parses");
+    assert_eq!(
+        describe_reset_credits("work", &sparse)[1],
+        "    usage-limit reset: no expiry"
+    );
+}
+
+/// An expiry stamp with nothing left to show is no stamp: blank, whitespace,
+/// only characters the terminal filter drops, or only characters a terminal
+/// draws as nothing. Both the confirm and `--list` say there is no expiry
+/// instead of printing an empty clause.
+#[test]
+fn limit_reset_blank_expiry_reads_as_no_expiry() {
+    for blank in [
+        "",
+        "   ",
+        "\u{7}",
+        "\u{202e}",
+        " \u{1b} ",
+        "\u{200b}",
+        "\u{2060} \u{fe0f}",
+        "\u{e0041}",
+    ] {
+        let c = fixed_credit(Some(blank));
+        assert_eq!(
+            sole_prompt(&c),
+            "tollgate: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+             It reopens the account's usage windows now and cannot be undone.",
+            "expires_at {blank:?}"
+        );
+        assert_eq!(
+            sole_list_row(&c),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "expires_at {blank:?}"
+        );
+    }
+}
+
 /// The prompt names the credit, its expiry, and "1 of N"; the listing marks
 /// the credit the prompt would name. A missing title falls back to the generic
-/// name, and a count lagging its own list never reads "1 of 0".
+/// name in the listing, and a count lagging its own list never reads "1 of 0".
 #[test]
 fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let mut titled = credit(
@@ -333,16 +576,14 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
 
     let prompt = limit_reset_prompt("work", &credits, &dated);
     assert!(
-        prompt.starts_with(
-            "tollgate: use a usage-limit reset on 'work'? usage-limit reset · expires "
-        ),
+        prompt.starts_with("tollgate: use a usage-limit reset on 'work'? Expires "),
         "{prompt}"
     );
-    assert!(prompt.contains("· 1 of 2 available."), "{prompt}");
+    assert!(prompt.contains(", 1 of 2 available."), "{prompt}");
     assert!(prompt.contains("cannot be undone"), "{prompt}");
     let titled_prompt = limit_reset_prompt("work", &list_of(vec![titled.clone()], 0), &titled);
     assert!(
-        titled_prompt.contains("Full reset (Weekly + 5 hr) · no expiry · 1 of 1 available."),
+        titled_prompt.contains("Full reset (Weekly + 5 hr), no expiry, 1 of 1 available."),
         "control characters dropped, count floored at one: {titled_prompt}"
     );
 
@@ -353,12 +594,12 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     );
     assert_eq!(lines.len(), 3);
     assert!(
-        lines[1].starts_with("    Full reset (Weekly + 5 hr) — available, no expiry, granted "),
+        lines[1].starts_with("    Full reset (Weekly + 5 hr): available, no expiry, granted "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[2].starts_with("  * usage-limit reset — available, expires "),
+        lines[2].starts_with("  * usage-limit reset: available, expires "),
         "{}",
         lines[2]
     );
@@ -402,14 +643,283 @@ fn limit_reset_unparseable_stamps_reach_the_terminal_without_control_characters(
     for text in std::iter::once(&prompt).chain(lines.iter()) {
         assert!(!text.chars().any(char::is_control), "{text:?}");
     }
-    assert!(
-        prompt.contains("expires 2026-01-01T00:00:00]52;c;AAAA"),
-        "{prompt}"
+    assert_eq!(
+        prompt,
+        "tollgate: use a usage-limit reset on 'work'? Expires 2026-01-01T00:00:00]52;c;AAAA, \
+         1 of 1 available. It reopens the account's usage windows now and cannot be undone."
     );
-    assert!(
-        lines[1].contains("granted 2026-01-01T00:00:00]52;c;AAAA"),
-        "{}",
-        lines[1]
+    assert_eq!(
+        lines[1],
+        "  * usage-limit reset: available, expires 2026-01-01T00:00:00]52;c;AAAA, \
+         granted 2026-01-01T00:00:00]52;c;AAAA  (used next)"
+    );
+}
+
+/// The title's 60 cap counts only the characters that take a cell: a run of
+/// zero-width characters inside a title never pushes it past the cap, and none
+/// of them is dropped. A cut keeps the invisible characters right after the last drawn one,
+/// so an emoji keeps its variation selector. Blanks count, as spaces do; a
+/// title exactly at the cap is shown whole.
+#[test]
+fn limit_reset_title_cap_counts_only_drawn_characters() {
+    let padded = format!("x{}y", "\u{200b}".repeat(70));
+    assert_eq!(
+        sole_prompt(&titled_credit(&padded)),
+        format!("tollgate: use a usage-limit reset on 'work'? {padded}, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_list_row(&titled_credit(&padded)),
+        format!("  * {padded}: available, no expiry, granted not-a-stamp  (used next)")
+    );
+
+    let heart = "\u{2764}\u{fe0f}";
+    assert_eq!(
+        sole_prompt(&titled_credit(&heart.repeat(70))),
+        format!(
+            "tollgate: use a usage-limit reset on 'work'? {}..., no expiry{PROMPT_TAIL}",
+            heart.repeat(57)
+        )
+    );
+
+    assert_eq!(
+        sole_prompt(&titled_credit(&"x ".repeat(35))),
+        format!(
+            "tollgate: use a usage-limit reset on 'work'? {}x..., no expiry{PROMPT_TAIL}",
+            "x ".repeat(28)
+        )
+    );
+
+    let at_cap = format!(
+        "{}{}{}",
+        "x".repeat(30),
+        "\u{200b}".repeat(5),
+        "x".repeat(30)
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit(&at_cap)),
+        format!("tollgate: use a usage-limit reset on 'work'? {at_cap}, no expiry{PROMPT_TAIL}")
+    );
+}
+
+/// The `--list` status cap (20) counts only drawn characters too.
+#[test]
+fn limit_reset_status_cap_counts_only_drawn_characters() {
+    let status = format!("re{}deemed", "\u{200b}".repeat(25));
+    let c = credit("c", "codex_rate_limits", &status, "not-a-stamp", None);
+    assert_eq!(
+        describe_reset_credits("work", &list_of(vec![c], 0))[1],
+        format!("    usage-limit reset: {status}, no expiry, granted not-a-stamp")
+    );
+}
+
+/// An unparseable stamp's cap (40) counts only drawn characters too, on the
+/// expiry and the grant alike.
+#[test]
+fn limit_reset_raw_stamp_cap_counts_only_drawn_characters() {
+    let raw = format!("{}soon", "\u{200b}".repeat(45));
+    assert_eq!(
+        sole_prompt(&fixed_credit(Some(&raw))),
+        format!("tollgate: use a usage-limit reset on 'work'? Expires {raw}{PROMPT_TAIL}")
+    );
+    let granted = credit("a", "codex_rate_limits", "available", &raw, None);
+    assert_eq!(
+        sole_list_row(&granted),
+        format!("  * usage-limit reset: available, no expiry, granted {raw}  (used next)")
+    );
+}
+
+/// U+2800 BRAILLE PATTERN BLANK draws an empty cell, so it is blank like a
+/// space: a title, expiry, status or grant made of it shows nothing.
+#[test]
+fn limit_reset_braille_blank_alone_shows_nothing() {
+    let blank = "\u{2800}";
+    for text in [blank.to_string(), format!(" {blank} {blank} ")] {
+        assert_eq!(
+            sole_prompt(&titled_credit(&text)),
+            format!("tollgate: use a usage-limit reset on 'work'? No expiry{PROMPT_TAIL}"),
+            "title {text:?}"
+        );
+        assert_eq!(
+            sole_list_row(&titled_credit(&text)),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "title {text:?}"
+        );
+        assert_eq!(
+            sole_prompt(&fixed_credit(Some(&text))),
+            format!("tollgate: use a usage-limit reset on 'work'? No expiry{PROMPT_TAIL}"),
+            "expires_at {text:?}"
+        );
+        let no_status = credit("c", "codex_rate_limits", &text, "not-a-stamp", None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
+            "    usage-limit reset: no expiry, granted not-a-stamp",
+            "status {text:?}"
+        );
+        let no_grant = credit("c", "codex_rate_limits", "available", &text, None);
+        assert_eq!(
+            sole_list_row(&no_grant),
+            "  * usage-limit reset: available, no expiry  (used next)",
+            "granted_at {text:?}"
+        );
+    }
+}
+
+/// A title trims U+2800 off both ends, as it trims spaces.
+#[test]
+fn limit_reset_title_trims_braille_blanks_off_its_ends() {
+    let c = titled_credit("\u{2800} Full reset \u{2800}\u{2800}");
+    assert_eq!(
+        sole_prompt(&c),
+        format!("tollgate: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_list_row(&c),
+        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A status sent with blanks around `available` is available: it is the one
+/// `limit-reset` spends, and `--list` prints it trimmed.
+#[test]
+fn limit_reset_spends_an_available_status_sent_with_blanks() {
+    for status in [" available ", "\u{2800}available\t"] {
+        let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
+        let credits = list_of(vec![c.clone()], 3);
+        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            describe_reset_credits("work", &credits),
+            vec![
+                "tollgate: 'work' has 3 usage-limit resets available.".to_string(),
+                "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+                    .to_string(),
+            ],
+            "status {status:?}"
+        );
+    }
+}
+
+/// The Hangul fillers draw an empty cell, so they are blank like a space: they
+/// count toward a cap and trim off the ends.
+#[test]
+fn limit_reset_hangul_fillers_count_and_trim_as_blank() {
+    let filled = format!("a{}b", "\u{3164}".repeat(100));
+    assert_eq!(
+        sole_prompt(&titled_credit(&filled)),
+        format!(
+            "tollgate: use a usage-limit reset on 'work'? a{}..., no expiry{PROMPT_TAIL}",
+            "\u{3164}".repeat(56)
+        )
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit("\u{3164}Full reset\u{ffa0}")),
+        format!("tollgate: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit("Full reset\u{115f}")),
+        format!("tollgate: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    let c = credit(
+        "a",
+        "codex_rate_limits",
+        "\u{115f}available",
+        "not-a-stamp",
+        None,
+    );
+    let credits = list_of(vec![c.clone()], 3);
+    assert_eq!(credits.next_to_use(), Some(&c));
+    assert_eq!(
+        describe_reset_credits("work", &credits)[1],
+        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A credit is spent when the status `--list` shows for it reads `available`:
+/// control, bidi and invisible characters never keep a row that reads
+/// `available` from being the one `limit-reset` spends.
+#[test]
+fn limit_reset_spends_the_status_list_shows_as_available() {
+    for (status, shown) in [
+        ("available\u{7}", "available"),
+        ("available\u{202e}", "available"),
+        ("\u{200b}available", "available"),
+    ] {
+        let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
+        let credits = list_of(vec![c.clone()], 3);
+        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            describe_reset_credits("work", &credits),
+            vec![
+                "tollgate: 'work' has 3 usage-limit resets available.".to_string(),
+                format!(
+                    "  * usage-limit reset: {shown}, no expiry, granted not-a-stamp  (used next)"
+                ),
+            ],
+            "status {status:?}"
+        );
+    }
+}
+
+/// A title trims invisible padding off its ends along with blanks, and keeps
+/// the invisible characters right after its last drawn one.
+#[test]
+fn limit_reset_title_trims_invisible_padding_off_its_ends() {
+    for (title, shown) in [
+        (" \u{200b} Full reset \u{200b} ", "Full reset"),
+        ("\u{2060}\u{feff}Full reset\u{2060}", "Full reset\u{2060}"),
+        ("\u{2764}\u{fe0f} ", "\u{2764}\u{fe0f}"),
+    ] {
+        assert_eq!(
+            sole_prompt(&titled_credit(title)),
+            format!("tollgate: use a usage-limit reset on 'work'? {shown}, no expiry{PROMPT_TAIL}"),
+            "title {title:?}"
+        );
+    }
+}
+
+/// A cap below the ellipsis' own width is dots alone, as `format::truncate`
+/// gives, never a panic.
+#[test]
+fn limit_reset_cap_below_the_ellipsis_is_dots_alone() {
+    assert_eq!(cap_drawn("abcd", 2), "..");
+    assert_eq!(cap_drawn("abcd", 0), "");
+    assert_eq!(cap_drawn("abcd", 3), "...");
+    assert_eq!(cap_drawn("a\u{200b}\u{200b}", 2), "a\u{200b}\u{200b}");
+}
+
+/// A soft hyphen takes a cell on most terminals (drawn as a hyphen), so it
+/// counts toward a cap and a status holding one inside is not `available`;
+/// alone or at the ends it is padding, like an invisible character.
+#[test]
+fn limit_reset_soft_hyphen_takes_a_cell() {
+    let c = credit(
+        "a",
+        "codex_rate_limits",
+        "avail\u{ad}able",
+        "not-a-stamp",
+        None,
+    );
+    let credits = list_of(vec![c], 0);
+    assert_eq!(credits.next_to_use(), None);
+    assert_eq!(
+        describe_reset_credits("work", &credits),
+        vec![
+            "tollgate: no usage-limit resets available on 'work'.".to_string(),
+            "    usage-limit reset: avail\u{ad}able, no expiry, granted not-a-stamp".to_string(),
+        ]
+    );
+
+    let hyphens = format!("x{}y", "\u{ad}".repeat(70));
+    assert_eq!(
+        sole_prompt(&titled_credit(&hyphens)),
+        format!(
+            "tollgate: use a usage-limit reset on 'work'? x{}..., no expiry{PROMPT_TAIL}",
+            "\u{ad}".repeat(56)
+        )
+    );
+
+    assert_eq!(
+        sole_prompt(&titled_credit("\u{ad}Full reset\u{ad}")),
+        format!("tollgate: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
     );
 }
 

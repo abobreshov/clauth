@@ -157,11 +157,13 @@ fn a_profile_read_asks_about_the_stored_login() {
     crate::actions::overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         crate::actions::CaptureSnapshot {
             credentials: Some(tok("at-b")),
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install b with no proven uuid");
@@ -177,7 +179,13 @@ fn a_profile_read_asks_about_the_stored_login() {
         (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     let seen = handle.join().expect("join stub");
     let bearer = seen
         .iter()
@@ -315,7 +323,13 @@ fn a_store_moved_mid_read_writes_no_anchor() {
         (200, r#"{"account":{"uuid":"uuid-a"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
     assert_eq!(
         load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
@@ -326,8 +340,9 @@ fn a_store_moved_mid_read_writes_no_anchor() {
 
 /// A failed anchor write (the off-roster skip, the same `!landed` branch an
 /// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
-/// the removal runs before the write, so a removable old anchor is gone even when
-/// the new write fails, and the log is exactly the failure line.
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails, and the log is exactly the
+/// failure line.
 #[test]
 fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
@@ -359,6 +374,41 @@ fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
         sink.snapshot(),
         vec!["tollgate: offroster: could not write the identity anchor".to_string()],
         "the failed write logs its failure line alone"
+    );
+}
+
+/// A failed seed write (the off-roster skip, the same `!landed` branch an
+/// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails.
+#[test]
+fn a_failed_seed_write_leaves_no_displaced_anchor() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("offroster");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-off".to_string(),
+            refresh_token: Some("rt-off".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::write(dir.join(ACCOUNT_ID_CACHE_FILE), br#""uuid-old""#).expect("seed anchor");
+
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-new".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "a failed seed leaves the profile unanchored, never on the old account"
     );
 }
 
@@ -482,7 +532,13 @@ fn a_failed_profile_read_keeps_the_anchor() {
 
     let (base, handle) = serve_endpoints_raw(1, |_p, _i| (500, String::new()));
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
 
     assert_eq!(
@@ -609,7 +665,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "the plan still maps alongside the backfill"
@@ -624,7 +687,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     );
     let before = std::fs::read(&cred_path).expect("read store");
 
-    fetch_profile_plan(&name, "at-poll", true, None).expect("second pull");
+    fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("second pull");
     assert_eq!(
         std::fs::read(&cred_path).expect("read store"),
         before,
@@ -681,7 +751,14 @@ fn a_corrupt_store_refuses_the_ride_along_without_failing_the_fetch() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "a corrupt store never fails the fetch"
@@ -952,17 +1029,33 @@ fn round2_failed_proven_anchor_write_keeps_duplicate_walks_blocked() {
                 "keep the proven anchor byte-for-byte"
             );
             assert!(!identity_pending(&name));
-            assert!(
-                matches!(crate::fallback::blocked_reason(&config, &config.profiles[1], None, &HashSet::new()),
-                Some(crate::fallback::BlockedReason::SameAccount { profile }) if profile == name)
-            );
+            assert!(matches!(
+                crate::fallback::blocked_reason(
+                    &config,
+                    &config.profiles[1],
+                    None,
+                    &HashSet::new(),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(crate::fallback::BlockedReason::SameAccount { profile }) if profile == name
+            ));
         } else {
             assert!(load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_none());
             assert!(identity_pending(&name));
-            assert!(
-                matches!(crate::fallback::blocked_reason(&config, &config.profiles[1], None, &HashSet::new()),
-                Some(crate::fallback::BlockedReason::IdentityUnverified { profile }) if profile == name)
-            );
+            assert!(matches!(
+                crate::fallback::blocked_reason(
+                    &config,
+                    &config.profiles[1],
+                    None,
+                    &HashSet::new(),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(crate::fallback::BlockedReason::IdentityUnverified { profile }) if profile == name
+            ));
         }
         assert!(crate::fallback::walk_excluded(
             &config,
@@ -1030,6 +1123,22 @@ fn a_login_with_no_proven_uuid_removes_the_anchor() {
 // account returns /profile 200 with `organization_type:"claude_free"` +
 // `subscription_status:"canceled"` while /usage 429s on every tick. The active
 // control (filip3) stays `claude_pro`/`trialing`. These pin the exact shapes.
+
+/// A `/profile` whose status happens to spell tollgate's own word for an
+/// organization's refusal is no such refusal: only the usage probe's landing
+/// writes it, so the walks never skip an account off a status `/profile` sent.
+#[test]
+fn a_profile_status_spelling_the_org_refusal_reads_as_none() {
+    let raw: RawProfile = serde_json::from_str(&format!(
+        r#"{{"account":{{"has_claude_pro":true,"has_claude_max":false}},
+            "organization":{{"organization_type":"claude_pro","subscription_status":"{}"}}}}"#,
+        crate::usage::ORG_REFUSED_STATUS
+    ))
+    .expect("fixture parses");
+    let plan = plan_from_profile(&raw);
+    assert!(!plan.is_org_refused());
+    assert!(!plan.refuses_service());
+}
 
 /// `plan_from_profile` reads BOTH the tier (a canceled Pro drops to Free) and the
 /// precise canceled status off the real captured bodies, and keeps a canceled
@@ -1296,6 +1405,25 @@ fn epoch_to_iso_round_trips() {
     }
     // Negative input clamps to epoch 0 instead of underflowing the calendar.
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
+}
+
+/// `ms_to_iso` floors to whole seconds for signed and unsigned inputs alike;
+/// a `u64` past `i64::MAX` must not wrap negative.
+#[test]
+fn epoch_millisecond_conversion_preserves_signed_and_unsigned_inputs() {
+    for (ms, iso) in [
+        (i128::from(i64::MIN), "1970-01-01T00:00:00+00:00"),
+        (-1_001, "1970-01-01T00:00:00+00:00"),
+        (-999, "1970-01-01T00:00:00+00:00"),
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i128::from(i64::MAX), "292278994-08-17T07:12:55+00:00"),
+        (i128::from(u64::MAX), "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
+    }
 }
 
 /// `retry-after` parsing accepts the delta-seconds form and the IMF-fixdate
@@ -2402,13 +2530,448 @@ fn humanize_duration_five_minutes_and_up_stays_coarse() {
     assert_eq!(humanize_duration(25 * 3600), "1d 1h");
 }
 
-/// The shared usage agent has an end-to-end deadline: a server that sends its
-/// headers and then stalls the body cannot freeze the caller.
+// ── the usage-credit spend cap (#93) ─────────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model once the account's credit cap is
+// spent. `credit_capped` is the one predicate every account pick keys on; a
+// billing-off account carrying a stale limit (kerry, 2026-07-17: enabled false,
+// limit $50, used $31.07) is never capped, whatever its figures say.
+
+fn spend(enabled: bool, used: Option<f64>, limit: Option<f64>, percent: Option<f64>) -> SpendInfo {
+    SpendInfo {
+        enabled,
+        used,
+        limit,
+        percent,
+        currency: Some("USD".to_string()),
+    }
+}
+
+fn extra(
+    is_enabled: bool,
+    used_credits: Option<f64>,
+    monthly_limit: Option<f64>,
+    utilization: Option<f64>,
+) -> ExtraUsage {
+    ExtraUsage {
+        is_enabled,
+        monthly_limit,
+        used_credits,
+        utilization,
+        currency: Some("USD".to_string()),
+        ..ExtraUsage::default()
+    }
+}
+
 #[test]
-fn the_shared_usage_agent_has_a_finite_end_to_end_deadline() {
-    let t = http_agent().config().timeouts();
-    assert_eq!(t.global, Some(crate::usage::keyed_http::CALL_DEADLINE));
-    assert_eq!(t.recv_body, Some(crate::usage::keyed_http::CALL_DEADLINE));
+fn a_spend_block_with_billing_off_is_never_capped() {
+    assert!(!spend(false, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(false, Some(31.07), Some(50.0), Some(62.0)).is_capped());
+    assert!(!spend(false, None, None, Some(100.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_is_capped_once_used_reaches_the_limit() {
+    assert!(spend(true, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(spend(true, Some(60.0), Some(50.0), Some(100.0)).is_capped());
+    // The amounts decide when both are read: 49.75 of 50 is 99.5%, which the
+    // wire's integer `percent` rounds up to 100.
+    assert!(!spend(true, Some(49.75), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, Some(6.0), Some(50.0), Some(12.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_without_both_amounts_falls_back_to_its_percent() {
+    assert!(spend(true, None, None, Some(100.0)).is_capped());
+    assert!(spend(true, Some(50.0), None, Some(100.0)).is_capped());
+    assert!(spend(true, None, Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, None, None, Some(99.0)).is_capped());
+    // Nothing read is no evidence of a cap.
+    assert!(!spend(true, None, None, None).is_capped());
+}
+
+#[test]
+fn an_extra_usage_block_is_capped_once_its_utilization_reaches_100() {
+    assert!(extra(true, None, None, Some(100.0)).is_capped());
+    assert!(extra(true, None, None, Some(100.4)).is_capped());
+    assert!(!extra(true, None, None, Some(99.99)).is_capped());
+    assert!(!extra(false, None, None, Some(100.0)).is_capped());
+    // With no utilization read, the amounts decide.
+    assert!(extra(true, Some(25.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, Some(24.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, None, None, None).is_capped());
+}
+
+#[test]
+fn credit_capped_reads_either_block() {
+    let base = UsageInfo::default();
+    assert!(!base.credit_capped(), "no block at all is no cap");
+
+    let spend_capped = UsageInfo {
+        spend: Some(spend(true, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(spend_capped.credit_capped());
+
+    let extra_capped = UsageInfo {
+        spend: Some(spend(true, Some(6.0), Some(50.0), Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(extra_capped.credit_capped());
+
+    // kerry's live shape on 2026-10-18: 12% of the cap, nowhere near it.
+    let kerry = UsageInfo {
+        spend: Some(spend(true, None, None, Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(!kerry.credit_capped());
+
+    let stale = UsageInfo {
+        spend: Some(spend(false, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(false, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(!stale.credit_capped(), "billing off on both blocks");
+}
+
+/// F8/M5+M6 (A7 re-anchor): a `tollgate start` copy-back of a different account's
+/// login leaves the profile anchored to A holding B's token; the next `/profile`
+/// re-anchors A→B inside its hold — the usage cache is re-seeded with ONLY that
+/// body's plan, the durable stamp is re-written, and the decision flags the
+/// re-anchor for the drain's memory forget.
+#[test]
+fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
+    use crate::profile_cache::{
+        ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
+    };
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p3");
+    crate::testutil::register_names(&["p3"]);
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    // A copy-back of account B's login: the store holds B's token while the
+    // anchor still names account A.
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-b"));
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-a".to_string()),
+        "precondition: the copy-back left the anchor at A"
+    );
+    // Seed a throughput cache on the plain-OAuth profile: its throughput
+    // identity is the anchor digest, so A→B moves it and the re-anchor must
+    // forget the file too (R2).
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    // `/profile` answers uuid u-b: the stored token at-b authenticates as B.
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor forgets the throughput cache when its identity moved"
+    );
+    let cache = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the re-anchor seeded the usage cache");
+    assert!(
+        cache.five_hour.is_none() && cache.seven_day.is_none(),
+        "the re-anchor seed holds only the body's plan, never a stale reading"
+    );
+    assert!(cache.plan.is_some(), "the plan comes from that body");
+    // The scheduler's re-seed reads exactly this shape (a plan, no windows, no
+    // `fetched_at`) as a plan-only seed and leaves the new login's `/usage` due
+    // on the next tick; a dated or windowed seed would stamp its cadence.
+    assert!(
+        cache.windows().is_empty() && cache.fetched_at.is_none(),
+        "the re-anchor seed is plan-only: no window and no fetch time"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, PROFILE_FETCHED_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor re-writes the durable /profile stamp"
+    );
+}
+
+/// A `/profile` read that re-anchors the profile on another account drops its
+/// credit refusal, as a login as another account does: the refusal was the old
+/// account's. The control, the same read naming the anchored account, keeps
+/// it.
+#[test]
+fn a_profile_read_on_another_account_drops_a_credit_refusal() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["p3"]);
+    let name = crate::profile::ProfileName::from("p3");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let refused_after = |uuid: &'static str| {
+        seed_login_anchor(
+            &name,
+            Some(&crate::profile::AccountId::from("u-a".to_string())),
+        );
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms() + 60_000,
+                file: std::path::PathBuf::from("/p/a.jsonl"),
+                uuid: None,
+            },
+        );
+        assert!(
+            crate::profile_cache::credit_refusal(&name).is_some(),
+            "fixture control: the refusal is on record"
+        );
+        let (base, handle) = serve_endpoints_raw(1, move |_path, _i| {
+            (200, format!(r#"{{"account":{{"uuid":"{uuid}"}}}}"#))
+        });
+        let _endpoints = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision::default();
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        crate::profile_cache::credit_refusal(&name).is_some()
+    };
+    assert!(refused_after("u-a"), "the anchored account's read keeps it");
+    assert!(!refused_after("u-b"), "a read on another account drops it");
+}
+
+/// F6/R2 (keyed arm): a hybrid's throughput identity is its endpoint auth
+/// (base_url + key), which an OAuth re-anchor does not move — the throughput
+/// cache is kept, unlike a plain-OAuth profile's anchor-digest identity.
+#[test]
+fn a_reanchor_keeps_a_hybrids_throughput_cache() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p4");
+    crate::testutil::register_names(&["p4"]);
+    let mut profile = crate::profile::Profile::new(
+        "p4".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "a hybrid's endpoint-auth throughput identity survives an OAuth re-anchor"
+    );
+}
+
+/// A seeded plan survives a forced `/profile` that fails (A4-keep): the seed
+/// wrote no stamp, so the read stays due, and a failed read writes no plan —
+/// the seeded tier stays on disk for the next read.
+#[test]
+fn the_seeded_plan_survives_a_failed_forced_profile() {
+    use crate::profile::{AccountId, AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        ..crate::usage::PlanInfo::default()
+    };
+    let creds = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "minted-access".to_string(),
+            refresh_token: Some("minted-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: Some(creds),
+        base_url: None,
+        api_key: None,
+        anchor: crate::actions::AnchorAction::Proven(
+            crate::profile_cache::AccountIdentity::uuid_only(AccountId::from("u-1"), 0),
+        ),
+        plan: Some(plan),
+    };
+    crate::actions::capture_into_profile(
+        &mut AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        },
+        "acct".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("install the seeded login");
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .is_some(),
+        "precondition: the seed is on disk"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "precondition: the seed wrote no stamp, so /profile is due"
+    );
+
+    // A forced `/profile` the endpoint answers with a 500.
+    let (base, handle) =
+        crate::testutil::serve_endpoints_raw(1, |_path, _i| (500, "{}".to_string()));
+    let _sandbox = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let fetched = fetch_profile_plan(
+        &name,
+        "minted-access",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
+    handle.join().expect("join the stub");
+
+    assert!(fetched.is_none(), "the failed read yields no plan");
+    assert_eq!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the failed forced read leaves the seeded plan on disk"
+    );
+}
+
+/// The probe body's plan rides `LoginProfile` out of the raw-body mapping — the
+/// same tier a `/profile` read would cache, so the login seed is the exact plan
+/// the probe carried. tollgate pairs the email with the account on the probe's
+/// identity, not on the plan.
+#[test]
+fn login_profile_from_raw_carries_the_probe_plan() {
+    let p: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"u-1","email":"cloudy@example.com"},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#,
+    )
+    .expect("the profile parses");
+    let login = login_profile_from_raw(p);
+    assert_eq!(
+        login.plan.tier,
+        crate::usage::PlanTier::Max(Some(5)),
+        "the probe carries the body's exact tier"
+    );
+    let identity = login.identity.expect("the probe body names its account");
+    assert_eq!(
+        identity.account_uuid.as_str(),
+        "u-1",
+        "and the identity names the account it was read for"
+    );
+    assert_eq!(
+        identity.email.as_deref(),
+        Some("cloudy@example.com"),
+        "with the email paired with that account"
+    );
+}
+
+/// The shared usage agent (`/usage`, `/profile`, the typed providers) bounds
+/// the whole call at its two phase deadlines (4 s connect + 8 s headers), so a
+/// stalled body ends at 12 s instead of hanging the fetch leg.
+#[test]
+fn the_usage_agent_bounds_the_whole_call_at_its_deadlines() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let timeouts = http_agent().config().timeouts();
+    assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+    assert_eq!(timeouts.recv_response, Some(Duration::from_secs(8)));
+    assert_eq!(timeouts.global, Some(Duration::from_secs(12)));
+    assert_eq!(timeouts.global, Some(USAGE_HTTP_DEADLINES));
+}
+
+#[test]
+fn a_usage_agent_fails_a_stalled_body_at_its_whole_call_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bound = Duration::from_millis(200);
+    crate::testutil::assert_stalled_body_fails_at(usage_agent(bound), bound);
+}
+
+#[test]
+fn a_usage_agent_reads_a_body_served_within_its_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::assert_prompt_body_reads(usage_agent(Duration::from_millis(200)));
 }
 
 /// The same canned account body repairs a stale anchor and exposes the duplicate
@@ -2456,7 +3019,13 @@ fn duplicate_account_profile_replies_flag_render_and_block_the_walk() {
         crate::profile_cache::same_account_as(&config, &second),
         Some(first.clone())
     );
-    let entries = crate::daemon::build_profile_entries(&config, 30_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        30_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let json = serde_json::to_value(&entries).expect("serialize status entries");
     assert_eq!(json[1]["same_account_as"], "leadtone");
     assert_eq!(json[1]["walk_blocker"], "same account as 'leadtone'");
@@ -2479,10 +3048,8 @@ fn duplicate_account_profile_replies_flag_render_and_block_the_walk() {
     let keys = std::collections::HashSet::new();
     assert!(crate::fallback::walk_excluded(&config, &second, &keys));
     config.state.auth_broken.push(first.clone());
-    assert!(!matches!(
-        crate::fallback::next_target(&config, None, &keys),
-        Some(crate::fallback::SwitchAction::To(_))
-    ));
+    // The walk itself, through the snapshot every caller builds (the
+    // config-walking `next_target` shortcut left with `Profile.usage`).
     let snapshot = crate::fallback::snapshot_chain(&config, &keys).expect("blocked snapshot");
     assert!(!matches!(
         crate::fallback::next_auto_switch_target_for_test(
@@ -2493,9 +3060,17 @@ fn duplicate_account_profile_replies_flag_render_and_block_the_walk() {
     ));
     let mut later = snapshot.chain[0].clone();
     later.name = second.clone();
-    assert!(
-        matches!(crate::fallback::start_block(&config, &later, &config.profiles[1], None, false, false, None), Some(crate::fallback::StartBlock::SameAccount { profile }) if profile == first)
-    );
+    assert!(matches!(crate::fallback::start_block(
+            &config,
+            &later,
+            &config.profiles[1],
+            None,
+            false,
+            false,
+            None,
+            false,
+            &[],
+        ), Some(crate::fallback::StartBlock::SameAccount { profile }) if profile == first));
     config.state.auth_broken.clear();
 
     assert_eq!(
@@ -2515,7 +3090,13 @@ fn duplicate_account_profile_replies_flag_render_and_block_the_walk() {
     reconcile_identity_anchor(&second, "at-scifoo", &raw_profile(Some("distinct-uuid")));
     assert!(crate::profile_cache::same_account_as(&config, &second).is_none());
     assert!(!crate::fallback::walk_excluded(&config, &first, &keys));
-    let entries = crate::daemon::build_profile_entries(&config, 30_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        30_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let json = serde_json::to_value(&entries).expect("serialize distinct entries");
     assert!(json[1].get("same_account_as").is_none());
     assert!(json[1].get("walk_blocker").is_none());

@@ -5,7 +5,14 @@ mod app;
 mod render;
 pub(crate) mod theme;
 
-use std::sync::atomic::Ordering;
+pub(crate) use app::escape_control;
+// A scheduler test draws a stood-down TUI's frame over the stores its tick
+// wrote; test-only, so the shipped binary's reach stays as it was.
+#[cfg(test)]
+pub(crate) use app::App;
+#[cfg(test)]
+pub(crate) use render::draw;
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,10 +24,11 @@ use crate::profile::AppConfig;
 /// 80ms tick: spinner advances every frame per contract; responsive without burning CPU.
 const TICK: Duration = Duration::from_millis(80);
 
-/// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
-/// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied to
-/// the constructed [`app::App`] via [`app::App::with_herdr_mode`]; nothing
-/// else here reads the environment.
+/// Launch the full-screen TUI. Returns on quit (`q` twice, `⌃c` twice, or a
+/// fatal error).
+/// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied
+/// through [`app::App::with_herdr_mode`]. `open_tab` overrides the saved home
+/// tab for this launch.
 pub(crate) fn run(
     config: AppConfig,
     herdr_mode: bool,
@@ -68,9 +76,6 @@ fn run_loop(
     let mut last_tick = Instant::now();
 
     while !application.quit {
-        if application.shutting_down.load(Ordering::SeqCst) {
-            application.quit = true;
-        }
         terminal.draw(|frame| render::draw(frame, &application))?;
         let size = terminal.size()?;
         // Update compact + width-floor state each frame so the banner appears as
@@ -104,8 +109,9 @@ fn run_loop(
 #[path = "../../tests/inline/showcase.rs"]
 mod showcase;
 
-// Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads before it
-// clears `HOME_OVERRIDE`, so a worker can never resolve the operator's real
-// `$HOME` and lock under their `~/.tollgate`.
+// Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads bounded
+// before it clears `HOME_OVERRIDE`; a worker still running past the bound is
+// detached, and its next home read resolves whichever `HOME_OVERRIDE` is
+// installed then, never the operator's real `$HOME`.
 #[cfg(test)]
-pub(crate) use app::join_test_workers;
+pub(crate) use app::{detach_test_workers, join_test_workers_within};

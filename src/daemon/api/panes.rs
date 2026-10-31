@@ -57,6 +57,38 @@ pub(crate) enum HerdrProbeOut {
 pub(crate) type PaneProbe =
     Box<dyn Fn(&[&str], std::time::Duration) -> HerdrProbeOut + Send + Sync>;
 
+/// One bounded `herdr pane list` call through the seam, reduced to the panes
+/// it listed, or the fixed reason herdr was absent. `panes()` needs the reason
+/// for its `present: false` body, and `session_pane`/`herdr_session_ids` map
+/// any absence to no pane, so the probe-and-parse ladder lives once (B#6).
+pub(crate) fn listed_panes(ctx: &ApiContext) -> Result<Vec<HerdrPane>, &'static str> {
+    listed_panes_probe(&ctx.herdr_probe)
+}
+
+/// [`listed_panes`] over an explicit probe, so a caller without an
+/// [`ApiContext`] (the mod bridge's push dedup) reads the same ladder.
+fn listed_panes_probe(probe: &PaneProbe) -> Result<Vec<HerdrPane>, &'static str> {
+    match probe(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
+        HerdrProbeOut::NotInstalled => Err(NOT_INSTALLED),
+        HerdrProbeOut::Ran(None) => Err(NO_SERVER),
+        HerdrProbeOut::Ran(Some(out)) if !out.success => Err(NO_SERVER),
+        HerdrProbeOut::Ran(Some(out)) => {
+            crate::herdr::parse_pane_list(&out.stdout).ok_or(NO_SERVER)
+        }
+    }
+}
+
+/// The agent session running in the `pane_id`'s own listing, from one bounded
+/// `pane list` probe. `None` when the pane has no session herdr could read by
+/// id, the pane is gone from the listing, or the probe failed: the follower
+/// then treats the pane as mod-less and pushes as base did (WP-8).
+#[cfg(unix)]
+pub(crate) fn pane_session_id(probe: &PaneProbe, pane_id: &str) -> Option<String> {
+    let panes = listed_panes_probe(probe).ok()?;
+    let pane = panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    pane.agent_session_id().map(str::to_owned)
+}
+
 /// The real probe: [`crate::herdr::resolved_bin`] + the daemon-scoped
 /// [`crate::herdr::daemon_bounded_output_deadline`] (session env stripped) at
 /// the call's own deadline.
@@ -181,7 +213,8 @@ pub(crate) struct PaneSession {
     kind: SessionKind,
     follows_chain: bool,
     isolated: bool,
-    /// The session's cwd, `null` when the row has none.
+    /// The dir the session runs in: its Claude Code record's `cwd`, else its
+    /// launch dir; `null` when neither names one.
     #[schema(required = true)]
     cwd: Option<String>,
 }
@@ -220,27 +253,14 @@ pub(crate) enum SessionKind {
 )]
 pub(crate) fn panes(ctx: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     let rows = crate::live_sessions::list();
-    let herdr_panes = match (ctx.herdr_probe)(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
-        HerdrProbeOut::NotInstalled => {
-            return Response::serialize(200, &absent_body(NOT_INSTALLED));
-        }
-        HerdrProbeOut::Ran(None) => {
-            return Response::serialize(200, &absent_body(NO_SERVER));
-        }
-        HerdrProbeOut::Ran(Some(out)) => {
-            if !out.success {
-                return Response::serialize(200, &absent_body(NO_SERVER));
-            }
-            match crate::herdr::parse_pane_list(&out.stdout) {
-                None => return Response::serialize(200, &absent_body(NO_SERVER)),
-                Some(panes) => panes,
-            }
-        }
+    let herdr_panes = match listed_panes(ctx) {
+        Ok(panes) => panes,
+        Err(reason) => return Response::serialize(200, &absent_body(reason)),
     };
     let rows = newest_per_pid(&rows);
     let mut panes = Vec::with_capacity(herdr_panes.len());
     for pane in herdr_panes {
-        match process_info(ctx, &pane.pane_id) {
+        match process_info(&ctx.herdr_probe, &pane.pane_id) {
             Some(info) => panes.push(join_pane(pane, info, &rows)),
             None => panes.push(pane_entry(pane, None, Vec::new())),
         }
@@ -271,9 +291,14 @@ fn absent_body(reason: &str) -> PanesBody {
 
 /// Newest row wins per pid: a recycled pid can match a stale row and a live one
 /// at once, and the dead row's profile must not show as a ghost session.
-fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
+pub(crate) fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
     let mut newest: HashMap<u32, &LiveSession> = HashMap::new();
-    for row in rows {
+    // The daemon's own background hold carries the DAEMON's pid: a daemon
+    // running in a foreground herdr pane would otherwise be joined as that
+    // pane's Claude session (wrong account on the row and in the push). The
+    // hold is not a pane's process. A launcher's background row has no hold
+    // flag and still joins — it IS a `tollgate start`.
+    for row in rows.iter().filter(|row| !row.background_hold) {
         match newest.entry(row.pid) {
             Entry::Occupied(mut slot) => {
                 if row.started_at > slot.get().started_at {
@@ -288,9 +313,27 @@ fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
     newest.into_values().collect()
 }
 
+/// The profile the tollgate session leading `pane_id` spends, by the same pid
+/// join this route answers with; `None` when herdr cannot say or no session
+/// leads the pane. What a blocked pane's push names as its account.
+pub(crate) fn pane_profile(probe: &PaneProbe, pane_id: &str) -> Option<String> {
+    let info = process_info(probe, pane_id)?;
+    let rows = crate::live_sessions::list();
+    pane_sessions(&info, &newest_per_pid(&rows))
+        .into_iter()
+        .find(|session| matches!(session.kind, SessionKind::Session))
+        .map(|session| session.profile)
+}
+
 fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneEntry {
+    let sessions = pane_sessions(&info, rows);
+    pane_entry(pane, info.foreground_process_group_id, sessions)
+}
+
+/// The tollgate sessions inside one pane, its own session first.
+fn pane_sessions(info: &ProcessInfo, rows: &[&LiveSession]) -> Vec<PaneSession> {
     let group_id = info.foreground_process_group_id;
-    let processes = info.foreground_processes;
+    let processes = &info.foreground_processes;
 
     let mut sessions = Vec::new();
     for row in rows {
@@ -320,10 +363,10 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
             kind,
             follows_chain: row.follows_chain,
             isolated: row.isolated,
-            cwd: row
-                .cwd
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+            cwd: crate::session_record::live_cwd(
+                row,
+                crate::session_record::live_record(row).as_ref(),
+            ),
         });
     }
     sessions.sort_by(|a, b| {
@@ -331,8 +374,7 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
             .cmp(&!matches!(&b.kind, SessionKind::Session))
             .then_with(|| a.session_id.as_str().cmp(b.session_id.as_str()))
     });
-
-    pane_entry(pane, group_id, sessions)
+    sessions
 }
 
 /// A listed member that is the pane's own session under a wrapper: a `tollgate`
@@ -353,6 +395,7 @@ fn is_tollgate_session(entry: &ProcessEntry) -> bool {
 }
 
 fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>) -> PaneEntry {
+    let agent_session_id = pane.agent_session_id().map(str::to_owned);
     PaneEntry {
         pane_id: pane.pane_id,
         workspace_id: pane.workspace_id,
@@ -365,20 +408,16 @@ fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>
         tag: pane.tokens.and_then(|tokens| tokens.tollgate),
         foreground_process_group_id: group_id,
         sessions,
-        agent_session_id: pane
-            .agent_session
-            .as_ref()
-            .and_then(|session| session.session_id())
-            .map(str::to_owned),
+        agent_session_id,
     }
 }
 
 /// One pane's `process-info`, or `None` when the call failed to answer (the
 /// pane closed between the list and this call, say) or its stdout was not the
 /// envelope.
-fn process_info(ctx: &ApiContext, pane_id: &str) -> Option<ProcessInfo> {
+fn process_info(probe: &PaneProbe, pane_id: &str) -> Option<ProcessInfo> {
     let args = ["pane", "process-info", "--pane", pane_id];
-    let out = match (ctx.herdr_probe)(&args, crate::herdr::PROBE_TIMEOUT) {
+    let out = match probe(&args, crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled | HerdrProbeOut::Ran(None) => return None,
         HerdrProbeOut::Ran(Some(out)) => out,
     };

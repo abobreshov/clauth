@@ -266,6 +266,7 @@ fn codex_json_view(name: &str) -> serde_json::Value {
         "tier": serde_json::Value::Null,
         "oauth": serde_json::Value::Null,
         "active": active,
+        "tps": serde_json::Value::Null,
     })
 }
 
@@ -395,7 +396,10 @@ fn session_auth_for(
 /// `cwd_is_real_home` shape); a side that cannot resolve falls back to the
 /// plain compare.
 fn dir_is_claude_dir(dir: &Path, claude_dir: &Path) -> bool {
-    match (dir.canonicalize(), claude_dir.canonicalize()) {
+    match (
+        crate::canonical::identity(dir),
+        crate::canonical::identity(claude_dir),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => dir == claude_dir,
     }
@@ -680,6 +684,7 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved
         .and_then(|(name, _)| config.find(&crate::profile::ProfileName::from(name.clone())));
+    let profile_name = resolved.map(|(name, _)| name.as_str());
     serde_json::json!({
         "profile": profile.map(|p| &p.name),
         "source": resolved.map(|(_, s)| s.as_str()),
@@ -687,6 +692,48 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
         "tier": profile.and_then(tier_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),
+        "tps": tps_view(profile_name),
+    })
+}
+
+/// The `--json` tps field for the resolved profile, read from the producer's
+/// cache only (no self-tail): `null` with no cache or one older than
+/// [`crate::tps::STALE_AFTER_MS`]. `speed`/`rate` are the profile's live
+/// figures; `session` is the current Claude Code session's live figures when
+/// `CLAUDE_CODE_SESSION_ID` names one in the cache; `peaks.today` is the
+/// profile's own today peaks from the cache's `peaks.today.accounts`.
+fn tps_view(profile: Option<&str>) -> serde_json::Value {
+    tps_view_at(profile, crate::usage::now_ms())
+}
+
+/// [`tps_view`] with the clock fixed, so tests can pin the staleness edge.
+fn tps_view_at(profile: Option<&str>, now_ms: u64) -> serde_json::Value {
+    let Some(snap) = crate::tps::load_cache() else {
+        return serde_json::Value::Null;
+    };
+    let Some(age_ms) = snap.age_ms(now_ms) else {
+        return serde_json::Value::Null;
+    };
+    if age_ms > crate::tps::STALE_AFTER_MS {
+        return serde_json::Value::Null;
+    }
+    let figures = profile.and_then(|name| snap.accounts.get(name));
+    let peaks = profile.and_then(|name| snap.peaks.today.accounts.get(name));
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .and_then(|sid| snap.sessions.get(&sid))
+        .map(|s| {
+            serde_json::json!({
+                "speed": s.figures.live.speed,
+                "rate": s.figures.live.rate,
+            })
+        });
+    serde_json::json!({
+        "speed": figures.and_then(|f| f.live.speed),
+        "rate": figures.map_or(0.0, |f| f.live.rate),
+        "session": session,
+        "peaks": serde_json::json!({"today": peaks.cloned().unwrap_or_default()}),
+        "age_secs": age_ms / 1000,
     })
 }
 

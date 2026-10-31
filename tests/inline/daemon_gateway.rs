@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway supervisor: the slot's closed state set, the record-only slot a
 //! body builds without a supervisor, and the state machine stepped by hand
 //! with an injected clock over a stub `shunt` in a `HomeSandbox`. The stub is
@@ -19,7 +19,6 @@ use super::*;
 use crate::gateway::GatewayRecord;
 use crate::testutil::HomeSandbox;
 
-#[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
 mod stub;
 
@@ -398,6 +397,27 @@ fn without_a_supervisor_the_slot_reads_the_record_alone() {
     );
 }
 
+/// The slot's `config` (the `status.json` bytes the `shunt` card reads) names
+/// the plain path, never the `\\?\C:\…` verbatim form Windows canonicalizes
+/// to.
+#[test]
+fn the_slot_names_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    fs::create_dir_all(&dir).expect("etc");
+    let config = dir.join("shunt.toml");
+    fs::write(&config, "[server]\n").expect("config");
+    let record = GatewayRecord::new(config.clone()).expect("adoptable");
+    GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    let plain = crate::testutil::plain_path(&config);
+
+    assert_eq!(unsupervised_slot().config.as_deref(), plain.to_str());
+}
+
 /// The gateway's log stays under the daemon's size cap on the supervisor's
 /// own cadence: a step trims an oversized `gateway.log` in place to its last
 /// whole lines within 1 MiB.
@@ -504,10 +524,11 @@ impl Rig {
     fn arm_check_stub(&self) {
         let script = format!(
             "#!/bin/sh\n\
+             {record}\n\
              d='{d}'\n\
              if [ \"$1\" = \"check\" ]; then\n\
              \x20 echo check >> \"$d/checks\"\n\
-             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; record_start $$ \"$d/check-slow-pid.start\"; exec sleep 60; fi\n\
              \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
              \x20 exit 0\n\
              fi\n\
@@ -534,6 +555,7 @@ impl Rig {
              \x20 wait $!\n\
              \x20 i=$((i + 1))\n\
              done\n",
+            record = crate::testutil::RECORD_START_SH,
             d = self.dir.display(),
         );
         fs::write(&self.binary, script).expect("arm the check stub");
@@ -624,18 +646,6 @@ impl std::ops::DerefMut for Supervised {
 impl Drop for Supervised {
     fn drop(&mut self) {
         self.0.kill_for_test();
-    }
-}
-
-/// A process the test owns outright, killed and reaped at the end.
-#[cfg(unix)]
-struct Owned(Child);
-
-#[cfg(unix)]
-impl Drop for Owned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -1228,7 +1238,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
     before.step(t0);
     rig.server.wait_serving(true);
     // The daemon dies hard: its gateway and marker stay behind.
-    let mut orphan = Owned(before.abandon().expect("a running gateway"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("a running gateway"));
     let orphan_pid = orphan.0.id();
 
     let mut after = rig.supervisor();
@@ -1262,7 +1272,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
 #[test]
 fn a_recorded_pid_whose_start_differs_is_never_signalled() {
     let rig = Rig::new("0.49.1");
-    let mut stranger = Owned(
+    let mut stranger = crate::testutil::Owned(
         Command::new(&rig.binary)
             .args(["run", "--config", "stranger.toml"])
             .stdout(std::process::Stdio::null())
@@ -1320,13 +1330,15 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     // Its record is written once its SIGTERM trap is set.
     rig.only_call();
     rig.server.wait_serving(true);
-    before.shutdown(Instant::now());
+    // The still-stopping line is unasserted; the marker read below is the
+    // begin_stop deadline marker, which stays for the draining child.
+    let _ = before.shutdown(Instant::now());
     stub::wait_until("the stub records its SIGTERM", secs(10), || {
         !stub::terms(&rig.dir).is_empty()
     });
     let recorded = read_marker().expect("read").expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
-    let mut orphan = Owned(before.abandon().expect("still running"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("still running"));
 
     let mut after = rig.supervisor();
     let early = Tick {
@@ -1513,7 +1525,8 @@ fn a_shutdown_during_an_underway_stop_sends_no_second_sigterm() {
         !stub::terms(&rig.dir).is_empty()
     });
 
-    supervisor.shutdown(Instant::now());
+    // The still-stopping line is unasserted here.
+    let _ = supervisor.shutdown(Instant::now());
     assert_eq!(
         stub::terms(&rig.dir),
         [pid],
@@ -1955,7 +1968,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     );
 
     // A process of this test's own making that is not the stub: a sleep.
-    let mut sleeper = Owned(
+    let mut sleeper = crate::testutil::Owned(
         Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1969,7 +1982,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     // One whose command line holds the stub's path inside another word: the
     // stub is an argv word, never a substring of the line.
     let lookalike_arg0 = format!("{}.old", rig.binary.display());
-    let mut lookalike = Owned(
+    let mut lookalike = crate::testutil::Owned(
         Command::new("sleep")
             .arg0(&lookalike_arg0)
             .arg("30")
@@ -2074,6 +2087,303 @@ fn a_supervisor_that_panics_is_logged_as_a_panic() {
         ],
         "the panic is logged as a panic, and nothing else is"
     );
+}
+
+// ── a stopping daemon and the token spend in flight ─────────────────────────
+
+/// A stopping daemon refuses every token spend that has not started, then
+/// returns from its stop only once the spend already in flight has saved, so
+/// the exit after it never lands between the token answer and the save.
+#[cfg(unix)]
+#[test]
+fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let saved = Arc::new(AtomicBool::new(false));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let spender = {
+        let activity = Arc::clone(&activity);
+        let shutting_down = Arc::clone(&shutting_down);
+        let saved = Arc::clone(&saved);
+        std::thread::spawn(move || {
+            let name = crate::profile::ProfileName::from("mid-spend");
+            let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                &activity,
+                &name,
+                &shutting_down,
+            )
+            .expect("an unset flag admits the spend");
+            claimed_tx.send(()).expect("the test waits for the claim");
+            std::thread::sleep(Duration::from_millis(400));
+            saved.store(true, Ordering::SeqCst);
+            drop(claim);
+        })
+    };
+    claimed_rx.recv().expect("the spender claimed");
+
+    stop_for_exit(&spends, None, None);
+
+    assert!(
+        saved.load(Ordering::SeqCst),
+        "the stop returned before the spend in flight saved"
+    );
+    assert!(
+        shutting_down.load(Ordering::SeqCst),
+        "the stop raised the scheduler's shutdown flag"
+    );
+    let late = crate::profile::ProfileName::from("late");
+    assert!(
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
+            .is_none(),
+        "a spend starting after the stop signal is refused"
+    );
+    spender.join().expect("the spender ran to its save");
+}
+
+/// The drain is bounded: a spend that never ends holds a stopping daemon for
+/// the bound it was given, then the stop goes on.
+#[cfg(unix)]
+#[test]
+fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let name = crate::profile::ProfileName::from("stuck-spend");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, &shutting_down)
+            .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+
+    let started = std::time::Instant::now();
+    let cleared = spends.drain(Duration::from_millis(300));
+    let waited = started.elapsed();
+
+    assert!(
+        !cleared,
+        "a spend still in flight at the bound reads as not cleared"
+    );
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "the drain waits its bound and no longer: {waited:?}"
+    );
+    drop(held);
+}
+
+/// With nothing in flight the drain returns at once, so a stop with no spend
+/// running exits as fast as it always did.
+#[cfg(unix)]
+#[test]
+fn a_stop_with_no_token_spend_does_not_wait() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let spends = crate::daemon::SpendDrain::new(activity, Arc::new(AtomicBool::new(false)));
+
+    let started = std::time::Instant::now();
+    assert!(
+        spends.drain(Duration::from_secs(20)),
+        "nothing in flight reads as cleared"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an idle drain does not wait: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The drain refuses new spends from its first moment, not after its wait: a
+/// spend that tries to start while the drain still waits on an earlier one is
+/// refused, so it can never be the one the exit cuts mid-save.
+#[cfg(unix)]
+#[test]
+fn a_spend_starting_while_the_drain_waits_is_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let first = crate::profile::ProfileName::from("first");
+    let held =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &first, &shutting_down)
+            .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let drainer = std::thread::spawn(move || spends.drain(Duration::from_secs(5)));
+    // Wait until the drain has actually raised the flag, not a fixed sleep: a
+    // stalled runner that outlives the sleep would admit the late claim on
+    // correct code.
+    let raised_by = std::time::Instant::now() + Duration::from_secs(2);
+    while !shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < raised_by
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let late = crate::profile::ProfileName::from("late");
+    let refused =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
+            .is_none();
+    drop(held);
+    let cleared = drainer.join().expect("the drain returns");
+
+    assert!(refused, "a spend starting mid-drain is refused");
+    assert!(cleared, "the drain clears once the earlier spend saves");
+}
+
+// ── a stop's deferred writes (upstream f0cca294 / 58b34a80, gateway half) ──
+
+/// The rig's supervisor thread under a claimed singleton, once it publishes a
+/// healthy gateway, with that gateway's pid. The lock is returned so the test
+/// holds the singleton for as long as the thread runs.
+#[cfg(unix)]
+fn healthy_thread(rig: &Rig) -> (DaemonLock, SupervisorThread, u32) {
+    let dir = tollgate_dir().expect("dir");
+    let super::super::probe::Claim::Active(singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    let thread = start(Arc::clone(&rig.handle), &singleton).expect("start");
+    stub::wait_until("the thread publishes a healthy gateway", secs(15), || {
+        published(&rig.handle).is_some_and(|slot| slot.state == GatewayState::Healthy)
+    });
+    let pid = rig.only_call().pid;
+    (singleton, thread, pid)
+}
+
+/// The missed-budget lines `SupervisorThread::shutdown` logged on this thread.
+#[cfg(unix)]
+fn missed_budget_lines(rig: &Rig) -> Vec<String> {
+    rig.lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("did not stop within the"))
+        .collect()
+}
+
+/// A stop whose gateway outlives its deadline answers before it writes: a
+/// stderr stalled at the "still stopping" line neither reads as a missed
+/// budget nor logs one. The stall (2 s) is more than twice the answer wait
+/// (the 300 ms budget plus the 500 ms answer grace): a stall before the answer
+/// would answer 1.5 s past the wait, while the deferred write answers at the
+/// deadline wake, inside the grace.
+#[cfg(unix)]
+#[test]
+fn a_write_stall_after_the_deadline_is_never_a_missed_budget() {
+    let rig = Rig::new("0.49.1");
+    rig.touch("ignore-term");
+    let (_singleton, thread, pid) = healthy_thread(&rig);
+    let _stall = probe_seam::stall_stop_writes("tollgate-gateway", secs(2));
+
+    let answered = thread.shutdown(Duration::from_millis(300));
+    stub::signal(pid, "KILL");
+    rig.server.wait_serving(false);
+
+    assert!(
+        answered,
+        "a write stalled after the deadline is not a stuck thread"
+    );
+    assert_eq!(missed_budget_lines(&rig), Vec::<String>::new());
+}
+
+/// A stop whose gateway exits inside its budget answers before it logs the
+/// exit and removes the marker, so a stall at those writes never reads as a
+/// missed budget; the join still waits the writes out, so the marker is gone
+/// once `shutdown` returns. The stall (5 s) is twice the answer wait (the 2 s
+/// budget plus the 500 ms grace).
+#[cfg(unix)]
+#[test]
+fn a_write_stall_after_the_gateway_exits_is_never_a_missed_budget() {
+    let rig = Rig::new("0.49.1");
+    let (_singleton, thread, pid) = healthy_thread(&rig);
+    let _stall = probe_seam::stall_stop_writes("tollgate-gateway", secs(5));
+
+    let answered = thread.shutdown(secs(2));
+
+    assert!(
+        answered,
+        "a write stalled after the exit is not a stuck thread"
+    );
+    assert_eq!(missed_budget_lines(&rig), Vec::<String>::new());
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [pid],
+        "one SIGTERM, and it ended the gateway"
+    );
+    assert_eq!(
+        read_marker().expect("read"),
+        None,
+        "the deferred marker removal ran before the join returned"
+    );
+    rig.server.wait_serving(false);
+}
+
+/// The clamp a stop applies to its last sleep, pinned two ways: by equality
+/// on hand-computed inputs through the pure [`stop_sleep`], then through the
+/// real loop, whose one sleep line sleeps `stop_poll`'s output: the seam
+/// records each `(remaining, request)` pair without sleeping, so the pin holds
+/// at any dispatch latency, and a call site that sleeps the poll regardless
+/// records nothing. The 2030 ms budget (40 polls plus a 30 ms remainder) keeps
+/// the loop sleeping at least once on a loaded box.
+#[cfg(unix)]
+#[test]
+fn the_stop_wait_clamps_its_last_sleep_to_the_deadline() {
+    let ms = Duration::from_millis;
+    assert_eq!(stop_sleep(ms(30)), ms(30));
+    assert_eq!(stop_sleep(ms(50)), ms(50));
+    assert_eq!(stop_sleep(ms(80)), ms(50));
+    assert_eq!(stop_sleep(Duration::ZERO), Duration::ZERO);
+
+    let rig = Rig::new("0.49.1");
+    rig.touch("ignore-term");
+    let (_singleton, thread, pid) = healthy_thread(&rig);
+    let _arm = probe_seam::arm_stop_sleeps("tollgate-gateway");
+
+    let answered = thread.shutdown(ms(2030));
+    stub::signal(pid, "KILL");
+    rig.server.wait_serving(false);
+
+    assert!(answered, "the stop answers");
+    let sleeps = probe_seam::stop_sleeps();
+    assert!(
+        !sleeps.is_empty()
+            && sleeps
+                .iter()
+                .all(|(remaining, request)| *request <= *remaining),
+        "the loop slept through the clamp, each sleep inside its remaining time: {sleeps:?}"
+    );
+}
+
+/// A stalled stderr at the "stopping" line never delays the SIGTERM: the stop
+/// sends its one SIGTERM (and writes the deadline marker) before that line.
+/// The 3 s wait is half the 6 s stall, so the old order (line first) misses it
+/// by 3 s, and the 12 s budget, twice the stall, still answers.
+#[cfg(unix)]
+#[test]
+fn the_stopping_line_write_never_delays_the_sigterm() {
+    let rig = Rig::new("0.49.1");
+    let (_singleton, thread, pid) = healthy_thread(&rig);
+    let _stall = probe_seam::stall_begin_stop("tollgate-gateway", secs(6));
+
+    let answered = std::thread::scope(|scope| {
+        let shutdown = scope.spawn(move || thread.shutdown(secs(12)));
+        stub::wait_until(
+            "the stub records its SIGTERM before the stop line stall ends",
+            secs(3),
+            || !stub::terms(&rig.dir).is_empty(),
+        );
+        shutdown.join().expect("the stop's caller joins")
+    });
+
+    assert!(answered, "the stop answers");
+    assert_eq!(stub::terms(&rig.dir), [pid], "exactly one SIGTERM");
+    rig.server.wait_serving(false);
 }
 
 /// Writes `changed` over the rig's config and drives one restart: the child

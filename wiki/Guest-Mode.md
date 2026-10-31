@@ -47,7 +47,7 @@ Every other key is left alone: `clauth@clauth`, `mcpServers.clauth`, upstream's 
 
 Run the plugin install from a shell outside Claude Code. With `CLAUDE_CONFIG_DIR` set, `claude plugin` would write that session's config, not `~/.claude`, so the install refuses and says why.
 
-Because the plugin now sits in the shared `~/.claude`, upstream's Claude Code sessions load it too. Its hooks (`tollgate self-heal`, `tollgate hook-profile-changed-note`) do nothing in any session whose `CLAUDE_CONFIG_DIR` is not under `~/.tollgate`, so upstream's sessions get no tollgate notes. The plugin's MCP server, and a wired `mcpServers.tollgate`, do show tollgate's tools in those sessions.
+Because the plugin now sits in the shared `~/.claude`, upstream's Claude Code sessions load it too. Its hooks (`tollgate self-heal`, `tollgate hook-profile-changed-note`) do nothing in any session whose `CLAUDE_CONFIG_DIR` is not under `~/.tollgate`, so upstream's sessions get no tollgate notes. Its hooks module, `register.ts`, stands down in those sessions too ([below](#the-bridge-and-the-plugins-module)). The plugin's MCP server, and a wired `mcpServers.tollgate`, do show tollgate's tools in those sessions.
 
 ## What is refused
 
@@ -82,6 +82,15 @@ Background work that would write a global file stands down without an error:
 - `settings.json` and `~/.claude.json` are not synced: each runtime's copy is seeded from your operator file at start and belongs to its session after that; nothing is written back, and runtime copies do not sync with each other
 - a session runtime gets a private copy of `~/.claude/plugins` at start (in both link modes), keeps its transcripts in `~/.tollgate/guest-claude/projects` instead of `~/.claude/projects` (`tollgate resume` seeds the named transcript there), and gets copies instead of links of the `~/.codex` entries it would otherwise share
 
+## The bridge and the plugin's module
+
+The Claude Code plugin's hooks module, `register.ts`, talks to the daemon over `~/.tollgate/bridge.sock`, which `tollgate daemon --listen` serves, so a paired phone can follow a session and answer its asks ([Claude Code plugin](Claude-Code-Plugin#answering-a-session-from-your-phone)). The plugin sits in the shared `~/.claude`, so upstream's sessions and bare `claude` sessions load the module too. In guest mode tollgate keeps a phone out of them:
+
+- **The module stands down outside tollgate's sessions.** At session start it checks for `~/.clauth` and for a completed import in `~/.tollgate/import-journal.json`. In guest mode, in a session whose `CLAUDE_CONFIG_DIR` is not under `~/.tollgate`, it goes inert before it names the socket: it posts nothing to the bridge, starts no poll loop (so no prompt or interrupt reaches it), holds no permission check or question for a phone, and does not spawn `tollgate hook-profile-changed-note`. A `tollgate start` session keeps the module working.
+- **The daemon refuses an unknown peer.** The bridge places each peer through its process's `live_sessions` row, one per session tollgate launched. In guest mode a peer that joins no row is taken for one of upstream's sessions, and the bridge answers it `403 unknown_peer` instead of reading its session record under `~/.claude`. That also covers a module whose stand-down check could not run.
+- **A phone's terminal attach yields the pane.** A control-tier device's attach to `GET /api/v1/panes/<id>/stream` goes without `--takeover`, so it displaces no current controller. Upstream's daemon drives the same herdr panes, and phones paired to each daemon would otherwise knock each other off a pane ([Daemon](Daemon)).
+- **The herdr paths stay open, on purpose.** `POST /api/v1/panes/<id>/prompt` and `POST /api/v1/panes/<id>/keys`, and the herdr fallback that `POST /api/v1/sessions/<id>/prompt` and `/interrupt` use when no module holds the session, are not guest-gated. A control-tier device paired with tollgate can therefore type into a session upstream runs in a herdr pane, as it can into any herdr pane.
+
 ## What holds whether or not guest mode is on
 
 These keep the two tools apart on any machine where both are installed:
@@ -99,5 +108,6 @@ These keep the two tools apart on any machine where both are installed:
 - An isolated guest session's transcripts are still rescued into `~/.claude/projects` at teardown, and `tollgate sessions` / `resume` list only `~/.claude/projects`, not the guest store.
 - A `~/.claude/.credentials.json` or `~/.codex/auth.json` link into a tollgate store made before guest mode is left in place, since removing it would write upstream's tree. With rotation off, tollgate no longer updates the store behind it.
 - `tollgate list` and `tollgate status --json` print each profile's `base_url` unredacted. `usage --json` and the local agent API redact endpoints.
+- The daemon's herdr pane routes and its session-keyed herdr fallback are not guest-gated, so a control-tier device paired with tollgate can reach a session upstream runs in herdr ([above](#the-bridge-and-the-plugins-module)).
 
 Handing the global files from upstream to tollgate is [the import](Import); its design is in [the import spec](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/specs/import-clauth.md) and [the plan](https://github.com/abobreshov/clauth/blob/feat/tollgate/docs/multi-provider-redesign-plan.md), section 4.0.

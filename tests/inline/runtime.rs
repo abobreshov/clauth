@@ -1,13 +1,52 @@
 #![allow(unsafe_code)]
+#![allow(clippy::disallowed_methods)]
 use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
-use crate::testutil::{HomeSandbox, hold_rotation_lock, set_mtime};
+use crate::live_sessions::Launcher;
+use crate::testutil::{
+    HomeSandbox, hold_rotation_lock, respawn_flags_naming, set_mtime, write_claude_job,
+    write_claude_job_flags, write_claude_job_in,
+};
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
 const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2","expiresAt":2000}}"#;
+
+/// `starting` sets the delegate mark from the launcher at registration, so a
+/// `tollgate start` row reads own and a delegate-spawn row reads a delegate —
+/// the carry that keeps a delegate from being tallied as own before its mark
+/// lands. The launcher is a typed value, never a bare bool that could swap
+/// places with `follows_chain` and mark every start row a delegate.
+#[test]
+fn starting_marks_only_a_delegate_row() {
+    let own = crate::live_sessions::LiveSession::starting(
+        &SessionId::for_test("4242-0"),
+        "work",
+        crate::harness::Harness::Claude,
+        false,
+        false,
+        Launcher::Own,
+        None,
+        None,
+    );
+    assert!(!own.is_delegate, "a tollgate start row is own");
+    let delegate = crate::live_sessions::LiveSession::starting(
+        &SessionId::for_test("4242-1"),
+        "work",
+        crate::harness::Harness::Claude,
+        false,
+        false,
+        Launcher::Delegate,
+        None,
+        None,
+    );
+    assert!(
+        delegate.is_delegate,
+        "a delegate row is marked at registration"
+    );
+}
 
 #[test]
 fn sync_no_op_when_link_missing() {
@@ -406,10 +445,13 @@ fn pose_dir_link(link: &Path, target: &Path) {
     std::os::unix::fs::symlink(target, link).expect("symlink dir");
     #[cfg(windows)]
     {
+        // cmd reads a `/` inside an argument as a switch, so mklink gets each
+        // path rebuilt in native separators whatever spelling the caller joined.
+        let native = |p: &Path| p.components().collect::<std::path::PathBuf>();
         let out = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(native(link))
+            .arg(native(target))
             .output()
             .expect("spawn `cmd /C mklink /J`");
         assert!(
@@ -432,6 +474,19 @@ fn pose_dir_link(link: &Path, target: &Path) {
          symlink_metadata, which is the misclassification under test",
         link.display()
     );
+}
+
+/// A linked entry is written through to its target, and that target path
+/// reaches `copy_file`'s error text: it is the plain spelling, never std's
+/// `\\?\` verbatim form on Windows.
+#[test]
+fn a_linked_write_target_is_its_target_in_plain_spelling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    fs::create_dir_all(&target).expect("target dir");
+    let link = tmp.path().join("link");
+    pose_dir_link(&link, &target);
+    assert_eq!(write_target(&link), crate::testutil::plain_path(&target));
 }
 
 /// A directory LINK in `~/.claude` (a skill linked at a plugin dir) must recurse
@@ -584,6 +639,87 @@ fn mirror_tree_propagates_runtime_edit_to_canonical() {
         fs::read(claude.join("todos.json")).expect("read canonical"),
         br#"[{"id":1}]"#
     );
+}
+
+/// T33b1 r4 F4 (cloudy 2026-10-22): on a copy host the mirror never carries
+/// `jobs/` either way — a tree's copy of a `claude rm`ed job would otherwise be
+/// published straight back into the store, and a store job copied into a tree
+/// would come back from it. Control: an ordinary file still crosses both ways.
+#[test]
+fn mirror_tree_never_carries_the_job_store_either_way() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(claude.join("jobs").join("aaaa0001")).expect("mkdir store job");
+    fs::write(
+        claude.join("jobs").join("aaaa0001").join("state.json"),
+        b"{}",
+    )
+    .expect("store job");
+    fs::create_dir_all(runtime.join("jobs").join("bbbb0002")).expect("mkdir tree job");
+    fs::write(
+        runtime.join("jobs").join("bbbb0002").join("state.json"),
+        b"{}",
+    )
+    .expect("tree job");
+    fs::write(claude.join("todos.json"), b"[]").expect("canonical control");
+    fs::write(runtime.join("notes.json"), b"[]").expect("runtime control");
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert!(
+        !claude.join("jobs").join("bbbb0002").exists(),
+        "a tree's job was published into the store"
+    );
+    assert!(
+        !runtime.join("jobs").join("aaaa0001").exists(),
+        "a store job was copied into the tree"
+    );
+    assert!(
+        runtime.join("todos.json").is_file() && claude.join("notes.json").is_file(),
+        "control: an ordinary file crosses both ways"
+    );
+}
+
+/// The build half of F4: a copy-host shared build never copies `jobs/` into the
+/// tree. Control: a sibling entry still arrives.
+#[test]
+fn a_copy_host_build_brings_no_job_store_into_the_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("jobs").join("aaaa0001")).expect("mkdir job");
+        fs::write(
+            claude_home.join("jobs").join("aaaa0001").join("state.json"),
+            b"{}",
+        )
+        .expect("job");
+        fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+        fs::write(claude_home.join("plugins").join("p.json"), b"{}").expect("plugin");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("copyhostjobs");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(
+            runtime.join("jobs").symlink_metadata().is_err(),
+            "the copy-host tree carries no job store"
+        );
+        assert!(
+            runtime.join("plugins").join("p.json").is_file(),
+            "control: the walk still copied a sibling entry"
+        );
+    });
 }
 
 #[test]
@@ -1815,16 +1951,24 @@ fn link_mode_of_reads_the_transport_off_the_existing_tree() {
 /// Redirect `home_dir()` into `root` for the duration of `f`, serialized on
 /// `profile::HOME_TEST_LOCK`. Uses the process-global `HOME_OVERRIDE` rather
 /// than `$HOME` so resolution matches on Windows too, where `dirs::home_dir()`
-/// reads `USERPROFILE`, not `HOME`. The override is cleared on drop so a
-/// panicking test can't leak it into the next test.
+/// reads `USERPROFILE`, not `HOME`. The home override is cleared on drop so a
+/// panicking test can't leak it into the next test; the process-wide lock
+/// timeout override is cleared on entry and on drop the same way `HomeSandbox`
+/// does, so a test that panicked mid-override cannot leak a shortened lock
+/// deadline into every later `with_fake_home` test.
 fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     let _lock = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A prior test that panicked mid-override leaks it into this one: clear it
+    // here (and on drop) so a later test never inherits a shortened lock
+    // deadline it did not set.
+    crate::lock::set_state_lock_timeout_override(None);
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {
             crate::profile::clear_home_override();
+            crate::lock::set_state_lock_timeout_override(None);
         }
     }
     crate::profile::set_home_override(root.to_path_buf());
@@ -2459,6 +2603,1423 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
+/// A shared tree always reaches Claude Code's ONE job store. CC writes a
+/// background job's record under `$CLAUDE_CONFIG_DIR/jobs/`, so a box that never
+/// ran one has no `~/.claude/jobs` for the build's walk to link — the record
+/// would land inside the tree, where the store never names it and the next
+/// teardown collects the tree under its own job.
+#[test]
+fn a_shared_tree_links_jobs_into_the_one_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared tree's jobs link") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "the fixture starts on a box that never wrote a job"
+        );
+        let profile = configured_profile("jobslink");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+
+        let store = claude_home.join("jobs");
+        assert!(store.is_dir(), "the store is created before the walk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store)
+                    .expect("store meta")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the store lands owner-only like every other tollgate write"
+            );
+        }
+        assert_eq!(
+            fs::canonicalize(rt.config_dir().join("jobs")).expect("resolve the tree's link"),
+            fs::canonicalize(&store).expect("resolve the store"),
+            "the per-session tree reaches the one store"
+        );
+        drop(rt);
+    });
+}
+
+/// A shared tree links `projects` even on a box with no `~/.claude/projects`
+/// yet — the store is created before the walk, so the tree reaches the one
+/// transcript store the session index reads.
+#[test]
+fn a_shared_tree_links_projects_on_a_box_without_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared tree's projects link") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("projects").exists(),
+            "the fixture starts on a box that never wrote a transcript"
+        );
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("projectslink");
+        let canonical = tmp.path().join("creds.json");
+
+        let notes = build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(
+            notes.is_empty(),
+            "a store created successfully raises no note, got: {notes:?}"
+        );
+
+        let store = claude_home.join("projects");
+        assert!(store.is_dir(), "the store is created before the walk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store)
+                    .expect("store meta")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the store lands owner-only like every other tollgate write"
+            );
+        }
+        assert_eq!(
+            fs::canonicalize(runtime.join("projects")).expect("resolve the tree's link"),
+            fs::canonicalize(&store).expect("resolve the store"),
+            "the per-session tree reaches the one store"
+        );
+    });
+}
+
+/// An isolated Real tree links neither `jobs` nor `projects`, and creates
+/// neither store. The shared-only gate is what keeps an isolated session's CC
+/// (empty settings → default 30-day cleanupPeriodDays) from cleaning the user's
+/// transcripts through a linked `projects`, and its `--bg` records from naming
+/// a store that never sees them.
+#[test]
+fn an_isolated_tree_links_no_stores_on_a_box_without_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "an isolated tree's store boundary") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "the fixture starts without a jobs store"
+        );
+        assert!(
+            !claude_home.join("projects").exists(),
+            "the fixture starts without a projects store"
+        );
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("isolatedstores");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Isolated,
+        )
+        .expect("build");
+
+        assert!(
+            !runtime.join("jobs").exists(),
+            "an isolated tree links no jobs store"
+        );
+        assert!(
+            !runtime.join("projects").exists(),
+            "an isolated tree links no projects store"
+        );
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "an isolated build creates no jobs store"
+        );
+        assert!(
+            !claude_home.join("projects").exists(),
+            "an isolated build creates no projects store"
+        );
+    });
+}
+
+/// A store entry that is not a usable dir — a dangling `projects` symlink (a
+/// target moved aside or an unmounted disk), a regular `jobs` file — is left
+/// to the walk, never a refused start: one moved-aside `~/.claude` target must
+/// not take down every acquire.
+#[cfg(unix)]
+#[test]
+fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared build's unusable store skip") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        std::os::unix::fs::symlink("gone-projects", claude_home.join("projects"))
+            .expect("dangling projects symlink");
+        fs::write(claude_home.join("jobs"), b"not a dir").expect("regular jobs file");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("badstores");
+        let canonical = tmp.path().join("creds.json");
+
+        let notes = build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a store that is not a usable dir skips, never fails the build");
+
+        assert!(
+            notes.is_empty(),
+            "an unusable store skip raises no note, got: {notes:?}"
+        );
+
+        assert!(
+            claude_home
+                .join("projects")
+                .symlink_metadata()
+                .expect("projects meta")
+                .file_type()
+                .is_symlink(),
+            "the dangling projects symlink stays a symlink, never a created dir"
+        );
+        assert!(
+            claude_home.join("jobs").is_file(),
+            "the regular jobs file stays a file, never a created dir"
+        );
+        assert!(
+            !runtime.join("projects").is_dir(),
+            "the tree gets no usable projects store"
+        );
+        assert!(
+            !runtime.join("jobs").is_dir(),
+            "the tree gets no usable jobs store"
+        );
+        // On a linking host the walk links an unusable entry as it stands,
+        // `jobs` included: only a copy-host tree skips `jobs` outright.
+        assert_eq!(
+            fs::read_link(runtime.join("jobs")).expect("the tree links the jobs entry"),
+            claude_home.join("jobs"),
+            "the tree's jobs links the unusable entry as it stands"
+        );
+    });
+}
+
+/// Claude Code keys a background supervisor's socket on
+/// its config dir but keeps its roster in whatever `daemon/` resolves to, so a
+/// tree linking `daemon -> ~/.claude/daemon` makes every tree's supervisor share
+/// one roster and adopt the others' sessions (measured: the second of two
+/// concurrent launches lost its session). A shared build, on either transport,
+/// therefore never links or copies `daemon` — nor the lock/status/log the
+/// supervisor keys on its config dir; the tree's own supervisor makes a
+/// private one. Control: a sibling entry (`plugins`) still reaches the tree.
+#[test]
+fn a_shared_build_never_brings_the_daemon_dir_into_the_tree() {
+    for mode in [LinkMode::Real, LinkMode::Fake] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            if mode == LinkMode::Real && !host_poses(tmp.path(), "a linked shared build") {
+                return;
+            }
+            let claude_home = fake_claude_home(tmp.path());
+            fs::create_dir_all(claude_home.join("daemon")).expect("mkdir daemon");
+            fs::write(claude_home.join("daemon").join("roster.json"), b"{}").expect("roster");
+            fs::write(claude_home.join("daemon.json"), b"{}").expect("daemon.json");
+            fs::write(claude_home.join("daemon.lock"), b"{}").expect("daemon.lock");
+            fs::write(claude_home.join("daemon.status.json"), b"{}").expect("daemon.status.json");
+            fs::write(claude_home.join("daemon.log"), b"{}").expect("daemon.log");
+            fs::write(claude_home.join("daemon.scheduled.status.json"), b"{}")
+                .expect("daemon.scheduled.status.json");
+            fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+            fs::write(claude_home.join("plugins").join("p.json"), b"{}").expect("plugin");
+            let runtime = tmp.path().join("runtime");
+            fs::create_dir_all(&runtime).expect("mkdir runtime");
+            let profile = make_profile("nodaemonlink");
+            let canonical = tmp.path().join("creds.json");
+
+            build_runtime_dir(
+                &runtime,
+                &claude_home,
+                &profile,
+                &canonical,
+                mode,
+                Isolation::Shared,
+            )
+            .expect("build");
+
+            for name in [
+                "daemon",
+                "daemon.json",
+                "daemon.lock",
+                "daemon.status.json",
+                "daemon.log",
+                "daemon.scheduled.status.json",
+            ] {
+                assert!(
+                    runtime.join(name).symlink_metadata().is_err(),
+                    "{mode:?}: the tree carries no {name} entry"
+                );
+            }
+            assert!(
+                runtime.join("plugins").join("p.json").is_file(),
+                "{mode:?}: the walk still brought a sibling entry in"
+            );
+        });
+    }
+}
+
+/// the watchdog's bidirectional mirror must skip
+/// the supervisor's own state too — a tick must never copy the home
+/// `daemon`/lock/status/log into the tree nor the tree's back out, or the
+/// shared-roster bug survives on the copy transport.
+#[test]
+fn the_mirror_never_carries_the_daemon_state_either_way() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        for (home, tree) in [
+            (claude_home.join("daemon.json"), runtime.join("daemon.json")),
+            (claude_home.join("daemon.lock"), runtime.join("daemon.lock")),
+            (
+                claude_home.join("daemon.status.json"),
+                runtime.join("daemon.status.json"),
+            ),
+            (claude_home.join("daemon.log"), runtime.join("daemon.log")),
+            (
+                claude_home.join("daemon.scheduled.status.json"),
+                runtime.join("daemon.scheduled.status.json"),
+            ),
+        ] {
+            fs::write(&home, b"home").expect("seed home daemon state");
+            fs::write(&tree, b"tree").expect("seed tree daemon state");
+        }
+        fs::create_dir_all(claude_home.join("daemon")).expect("mkdir home daemon");
+        fs::write(claude_home.join("daemon").join("roster.json"), b"home").expect("home roster");
+        fs::create_dir_all(runtime.join("daemon")).expect("mkdir tree daemon");
+        fs::write(runtime.join("daemon").join("roster.json"), b"tree").expect("tree roster");
+
+        mirror_tree(&claude_home, &runtime).expect("mirror");
+
+        for name in [
+            "daemon.json",
+            "daemon.lock",
+            "daemon.status.json",
+            "daemon.log",
+            "daemon.scheduled.status.json",
+        ] {
+            assert_eq!(
+                fs::read_to_string(claude_home.join(name)).expect("home side"),
+                "home",
+                "the mirror never publishes the tree's {name} into ~/.claude"
+            );
+            assert_eq!(
+                fs::read_to_string(runtime.join(name)).expect("tree side"),
+                "tree",
+                "the mirror never copies ~/.claude's {name} into the tree"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(claude_home.join("daemon").join("roster.json"))
+                .expect("home roster"),
+            "home",
+            "the mirror never publishes the tree's roster into ~/.claude/daemon"
+        );
+        assert_eq!(
+            fs::read_to_string(runtime.join("daemon").join("roster.json")).expect("tree roster"),
+            "tree",
+            "the mirror never copies ~/.claude's roster into the tree's daemon/"
+        );
+    });
+}
+
+/// the GC re-check re-reads the job store — a job landing between
+/// the decide and removal holds spares the tree.
+#[test]
+fn gc_recheck_rereads_the_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        set_gc_recheck_hook(Some(Box::new(|runtime, _sessions| {
+            let home = crate::profile::home_dir().expect("home");
+            crate::testutil::write_claude_job(&home, "interposed", runtime);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+
+        assert!(runtime.exists(), "a job landing mid-sweep spares the tree");
+    });
+}
+
+/// the GC re-check re-reads the marker — a flock-held marker
+/// landing between the decide and removal holds spares the tree.
+#[test]
+fn gc_recheck_rereads_the_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        set_gc_recheck_hook(Some(Box::new(|_runtime, sessions| {
+            let file = open_pid_file(&sessions.join("777-0")).expect("open marker");
+            file.lock().expect("flock the marker");
+            gc_held_marker_set(file);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+        let _held = gc_held_marker_take();
+
+        assert!(
+            runtime.exists(),
+            "a marker landing mid-sweep spares the tree"
+        );
+    });
+}
+
+/// the GC re-check re-reads the lock file — a supervisor that appeared
+/// between the decide and removal holds (a fresh `daemon.lock` naming a live
+/// pid) spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gc_recheck_rereads_the_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        let sup = crate::testutil::FakeSupervisor::spawn(&runtime, false);
+        set_gc_recheck_hook(Some(Box::new(move |runtime, _sessions| {
+            crate::testutil::write_daemon_lock(runtime, sup.pid, &sup.proc_start);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+
+        assert!(
+            runtime.exists(),
+            "a supervisor landing mid-sweep spares the tree"
+        );
+    });
+}
+
+/// the teardown re-check re-reads the job store — a job landing
+/// between the stop and the removal hold spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-recheck");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            let home = crate::profile::home_dir().expect("home");
+            crate::testutil::write_claude_job(&home, "interposed", runtime);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(tree.exists(), "a job landing mid-teardown spares the tree");
+    });
+}
+
+/// the teardown re-check re-reads the MARKER — a flock-held
+/// marker landing between the stop and the removal hold spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-marker");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sessions = rt.sessions_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let marker = sessions.join("777-0");
+
+        set_drop_recheck_hook(Some(Box::new(move |_runtime| {
+            let file = open_pid_file(&marker).expect("open marker");
+            file.lock().expect("flock the marker");
+            drop_held_marker_set(file);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+        let _held = drop_held_marker_take();
+
+        assert!(
+            tree.exists(),
+            "a marker landing mid-teardown spares the tree"
+        );
+    });
+}
+
+/// the teardown re-check re-reads the LOCK FILE — a supervisor
+/// that appeared between the stop and the removal hold (a fresh `daemon.lock`
+/// naming a live pid) spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-lock");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        // A second supervisor lands only in the hook, after the first is
+        // SIGTERMed; its lock is what the re-check must re-read.
+        let landing = crate::testutil::FakeSupervisor::spawn(&tree, false);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            crate::testutil::write_daemon_lock(runtime, landing.pid, &landing.proc_start);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(
+            tree.exists(),
+            "a supervisor landing mid-teardown spares the tree"
+        );
+    });
+}
+
+/// a teardown that spares the tree on the re-check (a supervisor
+/// landed after the stop) still clears its in-flight row — without the clear,
+/// every Fake-mode acquire on the profile bails "a supervisor stop is in
+/// flight" until the row ages out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_spare_clears_the_in_flight_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-clear");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let landing = crate::testutil::FakeSupervisor::spawn(&tree, false);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            crate::testutil::write_daemon_lock(runtime, landing.pid, &landing.proc_start);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(tree.exists(), "the re-check spare kept the tree");
+        let key = stop_in_flight_key(&tree);
+        let journal = load_stops_in_flight().expect("journal");
+        assert!(
+            !journal.stops.iter().any(|row| row.tree == key),
+            "the teardown spare cleared the in-flight row: {:?}",
+            journal.stops
+        );
+    });
+}
+
+/// the mirror skip's deterministic arm — a supervisor state file
+/// present on ONE side only never crosses to the missing side. The
+/// both-sides-seeded test ties on mtime inside a clock tick; a missing side
+/// has no mtime to tie, so it reds on every run the skip is removed.
+#[test]
+fn the_mirror_never_copies_the_daemon_state_into_a_missing_side() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::write(claude_home.join("daemon.json"), b"home").expect("seed home daemon.json");
+        fs::write(claude_home.join("daemon.lock"), b"home").expect("seed home lock");
+        fs::write(claude_home.join("daemon.scheduled.status.json"), b"home")
+            .expect("seed home scheduled status");
+        fs::create_dir_all(claude_home.join("daemon")).expect("mkdir home daemon");
+        fs::write(claude_home.join("daemon").join("roster.json"), b"home").expect("home roster");
+
+        mirror_tree(&claude_home, &runtime).expect("mirror");
+
+        assert!(
+            runtime.join("daemon.json").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon.json into a missing tree side"
+        );
+        assert!(
+            runtime.join("daemon.lock").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon.lock into a missing tree side"
+        );
+        assert!(
+            runtime
+                .join("daemon.scheduled.status.json")
+                .symlink_metadata()
+                .is_err(),
+            "the mirror never copies ~/.claude's daemon.scheduled.status.json into a missing tree side"
+        );
+        assert!(
+            runtime.join("daemon").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon/ into a missing tree side"
+        );
+    });
+}
+
+/// acquire consults the in-flight record — a Fake-mode shared
+/// bare tree with a stop in flight refuses the start, instead of launching a
+/// session whose shared supervisor the stop is about to end.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_refuses_a_shared_tree_with_a_stop_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("in-flight");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            with_state_lock(|_held| record_stop_in_flight_locked(&runtime)).expect("stamp");
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("an in-flight stop must refuse the acquire");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "tollgate is stopping Claude Code's background service in {}; retry in a moment",
+                    runtime.display()
+                ),
+                "the refusal names the in-flight stop"
+            );
+        });
+    });
+}
+
+/// The background pair keeps one runtime path whatever the sid, so a `--bg`
+/// launch meeting a stop in flight there refuses instead of handing its job to
+/// the supervisor the stop is about to end.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_background_refuses_a_stop_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Real, || {
+            let profile = configured_profile("bg-in-flight");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime-bg");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime-bg");
+            with_state_lock(|_held| record_stop_in_flight_locked(&runtime)).expect("stamp");
+
+            let err = ProfileRuntime::acquire_background(
+                &profile.name,
+                BackgroundHold::Launcher,
+                &[],
+                Some("--bg"),
+            )
+            .err()
+            .expect("an in-flight stop must refuse the background acquire");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "tollgate is stopping Claude Code's background service in {}; retry in a moment",
+                    runtime.display()
+                ),
+                "the refusal names the in-flight stop"
+            );
+            let markers = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("sessions-bg");
+            assert!(
+                fs::read_dir(&markers).map_or(true, |mut dir| dir.next().is_none()),
+                "a refused launch leaves no marker in {}",
+                markers.display()
+            );
+        });
+    });
+}
+
+/// acquire declines the wipe of a tree whose own supervisor may
+/// be alive — the additive build keeps the tree and its sentinel, never
+/// `remove_dir_all`s under a live supervisor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_declines_the_wipe_of_a_tree_whose_supervisor_may_be_alive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("live-sup");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            fs::write(runtime.join("sentinel"), b"keep").expect("sentinel");
+            let sup = crate::testutil::FakeSupervisor::spawn(&runtime, false);
+            crate::testutil::write_daemon_lock(&runtime, sup.pid, &sup.proc_start);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            assert!(
+                runtime.join("sentinel").exists(),
+                "a live supervisor spares the wipe; the sentinel survives"
+            );
+            drop(rt);
+        });
+    });
+}
+
+/// an unparseable stop journal is logged once and treated as empty —
+/// every acquire still proceeds instead of bailing on the parse error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unparseable_stop_journal_reads_empty_and_logs_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("corrupt");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            let journal = stop_in_flight_path().expect("journal path");
+            crate::profile::mkdir_700(journal.parent().expect("journal parent"))
+                .expect("mkdir .tollgate");
+            fs::write(&journal, b"{ not json").expect("corrupt journal");
+
+            let lines = crate::logline::LogLines::new();
+            let _capture = lines.capture_here();
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("the corrupt journal does not brick the acquire");
+            drop(rt);
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("the corrupt journal does not brick the second acquire");
+            drop(rt);
+            assert_eq!(
+                lines.snapshot(),
+                vec![format!(
+                    "tollgate: treating an unparseable stop journal {} as empty",
+                    journal.display()
+                )],
+                "the corrupt journal logged exactly one line"
+            );
+        });
+    });
+}
+
+/// The `procStart` formatter renders `pbi_start_tvsec` as
+/// `asctime(gmtime(...))`. The first two pairs are the mac probe's measured
+/// values; the third (a single-digit day, space-padded `%e`) is hand-computed
+/// via `date -u -d @1791158400` = `Mon Oct  5 00:00:00 2026`, independent of
+/// the code under test.
+#[test]
+fn proc_start_formatter_matches_the_macos_probe() {
+    assert_eq!(format_proc_start(1792720759), "Fri Oct 23 01:59:19 2026");
+    assert_eq!(format_proc_start(1792721082), "Fri Oct 23 02:04:42 2026");
+    assert_eq!(format_proc_start(1791158400), "Mon Oct  5 00:00:00 2026");
+    for tvsec in [1792720759u64, 1792721082, 1791158400] {
+        assert_eq!(
+            parse_proc_start(&format_proc_start(tvsec)),
+            Some(tvsec),
+            "the parser inverts the formatter"
+        );
+    }
+    // A string in another format is unparseable (unverifiable), never a reused pid.
+    assert_eq!(parse_proc_start("2026-10-23T01:59:19Z"), None);
+    assert_eq!(parse_proc_start(""), None);
+    // A well-formed string with the WRONG weekday does not parse: the weekday
+    // guard is the only thing that keeps a corrupted date out of the parsed
+    // instant.
+    assert_eq!(parse_proc_start("Thu Oct 23 01:59:19 2026"), None);
+}
+
+/// a recorded `procStart` that parses but differs from the live start
+/// reads `Gone` only when the live start is strictly LATER (a reused pid);
+/// anything else — a future format, or a parsed instant not earlier than the
+/// live one — reads `Unverifiable` and spares.
+#[test]
+fn start_mismatch_verdict_only_reads_gone_for_a_later_live_start() {
+    let recorded = "Fri Oct 23 01:59:19 2026"; // epoch 1792720759
+    assert_eq!(
+        start_mismatch_verdict(1792720760, recorded, false),
+        SupervisorState::Gone,
+        "a strictly-later live start is a reused pid"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720759, recorded, false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an equal instant is not a mismatch verdict (the caller handles equality)"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720758, recorded, false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an earlier-than-recorded live start spares, never collects"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720760, "2026-10-23T01:59:19Z", false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an unparseable recorded string spares"
+    );
+}
+
+/// a live pid whose argv holds `daemon run` and whose config dir is this tree
+/// IS this tree's supervisor even when the recorded instant differs (a build
+/// that rendered it in a timezone west of UTC) — `Unverifiable` naming the
+/// stale recorded start, never `Gone`.
+#[test]
+fn start_mismatch_verdict_reads_a_matching_supervisor_as_unverifiable() {
+    assert_eq!(
+        start_mismatch_verdict(1792720759, "Thu Oct 22 20:59:19 2026", true),
+        SupervisorState::Unverifiable {
+            stale_start: Some("Thu Oct 22 20:59:19 2026".to_string())
+        },
+        "a matching supervisor spares whatever the start string says"
+    );
+}
+
+/// the zombie-fallback decision: a `kinfo_proc` read proves the pid gone only
+/// when the sysctl reports it absent or a `SZOMB` zombie — any live non-zombie
+/// state and every other read failure stays unreadable (spare). The zombie
+/// value is pinned as the literal `5` from `<sys/proc.h>` (`SZOMB`), never the
+/// code's own constant: a wrong constant would read a STOPPED live supervisor
+/// (`SSTOP` = 4) as gone and this test would stay green.
+#[test]
+fn kinfo_proc_read_decides_gone_only_for_zombie_or_absent() {
+    assert!(
+        kinfo_proc_reads_gone(KinfoProcRead::Absent),
+        "absent reads gone"
+    );
+    assert!(
+        kinfo_proc_reads_gone(KinfoProcRead::Present(5)),
+        "a zombie (SZOMB = 5) reads gone"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Present(4)),
+        "a stopped live supervisor (SSTOP = 4) must never read gone"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Present(2)),
+        "a live non-zombie reads unreadable"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Unreadable),
+        "a failed read reads unreadable"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        u32::from(P_STAT_SZOMB),
+        libc::SZOMB,
+        "the local SZOMB constant matches libc's Apple binding"
+    );
+}
+
+/// the `kinfo_proc` second-read decision: `size` bounds the read, so the
+/// first pass's buffer tail never counts. An empty read (the pid vanished
+/// between the sizing call and the read, so the kernel wrote no entry) is
+/// `Absent`; a read shorter than the `KinfoProcStat` prefix (40 bytes) is
+/// `Unreadable`; a full-enough read reports the `p_stat` byte.
+#[test]
+fn kinfo_proc_second_read_decides_empty_short_and_present() {
+    assert_eq!(
+        kinfo_proc_second_read(&[], 0),
+        KinfoProcRead::Absent,
+        "an empty second read is the pid vanishing, not unreadable"
+    );
+    // A full-sized, zeroed buffer whose second read reported zero bytes is
+    // still the pid vanishing: the first pass's sizing must not turn the
+    // buffer's tail into an entry.
+    let mut full = vec![0u8; std::mem::size_of::<KinfoProcStat>()];
+    assert_eq!(
+        kinfo_proc_second_read(&full, 0),
+        KinfoProcRead::Absent,
+        "a zero-byte second read over a sized buffer is the pid vanishing"
+    );
+    // A read too short to hold the `p_stat` byte (offset 36) is neither empty
+    // nor a whole entry — unreadable, never a guess at `p_stat`.
+    let short = vec![0u8; P_STAT_OFFSET];
+    assert_eq!(
+        kinfo_proc_second_read(&short, short.len()),
+        KinfoProcRead::Unreadable,
+        "a short read holds no p_stat byte"
+    );
+    // The threshold is the whole prefix, not the `p_stat` offset: a read one
+    // byte short of the entry holds `p_stat` and still is not an entry.
+    let mut one_short = vec![0u8; std::mem::size_of::<KinfoProcStat>() - 1];
+    one_short[P_STAT_OFFSET] = 5;
+    assert_eq!(
+        kinfo_proc_second_read(&one_short, one_short.len()),
+        KinfoProcRead::Unreadable,
+        "a read one byte short of the entry is unreadable"
+    );
+    full[P_STAT_OFFSET] = 5;
+    assert_eq!(
+        kinfo_proc_second_read(&full, full.len()),
+        KinfoProcRead::Present(5),
+        "a full read reports the p_stat byte"
+    );
+    assert_eq!(
+        kinfo_proc_second_read(&full, full.len() + 1),
+        KinfoProcRead::Unreadable,
+        "a reported size past the buffer is no read of it"
+    );
+}
+
+/// a live fake supervisor whose recorded `procStart` differs from its live
+/// start but whose argv + env still match this tree spares — `Unverifiable`
+/// naming the stale recorded start, never `Gone` — and the spare line names
+/// that stale start. The recorded string parses and is strictly EARLIER than
+/// the live start on macOS, so dropping the argv/env read there reads `Gone`
+/// and reds this test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_live_matching_supervisor_with_a_stale_recorded_start_spares() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        // Linux never parses the recorded string in the mismatch arm; any
+        // differing value works. macOS parses it, so it must be strictly
+        // earlier than the live start for the drop-the-read plant to red.
+        #[cfg(target_os = "linux")]
+        let stale = "Thu Oct 22 20:59:19 2026".to_string();
+        #[cfg(target_os = "macos")]
+        let stale = {
+            let live = crate::runtime::proc_bsdinfo(sup.pid)
+                .expect("live start")
+                .pbi_start_tvsec;
+            crate::runtime::format_proc_start(live - 18000)
+        };
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &stale);
+
+        assert_eq!(
+            supervisor_state(&tree),
+            SupervisorState::Unverifiable {
+                stale_start: Some(stale.clone())
+            },
+            "a matching supervisor with a stale recorded start spares, never Gone"
+        );
+
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "the stale-start verdict spares the tree"
+        );
+        assert_eq!(
+            lines.snapshot(),
+            vec![format!(
+                "tollgate: {}: sparing: its supervisor's recorded start {stale:?} is stale (the pid still reads as this tree's supervisor)",
+                tree.display()
+            )],
+            "the spare line names the stale recorded start"
+        );
+    });
+}
+
+/// A `daemon.lock` recording a pid of `0` or above `i32::MAX` is a malformed
+/// record: `read_supervisor_record` returns `Err` (the corrupt-lock path
+/// spares as unverifiable), so the pid never reaches `pid_alive`'s
+/// `kill(pid, 0)` probe. `kill(0, 0)` probes the caller's own process group,
+/// and a pid above `i32::MAX` casts to a negative pid (`4294967295` ->
+/// `kill(-1, 0)`, every process the user owns). The stop then spares the tree
+/// with no signal. The linux verify would also spare a bogus pid as
+/// unreadable, so the boundary read is the red the plant targets.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bogus_lock_pid_is_a_malformed_record_that_never_signals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let start = "Thu Oct 22 20:59:19 2026";
+
+        for pid in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+            crate::testutil::write_daemon_lock(&tree, pid, start);
+            assert_eq!(
+                read_supervisor_record(&tree),
+                Err(()),
+                "a lock pid of {pid} is a malformed record, never a signal target"
+            );
+        }
+
+        // The malformed record spares with no signal: the corrupt-lock path
+        // returns `Unverifiable`, which the stop path spares without reaching
+        // the kill.
+        crate::testutil::write_daemon_lock(&tree, u32::MAX, start);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |_| {
+                fired.set(fired.get() + 1);
+            })));
+        }
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a bogus lock pid spares the tree"
+        );
+        crate::runtime::set_signal_send_hook(None);
+        assert_eq!(fired.get(), 0, "no signal reached the bogus pid");
+    });
+}
+
+/// The `daemon.status.json` fallback is the same trust boundary as
+/// `daemon.lock`: a status pid of `0` (the caller's own process group) or
+/// above `i32::MAX` (a negative pid: `4294967295` -> `kill(-1, 0)`) is a
+/// malformed record and reads `Err`, so the stop spares the tree with no
+/// signal. The control row proves the reader really parses the status file
+/// rather than ignoring it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bogus_status_pid_is_a_malformed_record_too() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let start = "Thu Oct 22 20:59:19 2026";
+
+        for pid in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+            crate::testutil::write_daemon_status(&tree, pid, start);
+            assert_eq!(
+                read_supervisor_record(&tree),
+                Err(()),
+                "a status pid of {pid} is a malformed record, never a signal target"
+            );
+        }
+
+        crate::testutil::write_daemon_status(&tree, u32::MAX, start);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |_| {
+                fired.set(fired.get() + 1);
+            })));
+        }
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a bogus status pid spares the tree"
+        );
+        crate::runtime::set_signal_send_hook(None);
+        assert_eq!(fired.get(), 0, "no signal reached the bogus pid");
+
+        crate::testutil::write_daemon_status(&tree, 4242, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((4242, start.to_string()))),
+            "the control row parses the status file"
+        );
+    });
+}
+
+/// Both pid edges of the boundary are ACCEPTED, from the lock and from the
+/// status fallback: `1` and `i32::MAX` are positive pids that fit `pid_t`, so
+/// a record naming one must read as this tree's supervisor instead of
+/// sparing it as malformed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_accepted_pid_edges_read_from_both_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tree = tmp.path().join("tree");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    let start = "Thu Oct 22 20:59:19 2026";
+
+    for pid in [1u32, i32::MAX as u32] {
+        crate::testutil::write_daemon_lock(&tree, pid, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((pid, start.to_string()))),
+            "a lock pid of {pid} is a valid kill target"
+        );
+        fs::remove_file(tree.join("daemon.lock")).expect("remove daemon.lock");
+
+        crate::testutil::write_daemon_status(&tree, pid, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((pid, start.to_string()))),
+            "a status pid of {pid} is a valid kill target"
+        );
+        fs::remove_file(tree.join("daemon.status.json")).expect("remove daemon.status.json");
+    }
+}
+
+/// the macOS `KERN_PROCARGS2` parser — `[int argc][exec path NUL][NUL
+/// padding][argc argv NUL][env NUL]` — parses argv and env out of hand-built
+/// buffers on every OS, and the argv/env checks see what the verify needs.
+#[test]
+fn parse_proc_args2_parses_the_macos_layout() {
+    let tree = tempfile::tempdir().expect("tempdir");
+    let tree_path = tree.path().to_path_buf();
+    let args2_buffer = |argc: i32, argv: &[&[u8]], environ: &[&[u8]]| -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&argc.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/claude");
+        buf.push(0);
+        buf.extend_from_slice(&[0, 0, 0]); // NUL padding to the argv boundary
+        for arg in argv {
+            buf.extend_from_slice(arg);
+            buf.push(0);
+        }
+        for entry in environ {
+            buf.extend_from_slice(entry);
+            buf.push(0);
+        }
+        buf
+    };
+
+    // argv hit (argv holds `daemon run`) + env hit (CLAUDE_CONFIG_DIR resolves
+    // to the tree).
+    let ccd = format!("CLAUDE_CONFIG_DIR={}", tree_path.display());
+    let buf = args2_buffer(
+        4,
+        &[b"/bin/claude", b"daemon", b"run", b"--origin"],
+        &[ccd.as_bytes()],
+    );
+    let args = parse_proc_args2(&buf).expect("a well-formed buffer parses");
+    let argv: Vec<&[u8]> = args.argv.iter().map(Vec::as_slice).collect();
+    assert!(argv_holds_daemon_run(&argv), "argv hit: daemon run found");
+    assert!(
+        environ_bytes_config_dir_is(&args.environ, &tree_path),
+        "env hit: config dir matches the tree"
+    );
+
+    // env miss: no CLAUDE_CONFIG_DIR entry -> false.
+    let miss = args2_buffer(2, &[b"/bin/claude", b"daemon"], &[b"PATH=/usr/bin"]);
+    let args = parse_proc_args2(&miss).expect("the miss buffer parses");
+    assert!(
+        !environ_bytes_config_dir_is(&args.environ, &tree_path),
+        "env miss reads false"
+    );
+
+    // Truncated buffer: argc names two argv strings but the second never
+    // terminates.
+    let mut truncated = args2_buffer(2, &[b"/bin/claude", b"daemon"], &[]);
+    truncated.pop(); // drop the final NUL
+    assert_eq!(
+        parse_proc_args2(&truncated),
+        None,
+        "a truncated argv string does not parse"
+    );
+
+    // argc past the end: argc names more strings than the buffer holds.
+    let past_end = args2_buffer(6, &[b"/bin/claude", b"daemon"], &[]);
+    assert_eq!(
+        parse_proc_args2(&past_end),
+        None,
+        "an argc past the end does not parse"
+    );
+}
+
+/// the cross-process spare dedupe's decision, factored off the
+/// platform call — the same journal logic every OS runs, unit-tested on the
+/// host.
+#[test]
+fn the_spared_announce_decision_dedupes_per_tree() {
+    let (announce, rows) = spared_announce_decision(&[], "tree-a", 1000);
+    assert!(announce, "an unseen tree announces");
+    assert_eq!(
+        rows,
+        vec![SparedAnnounceRow {
+            tree: "tree-a".into(),
+            stamp_secs: 1000
+        }]
+    );
+
+    let (again, rows2) = spared_announce_decision(&rows, "tree-a", 1005);
+    assert!(!again, "the same tree is deduped");
+    assert_eq!(rows2, rows, "a deduped decision adds no row");
+
+    let (other, rows3) = spared_announce_decision(&rows, "tree-b", 1010);
+    assert!(other, "a different tree still announces");
+    assert_eq!(rows3.len(), 2, "the second tree joins the rows");
+}
+
+/// a SIGTERM that fails with `ESRCH` — the verified supervisor exited between
+/// the verify and the kill — proceeds (the delete's re-check re-reads the lock
+/// file before removing), with no wedged row and no "could not SIGTERM" line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_proceeds_when_the_supervisor_exits_before_the_kill() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let mut config = crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: Vec::new(),
+        };
+        crate::actions::create_blank_profile(
+            &mut config,
+            "victim".to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
+        let tree = tmp
+            .path()
+            .join(".tollgate")
+            .join("profiles")
+            .join("victim")
+            .join("runtime-4242-0");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let pid = sup.pid;
+
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |hook_pid| {
+                assert_eq!(hook_pid, pid, "the seam fires for the verified pid");
+                fired.set(fired.get() + 1);
+                let _ = sup.child.kill();
+                let _ = sup.child.wait();
+            })));
+        }
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        let name = crate::profile::ProfileName::from("victim");
+        let guard = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+        crate::actions::delete_profile(&mut config, &name, false, &guard)
+            .expect("the supervisor exiting before the kill lets the delete proceed");
+        drop(guard);
+        crate::runtime::set_signal_send_hook(None);
+
+        assert_eq!(
+            fired.get(),
+            1,
+            "the signal seam fired exactly once (the kill, not a misread Gone)"
+        );
+        assert!(!tree.exists(), "the delete removed the tree");
+        assert!(
+            !lines
+                .snapshot()
+                .iter()
+                .any(|line| line.contains("could not SIGTERM")),
+            "an ESRCH kill is the stopped outcome, never a could-not-SIGTERM spare"
+        );
+        let journal = load_stops_in_flight().expect("journal");
+        assert!(
+            !journal.wedged.iter().any(|row| row.pid == pid),
+            "an ESRCH kill records no wedged row"
+        );
+    });
+}
+
+/// a supervisor recorded as wedged is spared without a second signal
+/// — the stop skip reads the journal and never reaches `signal_and_wait`, so a
+/// `tollgate start` on a wedged tree pays no 15 s wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_wedged_supervisor_is_not_resignalled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        record_wedged_stop(&tree, sup.pid, &sup.proc_start);
+
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a wedged supervisor spares without another stop"
+        );
+        assert!(
+            sup.child.try_wait().is_ok_and(|status| status.is_none()),
+            "the wedged supervisor was not re-signalled"
+        );
+    });
+}
+
+/// the cross-process spare announcement's journal body — load -> sweep ->
+/// push -> save in one flock hold — dedupes per tree across calls, the
+/// off-linux announce latch, driven on linux through the same factored fn.
+#[test]
+fn the_journal_spare_announce_dedupes_per_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree_a = tmp.path().join("tree-a");
+        fs::create_dir_all(&tree_a).expect("mkdir tree-a");
+        let tree_b = tmp.path().join("tree-b");
+        fs::create_dir_all(&tree_b).expect("mkdir tree-b");
+
+        assert!(
+            journal_spare_should_announce(&tree_a),
+            "an unseen tree announces"
+        );
+        assert!(
+            !journal_spare_should_announce(&tree_a),
+            "the same tree is deduped across calls"
+        );
+        assert!(
+            journal_spare_should_announce(&tree_b),
+            "a different tree still announces"
+        );
+    });
+}
+
+/// A `~/.claude` that refuses new entries (read-only, `EACCES`, `ENOSPC`) must
+/// not refuse a shared start: the store is skipped, as an unusable one is, and
+/// the tree gets no link for it. The base started there — the walk only links
+/// what `~/.claude` already holds — and this fix must not be stricter than the
+/// base it corrects. Each store it cannot create is returned as a note the
+/// start path prints, one line naming only that store's own consequence.
+///
+/// Unix only: [`crate::testutil::UnwritableDir`]'s Windows deny ACE still lets
+/// a new SUBDIRECTORY through, so it cannot pose a refused `mkdir` here.
+#[cfg(unix)]
+#[test]
+fn a_shared_build_skips_a_store_it_cannot_create() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared build's store-create failure") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            claude_home.join("jobs").symlink_metadata().is_err(),
+            "the fixture starts without a jobs store"
+        );
+        assert!(
+            claude_home.join("projects").symlink_metadata().is_err(),
+            "the fixture starts without a projects store"
+        );
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("uncreatablestores");
+        let canonical = tmp.path().join("creds.json");
+        let unwritable = crate::testutil::UnwritableDir::new(&claude_home);
+        // The refusal's text as this platform's std renders it, read off an
+        // independent create under the same unwritable dir.
+        let refused = fs::create_dir(claude_home.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+
+        let notes = build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a store that cannot be created skips, never fails the build");
+        drop(capture);
+        drop(unwritable);
+
+        // The build raises no log line for a failed create: the notes travel
+        // back to the acquire seam, and the start path prints them.
+        assert!(
+            lines.snapshot().is_empty(),
+            "the build must raise no logline line, got: {:?}",
+            lines.snapshot()
+        );
+        // cloudy 2026-10-22: one note per store the build could not create,
+        // each naming only its own consequence.
+        assert_eq!(
+            notes,
+            [
+                (
+                    "jobs",
+                    "background jobs stay in its own tree, where `claude agents` outside it cannot see them",
+                ),
+                (
+                    "projects",
+                    "transcripts stay in its own tree and are lost when it ends",
+                ),
+            ]
+            .map(|(store, consequence)| {
+                format!(
+                    "tollgate: could not create {}: {refused}; this session's {consequence}",
+                    claude_home.join(store).display()
+                )
+            }),
+            "one note per store the build could not create"
+        );
+
+        assert!(
+            claude_home.join("jobs").symlink_metadata().is_err(),
+            "no jobs store was created"
+        );
+        assert!(
+            claude_home.join("projects").symlink_metadata().is_err(),
+            "no projects store was created"
+        );
+        assert!(
+            runtime.join("jobs").symlink_metadata().is_err(),
+            "the tree links no jobs store"
+        );
+        assert!(
+            runtime.join("projects").symlink_metadata().is_err(),
+            "the tree links no projects store"
+        );
+    });
+}
+
 /// `runtime/settings.json` carries tollgate-owned credential routing for an
 /// api-key profile (top-level `apiKeyHelper` naming the profile, plus the
 /// base_url and model env keys), so it is a credential file and must land
@@ -2795,7 +4356,8 @@ fn acquire_creates_runtime_and_pid_file() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("lifecycle");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         assert!(
             rt.config_dir().is_dir(),
@@ -2874,7 +4436,8 @@ fn acquire_wipes_a_stale_tree_at_its_own_path_when_no_marker_holds_it() {
                 .expect("seed the stale entry");
 
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
 
             assert_eq!(
                 rt.config_dir(),
@@ -2944,7 +4507,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
 
         // Mapped away because `ProfileRuntime` is not `Debug`; an Ok here also
         // tears the session down before the panic reports it.
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a start for a deleted account must fail loudly");
         let msg = format!("{err:#}");
@@ -3008,6 +4571,7 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 // A record removal taking no rotation lock — the shape a tollgate
                 // predating the witness ships. Its own body still runs under
@@ -3077,6 +4641,7 @@ fn acquire_builds_session_settings_from_the_profile_re_read_under_the_flock() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 // The edit lands on disk only, after the caller's borrow and
                 // after the rotation guard: the borrowed copy stays stale.
@@ -3135,7 +4700,7 @@ fn acquire_refuses_a_deleted_account_whose_directory_came_back() {
             "fixture must have put the directory back, or it poses nothing"
         );
 
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a start must follow the record, not the leftover directory");
         // The gate's own sentence, not just the name: every failure path in
@@ -3177,7 +4742,8 @@ fn acquire_isolates_credentials_from_real_home() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime_creds = rt.config_dir().join(".credentials.json");
 
         // The runtime's credentials resolve to the profile's OWN chain (V2),
@@ -3256,7 +4822,8 @@ fn acquire_builds_the_runtime_partition_the_mcp_note_describes() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir();
 
         // 1. The partition holds exhaustively: every top-level entry is one of
@@ -3338,10 +4905,10 @@ fn acquire_twice_same_process_counts_two_sessions() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("concurrent");
 
-        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
         // Pre-fix this second acquire blocks forever on the shared PID flock.
-        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         assert_eq!(
@@ -3383,9 +4950,9 @@ fn two_shared_sessions_get_independent_trees() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("twin");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         assert_ne!(
@@ -3463,7 +5030,8 @@ fn a_per_session_acquire_stamps_no_marker_at_the_bare_stem_path() {
         for (name, mode, isolation, bare_stem) in layouts {
             with_link_mode(mode, || {
                 let profile = configured_profile(name);
-                let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
+                let rt = ProfileRuntime::acquire(&profile, isolation, &[], false, Launcher::Own)
+                    .expect("acquire");
                 let sid = live_sid(&rt);
                 let profile_dir = tmp.path().join(".tollgate").join("profiles").join(name);
                 assert_eq!(
@@ -3541,13 +5109,14 @@ fn a_foreign_holder_of_our_own_marker_never_blocks_acquire() {
             std::thread::spawn(move || {
                 let profile = configured_profile("collide");
                 let claimed =
-                    ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(|rt| {
-                        // Read the dir while the session still holds its marker:
-                        // teardown unlinks it on drop.
-                        let names = dir_entry_names(rt.sessions_dir());
-                        drop(rt);
-                        names
-                    });
+                    ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                        .map(|rt| {
+                            // Read the dir while the session still holds its marker:
+                            // teardown unlinks it on drop.
+                            let names = dir_entry_names(rt.sessions_dir());
+                            drop(rt);
+                            names
+                        });
                 let _ = tx.send(claimed);
             });
 
@@ -3589,7 +5158,8 @@ fn teardown_racing_a_wedged_peer_removes_its_own_files_within_one_retry() {
         let profile = configured_profile("wedged");
         crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(150)));
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         let sessions = rt.sessions_dir().to_path_buf();
 
@@ -3658,7 +5228,8 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         let profile = configured_profile("stuck");
         crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(50)));
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
 
         let lock_path = crate::profile::tollgate_dir()
@@ -3724,7 +5295,8 @@ fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
             crate::runtime::set_rotation_lock_timeout_override(Some(Duration::from_millis(150)));
             let started = std::time::Instant::now();
             let outcome =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(drop);
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .map(drop);
             let _ = tx.send((outcome, started.elapsed()));
         });
         // 20x the deadline: wide enough that a loaded box never reads as a park,
@@ -3745,7 +5317,7 @@ fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("wedged-rot") && msg.contains("retry"),
+            msg.contains("wedged-rot") && msg.contains("Retry"),
             "the refusal must name the account and the way out, got: {msg}"
         );
         assert!(
@@ -3776,7 +5348,7 @@ fn a_start_behind_a_rotation_that_releases_in_time_proceeds() {
             std::thread::sleep(Duration::from_millis(150));
             drop(holder);
         });
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("a rotation that releases inside the deadline must be waited out");
         releaser.join().expect("join releaser");
 
@@ -3842,6 +5414,7 @@ fn the_rotation_hold_ends_at_the_register_and_stamp_window() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 head_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // Same process, second fd: `flock(2)` binds to the open file
@@ -3974,22 +5547,25 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
     });
 }
 
-/// The FLOOR, pinned as a LITERAL rather than re-derived from the three constants it
+/// The deadline, pinned as a LITERAL rather than re-derived from the constants it
 /// adds: an assertion keyed on those tracks any re-tune silently, and this number
-/// is a claim about how long a healthy holder spends — 19 s of the two deadlines a
-/// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
-/// invocations, plus 20 s for the session-start Keychain seed's shared budget.
-/// The token term bounds no phase of its call — the constant's own
-/// doc carries the measurement — while the keychain terms do bound their legs;
-/// all are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving any term must red this and force the claim to be re-made
+/// is a claim about how long a holder spends. The floor's four terms come to
+/// 69 s — 19 s of the two deadlines a token call carries, plus 20 s for a macOS
+/// Keychain mirror's two `security` invocations, plus 20 s for the
+/// session-start Keychain seed's shared budget, plus 10 s for the `.claude.json`
+/// seed's healthy sync-lock wait. The scheduler's fetch-leg rotation outlasts
+/// that: two 12 s identity probes, a 20 s pre-spend stage landing, the 19 s token
+/// call and the 20 s persist landing come to 83 s, and the deadline is the longer
+/// of the two. Moving any term must red this and force the claim to be re-made
 /// against what that term now bounds.
 #[test]
 fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
     assert_eq!(
         crate::runtime::ROTATION_LOCK_TIMEOUT,
-        Duration::from_secs(59),
-        "the session-start wait must outlast a healthy rotation's token call, its \
-         macOS Keychain mirror, and a macOS session-start Keychain seed"
+        Duration::from_secs(83),
+        "the session-start wait must outlast the longest rotation-guard holder: the \
+         fetch leg's two identity probes, its pre-spend stage landing, its token \
+         call and its persist's landing"
     );
 }
 
@@ -4021,9 +5597,9 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("survivor");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         let a_runtime = a.config_dir().to_path_buf();
@@ -4135,9 +5711,9 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("faketwin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
 
             let profile_dir = tmp
@@ -4179,10 +5755,12 @@ fn fake_mode_isolated_sessions_get_independent_trees() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("iso-twin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("second acquire");
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("second acquire");
 
             assert_ne!(
                 a.config_dir(),
@@ -4212,10 +5790,12 @@ fn fake_mode_isolated_teardown_rescues_only_its_own_tree() {
             let claude_home = fake_claude_home(tmp.path());
             let profile = configured_profile("iso-twin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("second acquire");
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("second acquire");
 
             let a_projects = a.config_dir().join("projects");
             let b_projects = b.config_dir().join("projects");
@@ -4277,7 +5857,7 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
             let claude_home = fake_claude_home(tmp.path());
             let profile = configured_profile("fakecopy");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
 
             let sentinel = ".session-one-was-here.tmp.pin";
@@ -4301,7 +5881,7 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
                  this test would prove nothing"
             );
 
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
 
             assert_eq!(
@@ -4333,9 +5913,9 @@ fn fake_mode_liveness_counts_both_shared_sessions() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("fakegate");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
             let tree = a.config_dir().to_path_buf();
             let markers = a.sessions_dir().to_path_buf();
@@ -4392,7 +5972,8 @@ fn fake_mode_registry_row_survives_gc() {
             let profile = configured_profile("fakerow");
 
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
             let sid = rt.swap.session.as_str().to_string();
 
             gc_stale_runtimes();
@@ -4426,8 +6007,8 @@ fn a_shared_fake_session_keys_its_marker_on_the_bare_sessions_stem() {
             fake_claude_home(tmp.path());
 
             let shared = configured_profile("fakebare-shared");
-            let rt =
-                ProfileRuntime::acquire(&shared, Isolation::Shared, &[], false).expect("acquire");
+            let rt = ProfileRuntime::acquire(&shared, Isolation::Shared, &[], false, Launcher::Own)
+                .expect("acquire");
             let bare = tmp
                 .path()
                 .join(".tollgate")
@@ -5242,6 +6823,1808 @@ fn gc_collects_a_dead_per_session_pair_and_spares_a_held_one() {
     });
 }
 
+/// A dead per-session pair (marker present, unlocked), seeded like the pairs
+/// `gc_collects_a_dead_per_session_pair_and_spares_a_held_one` builds.
+fn dead_pair(profiles: &Path, profile: &str, runtime_name: &str, sid: &str) -> (PathBuf, PathBuf) {
+    let runtime = profiles.join(profile).join(runtime_name);
+    let sessions = profiles.join(profile).join(
+        runtime_name
+            .strip_prefix("runtime")
+            .map(|rest| format!("sessions{rest}"))
+            .expect("paired name"),
+    );
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+    fs::write(sessions.join(sid), b"").expect("dead marker");
+    (runtime, sessions)
+}
+
+/// A `claude --bg` session keeps reading its `CLAUDE_CONFIG_DIR` long after the
+/// `tollgate start` that built the tree has exited and released its marker, so
+/// the marker alone cannot say the tree is unused: GC spares a dead pair while
+/// a Claude Code job record names its tree, and collects it once the job dir
+/// is gone (`claude rm`). A job naming some other tree spares nothing.
+#[test]
+fn gc_spares_a_dead_pair_a_claude_job_names_until_the_job_is_removed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (named, named_sessions) = dead_pair(&profiles, "bgjob", "runtime-4242-0", "4242-0");
+        let (other, other_sessions) = dead_pair(&profiles, "bgjob", "runtime-4242-1", "4242-1");
+        let job = write_claude_job(tmp.path(), "37560ded", &named);
+        write_claude_job(tmp.path(), "9f8e7d6c", &tmp.path().join("elsewhere"));
+
+        gc_stale_runtimes();
+
+        assert!(
+            named.join(".claude.json").is_file(),
+            "a tree a live background job names must survive the sweep"
+        );
+        assert!(
+            named_sessions.is_dir(),
+            "its sessions dir goes nowhere either"
+        );
+        assert!(
+            !other.exists() && !other_sessions.exists(),
+            "a dead pair no job names is still collected"
+        );
+
+        fs::remove_dir_all(&job).expect("claude rm");
+        gc_stale_runtimes();
+
+        assert!(
+            !named.exists() && !named_sessions.exists(),
+            "once the job dir is gone the dead pair is collected"
+        );
+    });
+}
+
+/// A job record caught mid-rewrite (or otherwise unreadable) names nothing the
+/// sweep can trust, and the sweep's failure mode is the one `is_session_alive`
+/// already takes: spare. Collecting on a torn read would delete the tree a live
+/// background session reads.
+#[test]
+fn gc_spares_every_dead_pair_while_a_job_record_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgtorn", "runtime-4242-2", "4242-2");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99ec");
+        fs::create_dir_all(&job).expect("mkdir job dir");
+        fs::write(
+            job.join("state.json"),
+            br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+        )
+        .expect("torn job record");
+
+        gc_stale_runtimes();
+
+        assert!(
+            runtime.join(".claude.json").is_file() && sessions.is_dir(),
+            "an unreadable job record must spare the dead pair this sweep"
+        );
+
+        fs::remove_dir_all(&job).expect("claude rm");
+        gc_stale_runtimes();
+
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "with the torn record gone the dead pair is collected"
+        );
+    });
+}
+
+/// `tollgate start <profile> --bg` returns as soon as `claude --bg` hands the
+/// session to Claude Code's background service, so the start's own teardown
+/// runs while the session still needs its tree: teardown leaves a tree a job
+/// names in place, and still removes one no job names.
+#[test]
+fn teardown_leaves_a_tree_a_claude_job_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        let mut trees = Vec::new();
+        for name in ["bgkeep", "bgdrop"] {
+            let profile = configured_profile(name);
+            let canonical = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join(name)
+                .join("credentials.json");
+            fs::create_dir_all(canonical.parent().expect("canonical parent"))
+                .expect("mkdir profile dir");
+            fs::write(&canonical, CREDS_V2).expect("write canonical");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            trees.push((tree, rt));
+        }
+        let keep = trees[0].0.clone();
+        let gone = trees[1].0.clone();
+        write_claude_job(tmp.path(), "37560ded", &keep);
+
+        drop(trees);
+
+        assert!(
+            keep.is_dir(),
+            "teardown must leave {} in place: a background job still reads it",
+            keep.display()
+        );
+        assert!(
+            !gone.exists(),
+            "teardown still removes {}: no job names it",
+            gone.display()
+        );
+    });
+}
+
+/// Writes the canonical credentials `acquire` links for `name`.
+fn seed_profile_store(home: &Path, name: &str) {
+    let canonical = home
+        .join(".tollgate")
+        .join("profiles")
+        .join(name)
+        .join("credentials.json");
+    fs::create_dir_all(canonical.parent().expect("canonical parent")).expect("mkdir profile dir");
+    fs::write(&canonical, CREDS_V2).expect("write canonical");
+}
+
+/// Writes a `{}` per-spawn `--settings` file for a live session and returns it.
+fn write_spawn_settings(rt: &ProfileRuntime) -> PathBuf {
+    let settings = spawn_settings_file(rt.config_dir(), rt.session_id());
+    fs::write(&settings, b"{}").expect("write spawn settings");
+    settings
+}
+
+/// A job's `respawnFlags` carry `--settings <spawn-settings-<sid>.json>`
+/// (measured 2026-10-20, 2.1.304): that list, not the tree the job runs in, is
+/// what says which settings file a respawn reads. Teardown keeps the file a job
+/// names and removes a sibling session's file even while a job names that
+/// sibling's tree, both sessions in one profile.
+#[test]
+fn teardown_keeps_only_the_spawn_settings_file_a_jobs_respawn_flags_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        seed_profile_store(tmp.path(), "bgss");
+        let profile = configured_profile("bgss");
+        let named = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let sibling =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                .expect("acquire");
+        let named_settings = write_spawn_settings(&named);
+        let sibling_settings = write_spawn_settings(&sibling);
+        let sibling_tree = sibling.config_dir().to_path_buf();
+        write_claude_job_flags(
+            tmp.path(),
+            "4b1d2c3e",
+            named.config_dir(),
+            respawn_flags_naming(&named_settings),
+        );
+        write_claude_job_flags(tmp.path(), "4b1d2c3f", &sibling_tree, serde_json::json!([]));
+
+        drop((named, sibling));
+
+        assert!(
+            named_settings.is_file(),
+            "teardown must keep {}: a job's respawnFlags name it",
+            named_settings.display()
+        );
+        assert!(
+            !sibling_settings.exists(),
+            "teardown still removes {}: no job's respawnFlags name it",
+            sibling_settings.display()
+        );
+        assert!(
+            sibling_tree.is_dir(),
+            "the sibling's tree itself stays: a job names it"
+        );
+    });
+}
+
+/// The sweep's half: a dead session's file survives exactly while a job's
+/// `respawnFlags` name it, shared or isolated, and is collected once the job dir
+/// is gone; a dead file no job names goes at once, even while some job names a
+/// tree it could have shared (the profile's bare fake-mode `runtime`). The file
+/// can hold a folded user `env` token, so nothing keeps it longer.
+#[test]
+fn gc_keeps_exactly_the_spawn_settings_files_a_jobs_respawn_flags_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (shared, _) = dead_pair(&profiles, "ssbg", "runtime-4545-0", "4545-0");
+        let shared_file = spawn_settings_file(&shared, "4545-0");
+        fs::write(&shared_file, b"{}").expect("shared settings file");
+        let (isolated, _) = dead_pair(&profiles, "ssbg", "runtime-isolated-4545-1", "4545-1");
+        let isolated_file = spawn_settings_file(&isolated, "4545-1");
+        fs::write(&isolated_file, b"{}").expect("isolated settings file");
+        let (unnamed, _) = dead_pair(&profiles, "ssbg", "runtime-4545-2", "4545-2");
+        let unnamed_file = spawn_settings_file(&unnamed, "4545-2");
+        fs::write(&unnamed_file, b"{}").expect("unnamed settings file");
+        let (beside_bare, _) = dead_pair(&profiles, "ssbg", "runtime-4545-3", "4545-3");
+        let beside_bare_file = spawn_settings_file(&beside_bare, "4545-3");
+        fs::write(&beside_bare_file, b"{}").expect("settings file beside a bare-runtime job");
+        let bare = profiles.join("ssbg").join("runtime");
+        fs::create_dir_all(&bare).expect("mkdir bare runtime");
+        let shared_job = write_claude_job_flags(
+            tmp.path(),
+            "5c2e3d4f",
+            &shared,
+            respawn_flags_naming(&shared_file),
+        );
+        let isolated_job = write_claude_job_flags(
+            tmp.path(),
+            "6d3f4e5a",
+            &isolated,
+            respawn_flags_naming(&isolated_file),
+        );
+        write_claude_job(tmp.path(), "7e4a5f6b", &bare);
+
+        gc_stale_runtimes();
+
+        for (file, flavor) in [(&shared_file, "shared"), (&isolated_file, "isolated")] {
+            assert!(
+                file.is_file(),
+                "a dead {flavor} session's {} must survive while a job's respawnFlags name it",
+                file.display()
+            );
+        }
+        for (file, why) in [
+            (&unnamed_file, "no job names it"),
+            (
+                &beside_bare_file,
+                "a job naming the bare `runtime` tree names no settings file",
+            ),
+        ] {
+            assert!(
+                !file.exists(),
+                "{} must be collected: {why}",
+                file.display()
+            );
+        }
+
+        fs::remove_dir_all(&shared_job).expect("claude rm");
+        fs::remove_dir_all(&isolated_job).expect("claude rm");
+        gc_stale_runtimes();
+
+        for (file, flavor) in [(&shared_file, "shared"), (&isolated_file, "isolated")] {
+            assert!(
+                !file.exists(),
+                "once the job dir is gone the dead {flavor} session's {} is collected",
+                file.display()
+            );
+        }
+    });
+}
+
+/// Fake-mode shared sessions of one profile all run in the bare `runtime`
+/// tree, so a job naming that tree says nothing about which session's file it
+/// respawns with: only the file its `respawnFlags` name survives.
+#[test]
+fn gc_keeps_only_the_named_fake_mode_sessions_spawn_settings_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile_dir = tmp.path().join(".tollgate").join("profiles").join("ssfk");
+        let runtime = profile_dir.join("runtime");
+        let sessions = profile_dir.join("sessions");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("4646-0"), b"").expect("dead marker 0");
+        fs::write(sessions.join("4646-1"), b"").expect("dead marker 1");
+        let named = spawn_settings_file(&runtime, "4646-0");
+        let other = spawn_settings_file(&runtime, "4646-1");
+        fs::write(&named, b"{}").expect("named settings file");
+        fs::write(&other, b"{}").expect("other settings file");
+        write_claude_job_flags(
+            tmp.path(),
+            "8f5b6a7c",
+            &runtime,
+            respawn_flags_naming(&named),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            named.is_file(),
+            "{} must survive: the job's respawnFlags name it",
+            named.display()
+        );
+        assert!(
+            !other.exists(),
+            "{} must be collected: the job shares its tree but names another file",
+            other.display()
+        );
+    });
+}
+
+/// A job record caught mid-rewrite names nothing either side can trust, so both
+/// removers take the store's fail-closed answer: keep every settings file.
+#[test]
+fn teardown_and_gc_keep_spawn_settings_files_while_the_job_store_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let torn = tmp.path().join(".claude").join("jobs").join("0add99ed");
+        fs::create_dir_all(&torn).expect("mkdir job dir");
+        fs::write(
+            torn.join("state.json"),
+            br#"{"state":"working","respawnFlags":["--settings","#,
+        )
+        .expect("torn job record");
+        seed_profile_store(tmp.path(), "bgtorn");
+        let rt = ProfileRuntime::acquire(
+            &configured_profile("bgtorn"),
+            Isolation::Shared,
+            &[],
+            false,
+            Launcher::Own,
+        )
+        .expect("acquire");
+        let live_settings = write_spawn_settings(&rt);
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (dead, _) = dead_pair(&profiles, "bgtorn", "runtime-4747-0", "4747-0");
+        let dead_settings = spawn_settings_file(&dead, "4747-0");
+        fs::write(&dead_settings, b"{}").expect("dead settings file");
+
+        drop(rt);
+        gc_stale_runtimes();
+
+        for (file, remover) in [(&live_settings, "teardown"), (&dead_settings, "GC")] {
+            assert!(
+                file.is_file(),
+                "{remover} must keep {} while the job store cannot be read",
+                file.display()
+            );
+        }
+    });
+}
+
+/// A record whose `respawnFlags` is present but not a list of strings (a
+/// retyped field after a Claude Code update: a string, `null`, a non-string
+/// element anywhere, a `--settings` with a non-string value) cannot say which
+/// file it names, so the files beside its tree fall back to T33a's tree rule; a
+/// file beside a tree no job names still goes.
+#[test]
+fn gc_keeps_the_settings_files_beside_a_tree_whose_jobs_respawn_flags_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let shapes = [
+            ("a string", serde_json::json!("--settings somewhere")),
+            ("null", serde_json::Value::Null),
+            ("a number", serde_json::json!(7)),
+            ("a negative number", serde_json::json!(-7)),
+            ("a float", serde_json::json!(7.5)),
+            ("a bool", serde_json::json!(true)),
+            (
+                "a non-string --settings value",
+                serde_json::json!(["--settings", 7]),
+            ),
+            (
+                "a non-string element before a --settings",
+                serde_json::json!([1, "--settings", "/nowhere/spawn-settings-1-0.json"]),
+            ),
+            (
+                "a map",
+                serde_json::json!({"--settings": "/nowhere/spawn-settings-1-1.json"}),
+            ),
+            (
+                "a map element before a --settings",
+                serde_json::json!([{"k": [1, {"j": null}]}, "--settings", "/nowhere/spawn-settings-1-2.json"]),
+            ),
+        ];
+        let mut kept = Vec::new();
+        for (n, (shape, flags)) in shapes.into_iter().enumerate() {
+            let sid = format!("4848-{n}");
+            let (tree, _) = dead_pair(&profiles, "ssrt", &format!("runtime-{sid}"), &sid);
+            let beside = spawn_settings_file(&tree, &sid);
+            fs::write(&beside, b"{}").expect("settings file beside the job's tree");
+            write_claude_job_flags(tmp.path(), &format!("9a6c7b8{n}"), &tree, flags);
+            kept.push((beside, shape));
+        }
+        let (other, _) = dead_pair(&profiles, "ssrt", "runtime-4849-0", "4849-0");
+        let elsewhere = spawn_settings_file(&other, "4849-0");
+        fs::write(&elsewhere, b"{}").expect("settings file beside an unnamed tree");
+
+        gc_stale_runtimes();
+
+        for (beside, shape) in &kept {
+            assert!(
+                beside.is_file(),
+                "{} must survive: its tree's job has respawnFlags tollgate cannot read ({shape})",
+                beside.display()
+            );
+        }
+        assert!(
+            !elsewhere.exists(),
+            "{} must be collected: no job names its tree",
+            elsewhere.display()
+        );
+    });
+}
+
+/// Teardown takes the same fallback: a job naming this session's own tree with
+/// unreadable `respawnFlags` keeps the session's file.
+#[test]
+fn teardown_keeps_the_spawn_settings_file_beside_a_tree_whose_jobs_respawn_flags_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        seed_profile_store(tmp.path(), "bgunk");
+        let rt = ProfileRuntime::acquire(
+            &configured_profile("bgunk"),
+            Isolation::Shared,
+            &[],
+            false,
+            Launcher::Own,
+        )
+        .expect("acquire");
+        let settings = write_spawn_settings(&rt);
+        write_claude_job_flags(
+            tmp.path(),
+            "9a6c7b90",
+            rt.config_dir(),
+            serde_json::json!("--settings somewhere"),
+        );
+
+        drop(rt);
+
+        assert!(
+            settings.is_file(),
+            "teardown must keep {}: its tree's job has respawnFlags tollgate cannot read",
+            settings.display()
+        );
+    });
+}
+
+/// `--settings` also takes inline JSON, and tollgate hands a user's own value
+/// through unfolded, so a job's flags can carry a value that is no path. Inline
+/// JSON names no file; a value that cannot resolve as a path (a NUL) falls back
+/// to its own job's tree. Neither makes the whole job store unreadable: a dead
+/// tree in an unrelated profile is still collected.
+#[test]
+fn gc_scopes_a_settings_value_that_is_no_path_to_its_own_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (inline_tree, _) = dead_pair(&profiles, "ssval", "runtime-4949-0", "4949-0");
+        let beside_inline = spawn_settings_file(&inline_tree, "4949-0");
+        fs::write(&beside_inline, b"{}").expect("settings file beside the inline job's tree");
+        let long_inline = format!(
+            r#"{{"permissions":{{"allow":["Bash({})"]}}}}"#,
+            "a".repeat(512)
+        );
+        write_claude_job_flags(
+            tmp.path(),
+            "aa1b2c3d",
+            &inline_tree,
+            serde_json::json!(["--settings", long_inline]),
+        );
+        let (nul_tree, _) = dead_pair(&profiles, "ssval", "runtime-4949-1", "4949-1");
+        let beside_nul = spawn_settings_file(&nul_tree, "4949-1");
+        fs::write(&beside_nul, b"{}").expect("settings file beside the NUL job's tree");
+        write_claude_job_flags(
+            tmp.path(),
+            "aa1b2c3e",
+            &nul_tree,
+            serde_json::json!(["--settings", "bad\u{0}path"]),
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssother", "runtime-5050-0", "5050-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: no job value makes the store unreadable"
+        );
+        assert!(
+            !beside_inline.exists(),
+            "{} must be collected: an inline JSON value names no file",
+            beside_inline.display()
+        );
+        assert!(
+            inline_tree.join(".claude.json").is_file(),
+            "the inline job's own tree stays: the job names it"
+        );
+        assert!(
+            beside_nul.is_file(),
+            "{} must survive: its job's value cannot resolve, so its tree falls back",
+            beside_nul.display()
+        );
+    });
+}
+
+/// Claude Code's `--settings` also parses the `--settings=<value>` spelling, so a
+/// record carrying it names that file too.
+#[test]
+fn gc_keeps_a_spawn_settings_file_named_in_the_equals_spelling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "sseq", "runtime-5151-0", "5151-0");
+        let file = spawn_settings_file(&tree, "5151-0");
+        fs::write(&file, b"{}").expect("settings file");
+        write_claude_job_flags(
+            tmp.path(),
+            "bb2c3d4e",
+            &tree,
+            serde_json::json!([format!("--settings={}", file.to_string_lossy())]),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            file.is_file(),
+            "{} must survive: the job's respawnFlags name it as --settings=<path>",
+            file.display()
+        );
+    });
+}
+
+/// A `respawnFlags` nested past serde_json's 128-level recursion limit is still
+/// one job's unreadable flags, never an unreadable store: the file beside its
+/// tree falls back to the tree rule, and a dead tree in an unrelated profile is
+/// still collected.
+#[test]
+fn gc_scopes_a_deeply_nested_respawn_flags_value_to_its_own_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssdeep", "runtime-5353-0", "5353-0");
+        let beside = spawn_settings_file(&tree, "5353-0");
+        fs::write(&beside, b"{}").expect("settings file beside the deep job's tree");
+        let mut deep = serde_json::json!([]);
+        for _ in 0..199 {
+            deep = serde_json::json!([deep]);
+        }
+        write_claude_job_flags(tmp.path(), "cc3d4e5a", &tree, deep);
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssdeepother", "runtime-5454-0", "5454-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: a 200-deep respawnFlags must not make the store unreadable"
+        );
+        assert!(
+            beside.is_file(),
+            "{} must survive: its tree's job has respawnFlags tollgate cannot read",
+            beside.display()
+        );
+    });
+}
+
+/// The settings sweep reads the job store inside its state-flock hold, never
+/// before it: a job written after the candidate scan, before the dead decision,
+/// still spares the file it names.
+#[test]
+fn gc_spares_a_settings_file_whose_job_is_written_inside_the_hold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "sslate", "runtime-5555-0", "5555-0");
+        let file = spawn_settings_file(&tree, "5555-0");
+        fs::write(&file, b"{}").expect("settings file");
+        let home = tmp.path().to_path_buf();
+        let (job_tree, named) = (tree.clone(), file.clone());
+
+        gc_spawn_settings_files_synced(move || {
+            write_claude_job_flags(&home, "cc3d4e5b", &job_tree, respawn_flags_naming(&named));
+        });
+
+        assert!(
+            file.is_file(),
+            "{} must survive: its job was written inside the hold, before the dead decision",
+            file.display()
+        );
+    });
+}
+
+/// Replace the one occurrence of `from` in a job dir's `state.json` with `to`,
+/// for record bytes a `serde_json::Value` cannot hold (an out-of-range number,
+/// a lone surrogate escape, a repeated key).
+fn rewrite_job_record(job_dir: &Path, from: &str, to: &str) {
+    let path = job_dir.join("state.json");
+    let record = fs::read_to_string(&path).expect("read job");
+    assert_eq!(
+        record.matches(from).count(),
+        1,
+        "{from} must occur once in {record}"
+    );
+    fs::write(&path, record.replace(from, to)).expect("rewrite job");
+}
+
+/// A `respawnFlags` token serde_json refuses to convert (an out-of-range
+/// number, a lone surrogate escape) or a repeated `respawnFlags` key is one
+/// job's unreadable flags, never an unreadable store: the file beside that
+/// job's tree falls back to the tree rule, and a dead tree in an unrelated
+/// profile is still collected.
+#[test]
+fn gc_scopes_a_respawn_flags_token_serde_json_refuses_to_its_own_job() {
+    let shapes = [
+        (
+            "an out-of-range number element",
+            r#""respawnFlags":[1e400]"#,
+        ),
+        (
+            "an out-of-range --settings value",
+            r#""respawnFlags":["--settings",1e400]"#,
+        ),
+        ("an out-of-range number", r#""respawnFlags":1e400"#),
+        ("a lone surrogate element", r#""respawnFlags":["\ud800"]"#),
+        (
+            "a lone surrogate map-element key",
+            r#""respawnFlags":[{"\ud800":1}]"#,
+        ),
+        ("a repeated key", r#""respawnFlags":[],"respawnFlags":[]"#),
+    ];
+    for (shape, raw) in shapes {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (tree, _) = dead_pair(&profiles, "sstoken", "runtime-5656-0", "5656-0");
+            let beside = spawn_settings_file(&tree, "5656-0");
+            fs::write(&beside, b"{}").expect("settings file beside the job's tree");
+            let job = write_claude_job_flags(
+                tmp.path(),
+                "dd4e5f6a",
+                &tree,
+                serde_json::json!("__flags__"),
+            );
+            rewrite_job_record(&job, r#""respawnFlags":"__flags__""#, raw);
+            let (unrelated, unrelated_sessions) =
+                dead_pair(&profiles, "sstokenother", "runtime-5757-0", "5757-0");
+
+            gc_stale_runtimes();
+
+            assert!(
+                !unrelated.exists() && !unrelated_sessions.exists(),
+                "a dead tree in an unrelated profile must still be collected ({shape}): the job store stays readable"
+            );
+            assert!(
+                beside.is_file(),
+                "{} must survive ({shape}): its tree's job has respawnFlags tollgate cannot read",
+                beside.display()
+            );
+        });
+    }
+}
+
+/// A record whose `providerEnv` serde_json refuses still makes the store
+/// unreadable: tollgate cannot tell which tree that job reads, so every tree is
+/// spared, a dead tree in an unrelated profile included.
+#[test]
+fn gc_keeps_every_tree_while_a_jobs_provider_env_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssenv", "runtime-5858-0", "5858-0");
+        let job = write_claude_job(tmp.path(), "dd4e5f6b", &tree);
+        rewrite_job_record(
+            &job,
+            r#"{"CLAUDE_CONFIG_DIR":"#,
+            r#"{"CLAUDE_CONFIG_DIR":1e400,"unread":"#,
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssenvother", "runtime-5959-0", "5959-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            unrelated.is_dir() && unrelated_sessions.is_dir(),
+            "a dead tree in an unrelated profile must be spared: a job whose providerEnv cannot be read may read any tree"
+        );
+    });
+}
+
+/// A `state` nested past serde_json's 128-level recursion limit reads as an
+/// unknown state (unfinished), never as an unreadable store: the job's own
+/// tree is spared, and a dead tree in an unrelated profile is still collected.
+#[test]
+fn gc_reads_a_deeply_nested_job_state_as_unknown_not_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssstate", "runtime-6060-0", "6060-0");
+        let job =
+            crate::testutil::write_claude_job_in(tmp.path(), "dd4e5f6c", &tree, "__state__", None);
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        rewrite_job_record(
+            &job,
+            r#""state":"__state__""#,
+            &format!(r#""state":{deep}"#),
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssstateother", "runtime-6161-0", "6161-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: a 200-deep state must not make the store unreadable"
+        );
+        assert!(
+            tree.join(".claude.json").is_file(),
+            "the job's own tree stays: the job names it"
+        );
+    });
+}
+
+/// Teardown removes a session's settings file before it takes the state flock,
+/// so a wedged peer holding the flock past every retry still cannot strand it.
+#[test]
+fn teardown_removes_an_unnamed_spawn_settings_file_while_the_state_flock_is_wedged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("sswedge");
+        crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(50)));
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let settings = write_spawn_settings(&rt);
+        let lock_path = crate::profile::tollgate_dir()
+            .expect("tollgate dir")
+            .join(crate::lock::LOCK_FILENAME);
+        let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
+        holder.lock().expect("hold the flock");
+        let timeouts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&timeouts);
+        set_teardown_timeout_hook(Some(Box::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        drop(rt);
+
+        assert!(
+            timeouts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the flock must have been wedged through teardown"
+        );
+        assert!(
+            !settings.exists(),
+            "teardown must remove {} even though the flock never came free",
+            settings.display()
+        );
+
+        drop(holder);
+        set_teardown_timeout_hook(None);
+        crate::lock::set_state_lock_timeout_override(None);
+    });
+}
+
+/// #1 (TOCTOU): the sweep snapshots the job store before the per-pair marker
+/// check, so a `tollgate start <p> -- --bg` that writes its job and releases its
+/// marker between the snapshot and this pair's turn would be collected from a
+/// stale "unnamed". The dead decision re-reads the store under the state lock,
+/// so a job written after the snapshot still spares the tree.
+#[test]
+fn gc_spares_a_pair_when_the_job_is_written_after_the_sweep_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let runtime = profiles.join("bgrace").join("runtime-777-4");
+        let sessions = profiles.join("bgrace").join("sessions-777-4");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let marker = open_pid_file(&sessions.join("777-4")).expect("marker");
+        marker.lock().expect("lock");
+        let snapshot = crate::claude_jobs::job_trees();
+        write_claude_job(tmp.path(), "37560ded", &runtime);
+        drop(marker);
+        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a job written after the sweep snapshot must still spare the tree"
+        );
+        assert!(sessions.is_dir(), "its sessions dir goes nowhere either");
+    });
+}
+
+/// #15: the in-lock re-read sits BEFORE the `if isolated` branch, so a job
+/// written after the sweep snapshot spares an ISOLATED-flavor pair too — the
+/// isolated rescue path (tombstone rename, then delete outside the lock) must
+/// not run on a tree a live job reads. Pins the check's position ahead of the
+/// rename: moving it after (`if !isolated && …`) would let the isolated tree
+/// be tombstoned, rescued and deleted.
+#[test]
+fn gc_spares_a_dead_isolated_pair_a_job_written_after_the_sweep_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let runtime = profiles.join("bgrace").join("runtime-isolated-777-4");
+        let sessions = profiles.join("bgrace").join("sessions-isolated-777-4");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let marker = open_pid_file(&sessions.join("777-4")).expect("marker");
+        marker.lock().expect("lock");
+        let snapshot = crate::claude_jobs::job_trees();
+        write_claude_job(tmp.path(), "37560ded", &runtime);
+        drop(marker);
+        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a job written after the sweep snapshot must spare an isolated tree"
+        );
+        assert!(
+            !profiles
+                .join("bgrace")
+                .join("runtime-isolated-777-4.rescuing")
+                .exists(),
+            "the isolated tree must not be renamed to its rescue tombstone"
+        );
+    });
+}
+/// bare-stem tree, so the tree a `tollgate start <p> -- --bg` spared at teardown
+/// is the one the next `tollgate start <p>` would wipe. The acquire must skip a
+/// tree the job store names. The sentinel is written AFTER the teardown's final
+/// sync, so the sync never carried it into `~/.claude`: a wiped tree loses it
+/// (the rebuild copies `~/.claude` back), a spared tree keeps it. A sentinel
+/// written BEFORE the sync round-trips and cannot show the wipe (the reviewer
+/// measured that), and a dir inode does not bind either: this box's test-tmp
+/// filesystem reuses a freed dir inode, so `remove_dir_all` + `mkdir` reads the
+/// same `ino`.
+#[test]
+fn acquire_keeps_a_tree_a_job_names_under_fake_link_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("bgfake");
+            let canonical = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("bgfake")
+                .join("credentials.json");
+            fs::create_dir_all(canonical.parent().expect("parent")).expect("mkdir");
+            fs::write(&canonical, CREDS_V2).expect("write canonical");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            write_claude_job(tmp.path(), "37560ded", &tree);
+            drop(rt);
+            assert!(tree.is_dir(), "teardown spared the tree");
+            fs::write(tree.join("bg-session-sentinel"), b"x").expect("sentinel");
+            let rt2 =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire 2");
+            assert_eq!(rt2.config_dir(), tree.as_path(), "same bare-stem tree");
+            assert!(
+                tree.join("bg-session-sentinel").is_file(),
+                "the next acquire must not wipe a tree a live job names"
+            );
+            drop(rt2);
+        });
+    });
+}
+
+/// #6: a plain file (`pins.json`) beside the job dirs is no job — the reader
+/// skips it, so a dead pair is still collected. The skip guard is pinned
+/// because a real `~/.claude/jobs` holds `pins.json`, and losing it would read
+/// the store as permanently unreadable and never collect a tree again.
+#[test]
+fn gc_collects_a_dead_pair_when_a_plain_file_sits_in_the_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgpins", "runtime-4242-7", "4242-7");
+        let jobs = tmp.path().join(".claude").join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir jobs");
+        fs::write(jobs.join("pins.json"), b"[]").expect("pins");
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "a plain file in the job store is no job, the dead pair is collected"
+        );
+    });
+}
+
+/// #7: a job dir caught before its first `state.json` lands spares the dead
+/// pair — the reader is fail-closed on a missing record, not permissive.
+/// Claude Code creates the dir, writes `state.json.tmp.<rand>`, renames it to
+/// `state.json`, and only then creates `tmp/` (measured 5/5, 2.1.308, the T35
+/// probe), so the mid-create shapes are an empty dir and a dir holding only
+/// the staged record. A permissive arm (`Err(_) if kind == NotFound =>
+/// continue`) would collect during job creation.
+#[test]
+fn gc_spares_a_dead_pair_when_a_job_dir_has_no_state_yet() {
+    for (shape, staged) in [("empty", None), ("staged", Some("state.json.tmp.8d511663"))] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-8", "4242-8");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ec");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if let Some(staged) = staged {
+                fs::write(job.join(staged), b"{\"state\":").expect("staged record");
+            }
+            gc_stale_runtimes();
+            assert!(
+                runtime.join(".claude.json").is_file() && sessions.is_dir(),
+                "{shape}: a job dir with no state.json yet must spare the dead pair"
+            );
+        });
+    }
+}
+
+/// F9 (cloudy 2026-10-22): on a copy host the tree's `jobs/` is its own real
+/// dir (the mirror never carries it), so a `claude --bg` started inside that
+/// session records itself ONLY there. Every job reader must still see it: GC
+/// spares the dead pair and the account counts as live. Control: the same tree
+/// with that record removed is collected.
+#[test]
+fn gc_spares_a_copy_host_tree_whose_own_job_store_names_it() {
+    // T33b1 r5 F9: on a copy host the tree's `jobs/` is its own real dir (the
+    // mirror never carries it, cloudy 2026-10-22), so a `claude --bg` started
+    // inside that session records itself ONLY there. Every job reader must
+    // still see it: GC spares the dead pair and the account counts as live.
+    // Control: the same tree with that record removed is collected.
+    for named in [true, false] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "copyjob", "runtime-4242-11", "4242-11");
+            if named {
+                let job = runtime.join("jobs").join("0add99ee");
+                fs::create_dir_all(&job).expect("mkdir tree job");
+                let record = serde_json::json!({
+                    "state": "working",
+                    "respawnFlags": [],
+                    "providerEnv": { "CLAUDE_CONFIG_DIR": runtime.to_string_lossy() },
+                });
+                fs::write(
+                    job.join("state.json"),
+                    serde_json::to_vec(&record).expect("encode job"),
+                )
+                .expect("tree job");
+                assert!(
+                    has_live_session(&crate::profile::ProfileName::from("copyjob")),
+                    "a job recorded only inside the tree keeps the account live"
+                );
+            }
+            gc_stale_runtimes();
+            assert_eq!(
+                runtime.exists() && sessions.exists(),
+                named,
+                "named: {named}: spared iff the tree's own job store names it"
+            );
+        });
+    }
+}
+
+/// F9 guard: a tree's `jobs/` is read only as a REAL directory. A symlinked
+/// `jobs` — the linked host's shape, where it IS the global store already read
+/// — is never followed, so a poisoned dir it points at cannot make the read
+/// unreadable; the dead pair is still collected.
+#[cfg(unix)]
+#[test]
+fn gc_skips_a_symlinked_tree_jobs_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgjobs", "runtime-4242-12", "4242-12");
+        let target = tmp.path().join("poison");
+        fs::create_dir_all(target.join("0add99ef")).expect("mkdir poison job");
+        fs::write(target.join("0add99ef").join("state.json"), b"{\"state\":").expect("bad record");
+        std::os::unix::fs::symlink(&target, runtime.join("jobs")).expect("symlink jobs");
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "a symlinked jobs dir is never followed, so its poisoned target spares nothing"
+        );
+    });
+}
+
+/// F9 guard: a non-dir `jobs` entry in a tree is an unknown shape and fails
+/// closed — the whole read is unreadable, so the dead pair is spared.
+#[test]
+fn gc_spares_a_dead_pair_when_a_tree_jobs_entry_is_not_a_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgjobs", "runtime-4242-13", "4242-13");
+        fs::write(runtime.join("jobs"), b"not a dir").expect("jobs file");
+        gc_stale_runtimes();
+        assert!(
+            runtime.exists() && sessions.exists(),
+            "a non-dir jobs entry reads as unreadable and spares the dead pair (fail closed)"
+        );
+    });
+}
+
+/// Write a tree-local job record: `<tree>/jobs/<id>/state.json` naming `names`.
+fn tree_job(tree: &Path, id: &str, state: &str, names: &Path) {
+    let job = tree.join("jobs").join(id);
+    fs::create_dir_all(&job).expect("mkdir tree job");
+    let record = serde_json::json!({
+        "state": state,
+        "respawnFlags": [],
+        "providerEnv": { "CLAUDE_CONFIG_DIR": names.to_string_lossy() },
+    });
+    fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write tree job");
+}
+
+/// Chmod `dir` to 0o000 for the fail-closed arms. Returns false (and restores)
+/// when running as root, where the chmod has no effect on readability.
+#[cfg(unix)]
+fn pose_unreadable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(dir).is_ok() {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn restore_readable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+/// F19: a symlinked profile dir's trees must still be read by the job walker
+/// (it enumerates the link the way the census does), so GC spares a tree a
+/// tree-local job names and the account counts live.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_profile_dir_still_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let elsewhere = tmp.path().join("elsewhere");
+        let (real_rt, real_sess) = dead_pair(&elsewhere, "symjob", "runtime-4242-30", "4242-30");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        std::os::unix::fs::symlink(elsewhere.join("symjob"), profiles.join("symjob"))
+            .expect("symlink profile dir");
+        let named = profiles.join("symjob").join("runtime-4242-30");
+        tree_job(&real_rt, "aa000030", "working", &named);
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("symjob")),
+            "a job recorded under a symlinked profile dir keeps the account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            real_rt.exists() && real_sess.exists(),
+            "a symlinked profile dir's tree-local job spares the tree"
+        );
+    });
+}
+
+/// F23: an isolated tree's own job store spares the tree and blocks
+/// rename/disable only while the job is UNFINISHED; a finished job holds
+/// nothing, since no session can re-enter an isolated tree.
+#[test]
+fn an_isolated_trees_job_store_counts_only_unfinished_jobs() {
+    for (state, spared) in [("working", true), ("stopped", false)] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (runtime, sessions) =
+                dead_pair(&profiles, "isojob", "runtime-isolated-4242-31", "4242-31");
+            tree_job(&runtime, "aa000031", state, &runtime);
+            assert_eq!(
+                has_live_session(&crate::profile::ProfileName::from("isojob")),
+                spared,
+                "{state}: a finished isolated job is not live"
+            );
+            gc_stale_runtimes();
+            assert_eq!(
+                runtime.exists() && sessions.exists(),
+                spared,
+                "{state}: spared iff the isolated job is unfinished"
+            );
+        });
+    }
+}
+
+/// A tree-local record naming a DIFFERENT tree is a stale copy (a copy-host
+/// mirror's leftover) and is skipped, so it cannot pin another account's tree.
+#[test]
+fn a_tree_local_job_naming_another_tree_is_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (b_rt, b_sess) = dead_pair(&profiles, "f24b", "runtime-4242-32", "4242-32");
+        let c_rt = profiles.join("f24c").join("runtime");
+        let c_sess = profiles.join("f24c").join("sessions");
+        fs::create_dir_all(&c_rt).expect("mkdir c");
+        fs::create_dir_all(&c_sess).expect("mkdir c sessions");
+        tree_job(&c_rt, "aa000032", "stopped", &b_rt);
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f24b")),
+            "a tree-local record naming another tree does not make that account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            !b_rt.exists() && !b_sess.exists(),
+            "a tree-local record naming another tree spares nothing"
+        );
+        assert!(
+            !c_rt.exists() && !c_sess.exists(),
+            "a tree-local store holding only foreign records spares its own tree nothing"
+        );
+    });
+}
+
+/// A linked-shape shared tree (its `CLAUDE.md` reads as a link) whose OWN real
+/// `jobs/` holds a live record written by Claude Code itself must be spared and
+/// count the account live: only a record naming a DIFFERENT tree is a stale
+/// copy. The linked-host shared `jobs/` is a symlink by construction, so a real
+/// dir there was written by the session, never by a mirror.
+#[cfg(unix)]
+#[test]
+fn a_linked_shape_shared_tree_holding_its_own_live_jobs_dir_is_spared() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let tree = profiles.join("g1link").join("runtime-bg");
+        let sessions = profiles.join("g1link").join("sessions-bg");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        std::os::unix::fs::symlink(tmp.path().join("real-claude-md"), tree.join("CLAUDE.md"))
+            .expect("symlink CLAUDE.md");
+        tree_job(&tree, "aa000036", "working", &tree);
+        assert_eq!(
+            crate::runtime::link_mode_of(Some(&tree)),
+            crate::runtime::LinkProbe::Real,
+            "the fixture reads as a linked-host tree"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("g1link")),
+            "a linked-shape shared tree's own live jobs record counts the account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            tree.exists() && sessions.exists(),
+            "the linked-shape shared tree is spared"
+        );
+    });
+}
+
+/// F20 (teardown): a tree-local job keeps the tree past the session teardown.
+#[test]
+fn teardown_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("f20tear");
+            seed_profile_store(tmp.path(), "f20tear");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            tree_job(&tree, "aa000033", "working", &tree);
+            drop(rt);
+            assert!(
+                tree.is_dir(),
+                "a tree-local job keeps the tree past the session teardown"
+            );
+        });
+    });
+}
+
+/// F20 (acquire wipe): the acquire wipe skips a tree its own job store names.
+#[test]
+fn the_acquire_wipe_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("f20wipe");
+            seed_profile_store(tmp.path(), "f20wipe");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            tree_job(&tree, "aa000034", "working", &tree);
+            drop(rt);
+            assert!(tree.is_dir(), "teardown spared the tree first");
+            fs::write(tree.join("f20-sentinel"), b"x").expect("sentinel");
+            let rt2 =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire 2");
+            assert!(
+                tree.join("f20-sentinel").is_file(),
+                "the acquire must not wipe a tree its own job store names"
+            );
+            drop(rt2);
+        });
+    });
+}
+
+/// F20 (rotation term): a tree-local unfinished job blocks the macOS rotation.
+#[test]
+fn the_rotation_job_term_reads_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("f20rot");
+        let tree = tmp.path().join(".tollgate/profiles/f20rot/runtime");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        write_creds(&tree.join(".credentials.json"), Some("rt"));
+        tree_job(&tree, "aa000035", "working", &tree);
+        assert_eq!(
+            rotation_block_on(&name, true),
+            Some(RotationBlock::BackgroundJob),
+            "a tree-local unfinished job blocks the rotation"
+        );
+    });
+}
+
+/// F20 (settings spare): a tree-local job's `respawnFlags` spare a settings
+/// file they name.
+#[test]
+fn a_tree_local_job_names_a_settings_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, _sessions) = dead_pair(&profiles, "f20set", "runtime-4242-37", "4242-37");
+        let settings = tmp.path().join("spawn-settings-4242-37.json");
+        fs::write(&settings, b"{}").expect("settings");
+        let job = runtime.join("jobs").join("aa000037");
+        fs::create_dir_all(&job).expect("mkdir tree job");
+        let record = serde_json::json!({
+            "state": "working",
+            "respawnFlags": ["--settings", settings.to_string_lossy()],
+            "providerEnv": { "CLAUDE_CONFIG_DIR": runtime.to_string_lossy() },
+        });
+        fs::write(
+            job.join("state.json"),
+            serde_json::to_vec(&record).expect("encode job"),
+        )
+        .expect("write tree job");
+        let jobs = crate::claude_jobs::job_trees();
+        assert!(
+            jobs.spares_settings(&settings, &[runtime]),
+            "a tree-local job's respawnFlags spare the settings file they name"
+        );
+    });
+}
+
+/// F22 + F21 arm 1: an unreadable tree-local store blocks only ITS account
+/// (live and rotation), never an unrelated account.
+#[cfg(unix)]
+#[test]
+fn a_tree_local_store_failure_blocks_only_its_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f22a", "runtime-4242-38", "4242-38");
+        let jobs = runtime.join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir tree jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        let name = crate::profile::ProfileName::from("f22a");
+        assert!(
+            has_live_session(&name),
+            "an unreadable tree-local store is live"
+        );
+        assert!(
+            matches!(
+                rotation_block_on(&name, true),
+                Some(RotationBlock::UnreadableJobStore(store))
+                    if store == jobs
+            ),
+            "the rotation names the tree's own store"
+        );
+        gc_stale_runtimes();
+        assert!(
+            runtime.exists() && sessions.exists(),
+            "the tree is spared (fail closed)"
+        );
+        // A second account is untouched by the first's unreadable store.
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f22b")),
+            "an unrelated account is not live"
+        );
+        assert_eq!(
+            rotation_block_on(&crate::profile::ProfileName::from("f22b"), true),
+            None,
+            "an unrelated account's rotation is not blocked"
+        );
+        restore_readable(&jobs);
+    });
+}
+
+/// F21 arm 2: an lstat error on `<tree>/jobs` (an unreadable tree) still spares
+/// the tree — fail closed.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_tree_still_spares_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f21tree", "runtime-4242-39", "4242-39");
+        if !pose_unreadable(&runtime) {
+            return;
+        }
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f21tree")),
+            "an unreadable tree reads live"
+        );
+        gc_stale_runtimes();
+        assert!(runtime.exists() && sessions.exists(), "the tree is spared");
+        restore_readable(&runtime);
+    });
+}
+
+/// F21 arm 3 + F22 scoping: an unreadable profile dir blocks only that account.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profile_dir_blocks_only_that_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let locked = profiles.join("f22locked");
+        fs::create_dir_all(&locked).expect("mkdir locked");
+        if !pose_unreadable(&locked) {
+            return;
+        }
+        assert!(
+            crate::claude_jobs::job_trees().spares_under(&locked),
+            "an unreadable profile dir spares its own account's trees (fail closed)"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22locked")),
+            "an unreadable profile dir reads live"
+        );
+        assert!(
+            rotation_blocked_on(&crate::profile::ProfileName::from("f22locked"), true),
+            "an unreadable profile dir blocks its account's rotation"
+        );
+        assert!(
+            matches!(
+                rotation_block_on(&crate::profile::ProfileName::from("f22locked"), true),
+                Some(RotationBlock::UnreadableJobStore(store)) if store == locked
+            ),
+            "an unreadable profile dir names itself as the unreadable store, not a live session"
+        );
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f22other")),
+            "an unrelated account is not live"
+        );
+        assert!(
+            !rotation_blocked_on(&crate::profile::ProfileName::from("f22other"), true),
+            "an unrelated account's rotation is not blocked"
+        );
+        restore_readable(&locked);
+    });
+}
+
+/// F21 arm 4: an unreadable `profiles/` root blocks every account (global).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profiles_root_blocks_every_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        if !pose_unreadable(&profiles) {
+            return;
+        }
+        assert!(
+            matches!(
+                crate::claude_jobs::job_trees(),
+                crate::claude_jobs::JobTrees::Unreadable { .. }
+            ),
+            "an unreadable profiles root reads the store as unreadable (fail closed)"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22any")),
+            "an unreadable profiles root reads every account live"
+        );
+        assert!(
+            rotation_blocked_on(&crate::profile::ProfileName::from("f22any"), true),
+            "an unreadable profiles root blocks every account's rotation"
+        );
+        restore_readable(&profiles);
+    });
+}
+
+/// F22 global: an unreadable global `~/.claude/jobs` still blocks every
+/// account, and the refusal names the conventional store path.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_global_store_blocks_every_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let jobs = tmp.path().join(".claude").join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir global jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22g")),
+            "an unreadable global store reads every account live"
+        );
+        assert_eq!(
+            rotation_block_on(&crate::profile::ProfileName::from("f22g"), true),
+            Some(RotationBlock::UnreadableJobStore("~/.claude/jobs".into())),
+            "the global refusal names the conventional store path"
+        );
+        restore_readable(&jobs);
+    });
+}
+
+/// cloudy 2026-10-22: `claude rm` can leave the job's supervisor running —
+/// measured with a second tree's supervisor sharing the roster — and that
+/// supervisor recreates the job dir with no record — an empty `tmp/`, then
+/// `exit-cause` once it is signalled (a lone bare job's supervisor exits
+/// instead). A creation never makes those shapes (`tmp/` follows
+/// `state.json`, #7), so a dir holding nothing but an empty `tmp/` and/or an
+/// `exit-cause` file is a removed job and the dead pair is collected. Any other
+/// record-less content stays unreadable and spares, as before.
+#[test]
+fn gc_reads_a_removed_jobs_leftover_dir_as_no_job() {
+    for (shape, with_tmp, with_cause, collected) in [
+        ("tmp only", true, false, true),
+        ("exit-cause only", false, true, true),
+        ("tmp and exit-cause", true, true, true),
+        ("tmp holding a file", true, false, false),
+        ("exit-cause a directory", false, false, false),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgrm", "runtime-4242-9", "4242-9");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ed");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if with_tmp {
+                fs::create_dir_all(job.join("tmp")).expect("mkdir tmp");
+            }
+            if with_cause {
+                fs::write(job.join("exit-cause"), b"SIGTERM").expect("exit-cause");
+            }
+            if shape == "tmp holding a file" {
+                fs::write(job.join("tmp").join("x"), b"x").expect("tmp file");
+            }
+            if shape == "exit-cause a directory" {
+                fs::create_dir_all(job.join("exit-cause")).expect("exit-cause dir");
+            }
+            gc_stale_runtimes();
+            assert_eq!(
+                !runtime.exists() && !sessions.exists(),
+                collected,
+                "{shape}: collected iff the dir is a removed job's leftover"
+            );
+        });
+    }
+}
+
+/// The leftover reader's unix-only guard shapes: a `tmp` that is a SYMLINK to
+/// an empty dir (not a real dir), and a job dir whose listing fails (mode
+/// 0o300, so the `state.json` lookup gives NotFound and the listing gives
+/// EACCES). Each stays unreadable, so the dead pair is spared — fail closed.
+#[cfg(unix)]
+#[test]
+fn gc_spares_a_dead_pair_for_unreadable_leftover_guard_shapes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (shape, symlink_tmp, unlistable) in [
+        ("tmp a symlink to an empty dir", true, false),
+        ("an unlistable job dir", false, true),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".tollgate").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgrm", "runtime-4242-9", "4242-9");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ed");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if symlink_tmp {
+                let target = tmp.path().join("empty");
+                fs::create_dir_all(&target).expect("empty dir");
+                std::os::unix::fs::symlink(&target, job.join("tmp")).expect("symlink tmp");
+            }
+            if unlistable {
+                fs::create_dir_all(job.join("tmp")).expect("mkdir tmp");
+                fs::set_permissions(&job, fs::Permissions::from_mode(0o300)).expect("chmod");
+                // Running with rights that ignore the mode (root): the listing
+                // succeeds, so the unreadable shape cannot be posed; restore
+                // and skip the row rather than fail vacuously.
+                if fs::read_dir(&job).is_ok() {
+                    let _ = fs::set_permissions(&job, fs::Permissions::from_mode(0o700));
+                    return;
+                }
+            }
+            gc_stale_runtimes();
+            let spared = runtime.exists() && sessions.exists();
+            // Restore the mode before asserting so the tempdir teardown can
+            // remove the unlistable dir.
+            if unlistable {
+                let _ = fs::set_permissions(&job, fs::Permissions::from_mode(0o700));
+            }
+            assert!(
+                spared,
+                "{shape}: the dead pair is spared (unreadable, fail closed)"
+            );
+        });
+    }
+}
+
+/// #10: an isolated-flavor (`runtime-isolated-<sid>`) job-named dead pair is
+/// neither tombstoned nor deleted — the rescue path (rename to a tombstone,
+/// then delete outside the lock) must not run on a tree a live job reads.
+#[test]
+fn gc_spares_a_dead_isolated_pair_a_job_names_without_tombstoning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) =
+            dead_pair(&profiles, "bgiso", "runtime-isolated-4242-0", "4242-0");
+        write_claude_job(tmp.path(), "37560ded", &runtime);
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a named isolated tree must survive the sweep"
+        );
+        assert!(sessions.is_dir(), "its sessions dir goes nowhere either");
+        assert!(
+            !profiles
+                .join("bgiso")
+                .join("runtime-isolated-4242-0.rescuing")
+                .exists(),
+            "a named isolated tree must not be renamed to its rescue tombstone"
+        );
+    });
+}
+
+/// #11: the spare rule compares the job's config dir with the tree path in one
+/// canonical spelling, so a job naming the tree through a symlinked parent
+/// still spares it. Pins [`crate::canonical::identity`] over a raw path `==`.
+#[cfg(unix)]
+#[test]
+fn gc_spares_a_dead_pair_named_through_a_symlinked_parent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bglink", "runtime-4242-9", "4242-9");
+        let link = tmp.path().join("link-to-bglink");
+        std::os::unix::fs::symlink(profiles.join("bglink"), &link).expect("symlink");
+        write_claude_job(tmp.path(), "37560ded", &link.join("runtime-4242-9"));
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file() && sessions.is_dir(),
+            "a tree named through a symlinked parent must survive the sweep"
+        );
+    });
+}
+
+/// #4: the per-pair spare line fires only on a NAMED hit, by equality.
+#[test]
+fn gc_logs_the_per_pair_spare_line_once_for_a_named_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgnamed", "runtime-4242-5", "4242-5");
+        write_claude_job(tmp.path(), "37560ded", &runtime);
+
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        let per_pair = format!(
+            "tollgate: spared runtime tree {}: a live Claude Code background job names it",
+            runtime.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == per_pair).count(),
+            1,
+            "the per-pair spare line appears exactly once, by equality"
+        );
+        assert!(
+            !snap.iter().any(|l| l.contains("could not be read")),
+            "no sweep-level unreadable line under a named hit"
+        );
+        assert!(sessions.is_dir(), "its sessions dir goes nowhere either");
+    });
+}
+
+/// #4: under an unreadable store `spares` is true for every pair — live ones
+/// included — so a per-pair line there would claim a live job names each tree.
+/// The sweep-level line covers Unreadable, once per sweep; no per-pair line is
+/// logged.
+#[test]
+fn gc_logs_no_per_pair_spare_line_under_an_unreadable_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (_live_runtime, live_sessions) =
+            dead_pair(&profiles, "bglive", "runtime-4242-3", "4242-3");
+        let marker = open_pid_file(&live_sessions.join("4242-3")).expect("marker");
+        marker.lock().expect("lock");
+        let (_dead_runtime, _dead_sessions) =
+            dead_pair(&profiles, "bgdead", "runtime-4242-4", "4242-4");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99ec");
+        fs::create_dir_all(&job).expect("mkdir job dir");
+        fs::write(
+            job.join("state.json"),
+            br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+        )
+        .expect("torn job record");
+
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        let sweep_line = format!(
+            "tollgate: spared every dead runtime tree this sweep: a Claude Code \
+             background-job record under {} could not be read",
+            job.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == sweep_line).count(),
+            1,
+            "the sweep-level spare line appears exactly once, by equality"
+        );
+        assert!(
+            !snap.iter().any(|l| l.contains("spared runtime tree")),
+            "no per-pair spare line under an unreadable store, live or dead pair"
+        );
+        drop(marker);
+    });
+}
+
+/// A scoped failure (a tree's own unreadable `jobs/`) spares the tree and logs
+/// ONE sweep-level line naming the store, once per sweep; the per-pair line
+/// stays silent because no job was shown to name the tree.
+#[cfg(unix)]
+#[test]
+fn a_scoped_store_failure_logs_one_sweep_line_naming_the_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "g6tree", "runtime-4242-41", "4242-41");
+        let jobs = runtime.join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir tree jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        let sweep_line = format!(
+            "tollgate: spared runtime trees this sweep: the Claude Code \
+             background-job store {} could not be read",
+            jobs.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == sweep_line).count(),
+            1,
+            "the scoped spare logs one sweep-level line naming the store, by equality"
+        );
+        assert!(
+            !snap
+                .iter()
+                .any(|l| l.contains("a live Claude Code background job names it")),
+            "no per-pair line claims a job names a tree whose store merely could not be read"
+        );
+        assert!(runtime.exists() && sessions.exists(), "the tree is spared");
+        restore_readable(&jobs);
+    });
+}
+
+/// A crash (or a teardown that could not take the state lock) strands a
+/// session's per-spawn `--settings` file, which can hold a folded user `env`
+/// token. GC collects it with the dead session, a stray one with no session at
+/// all, and spares a held session's.
+#[test]
+fn gc_collects_a_dead_sessions_spawn_settings_file_and_spares_a_held_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+
+        let dead_runtime = profiles.join("ssdead").join("runtime-4343-0");
+        let dead_sessions = profiles.join("ssdead").join("sessions-4343-0");
+        fs::create_dir_all(&dead_runtime).expect("mkdir runtime");
+        fs::create_dir_all(&dead_sessions).expect("mkdir sessions");
+        fs::write(dead_sessions.join("4343-0"), b"").expect("dead marker");
+        let dead_file = spawn_settings_file(&dead_runtime, "4343-0");
+        fs::write(&dead_file, b"{}").expect("dead settings file");
+
+        let stray_file =
+            spawn_settings_file(&profiles.join("ssstray").join("runtime-5151-0"), "5151-0");
+        fs::create_dir_all(stray_file.parent().expect("profile dir")).expect("mkdir profile");
+        fs::write(&stray_file, b"{}").expect("stray settings file");
+
+        let held_runtime = profiles.join("sslive").join("runtime-778-3");
+        let held_sessions = profiles.join("sslive").join("sessions-778-3");
+        fs::create_dir_all(&held_runtime).expect("mkdir held runtime");
+        fs::create_dir_all(&held_sessions).expect("mkdir held sessions");
+        let marker = open_pid_file(&held_sessions.join("778-3")).expect("open held marker");
+        marker.lock().expect("lock held marker");
+        let held_file = spawn_settings_file(&held_runtime, "778-3");
+        fs::write(&held_file, b"{}").expect("held settings file");
+
+        // The other two marker layouts: an isolated session keys its marker
+        // `sessions-isolated-<sid>/<sid>`, a fake-mode shared one the bare
+        // `sessions/<sid>` beside the one shared `runtime` dir.
+        let iso_sessions = profiles.join("ssiso").join("sessions-isolated-779-1");
+        fs::create_dir_all(&iso_sessions).expect("mkdir isolated sessions");
+        let iso_marker = open_pid_file(&iso_sessions.join("779-1")).expect("open isolated marker");
+        iso_marker.lock().expect("lock isolated marker");
+        let iso_file = spawn_settings_file(
+            &profiles.join("ssiso").join("runtime-isolated-779-1"),
+            "779-1",
+        );
+        fs::write(&iso_file, b"{}").expect("isolated settings file");
+
+        let fake_sessions = profiles.join("ssfake").join("sessions");
+        fs::create_dir_all(&fake_sessions).expect("mkdir fake sessions");
+        let fake_marker = open_pid_file(&fake_sessions.join("780-2")).expect("open fake marker");
+        fake_marker.lock().expect("lock fake marker");
+        let fake_file = spawn_settings_file(&profiles.join("ssfake").join("runtime"), "780-2");
+        fs::write(&fake_file, b"{}").expect("fake-mode settings file");
+
+        // The same two layouts, crashed: markers present but unlocked.
+        let dead_iso_sessions = profiles.join("ssiso").join("sessions-isolated-881-1");
+        fs::create_dir_all(&dead_iso_sessions).expect("mkdir dead isolated sessions");
+        fs::write(dead_iso_sessions.join("881-1"), b"").expect("dead isolated marker");
+        let dead_iso_file = spawn_settings_file(
+            &profiles.join("ssiso").join("runtime-isolated-881-1"),
+            "881-1",
+        );
+        fs::write(&dead_iso_file, b"{}").expect("dead isolated settings file");
+        fs::write(fake_sessions.join("882-2"), b"").expect("dead fake-mode marker");
+        let dead_fake_file = spawn_settings_file(&profiles.join("ssfake").join("runtime"), "882-2");
+        fs::write(&dead_fake_file, b"{}").expect("dead fake-mode settings file");
+
+        gc_stale_runtimes();
+
+        for (file, flavor) in [
+            (&dead_iso_file, "isolated"),
+            (&dead_fake_file, "fake-mode shared"),
+        ] {
+            assert!(
+                !file.exists(),
+                "a dead {flavor} session's {} must be collected",
+                file.display()
+            );
+        }
+
+        assert!(
+            !dead_file.exists(),
+            "{} must go with its dead session",
+            dead_file.display()
+        );
+        assert!(
+            !stray_file.exists(),
+            "{} has no session at all",
+            stray_file.display()
+        );
+        for (file, flavor) in [
+            (&held_file, "real-mode shared"),
+            (&iso_file, "isolated"),
+            (&fake_file, "fake-mode shared"),
+        ] {
+            assert!(
+                file.is_file(),
+                "a held {flavor} marker must spare {}",
+                file.display()
+            );
+        }
+        drop((marker, iso_marker, fake_marker));
+    });
+}
+
 /// `acquire` mints a marker dir before it builds the tree, so a crash in that
 /// window strands one with no runtime sibling — a fresh empty dir every session
 /// under per-session keying. GC must collect it, and must still leave one whose
@@ -5602,12 +8985,16 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             start_profile: "rowdead".into(),
             harness: crate::harness::Harness::Claude,
             pid: 6001,
+            claude_pid: None,
+            launch_families: None,
             started_at: 1,
             cwd: None,
             isolated: false,
             follows_chain: false,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store: None,
@@ -5643,7 +9030,8 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("registered");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         // `live_sid`, not `sid_of`: the subject here is the ROW, which a host
         // sharing one runtime tree files exactly the same way. Reading the sid off
         // the tree's name instead would skip this wiring on every such host.
@@ -5704,7 +9092,8 @@ fn session_teardown_holds_the_state_flock_once() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("teardown-count");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
         drop(rt);
@@ -5856,13 +9245,16 @@ fn lone_session(
         crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
+        Launcher::Own,
         Some(store.to_path_buf()),
+        None,
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
         session,
         isolation,
         LinkMode::Real,
+        SessionTree::PerSession,
         launch,
         store,
         &paths,
@@ -5898,13 +9290,16 @@ fn fake_session(
         crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
+        Launcher::Own,
         Some(store.to_path_buf()),
+        None,
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
         session,
         isolation,
         LinkMode::Fake,
+        SessionTree::PerSession,
         launch,
         store,
         &paths,
@@ -5951,13 +9346,13 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("optin-flag");
 
-        let opted =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true).expect("acquire");
+        let opted = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true, Launcher::Own)
+            .expect("acquire");
         let opted_row = crate::live_sessions::get(&live_sid(&opted)).expect("the opted-in row");
         drop(opted);
 
-        let plain =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let plain = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let plain_row = crate::live_sessions::get(&live_sid(&plain)).expect("the opted-out row");
         drop(plain);
 
@@ -6000,7 +9395,7 @@ fn a_fake_mode_host_never_registers_a_session_as_following_the_chain() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("optin-fake");
         with_link_mode(LinkMode::Fake, || {
-            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true)
+            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true, Launcher::Own)
                 .expect("acquire under the shared fake-mode tree");
             let rows = crate::live_sessions::list();
             drop(rt);
@@ -6262,6 +9657,130 @@ fn rotation_is_blocked_by_a_live_session_only_on_macos() {
     assert!(!rotation_blocked_by_live_session(false, false));
 }
 
+/// A `tollgate start <p> -- --bg` session releases its marker at once and keeps
+/// reading its runtime tree's namespaced Keychain item, so on macOS a rotation
+/// strands it exactly like a marker-held session. Only an UNFINISHED job counts
+/// for the rotation gate: a stopped job nobody `claude rm`s must not freeze the
+/// chain until its access token dies. "Unfinished" is read off `state`, never
+/// `firstTerminalAt`: `claude attach` revives a stopped job as `running` with
+/// the stamp kept (measured 2.1.304, 2026-10-20). A state this reader does not
+/// know counts as unfinished, and so does a record without one.
+#[test]
+fn rotation_on_macos_waits_on_an_unfinished_background_job_only() {
+    let cases: [(&str, Option<&str>, bool); 6] = [
+        ("working", None, true),
+        ("blocked", None, true),
+        ("running", Some("2026-10-20T10:06:16.283Z"), true),
+        ("stopped", Some("2026-10-20T10:06:16.283Z"), false),
+        ("done", Some("2026-10-20T10:06:16.283Z"), false),
+        ("failed", Some("2026-10-20T10:06:16.283Z"), false),
+    ];
+    for (state, stamp, blocked) in cases {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let name = crate::profile::ProfileName::from("rotjob");
+            let tree = tmp.path().join(".tollgate/profiles/rotjob/runtime-4242-0");
+            fs::create_dir_all(&tree).expect("mkdir runtime");
+            write_claude_job_in(tmp.path(), "3fde53e3", &tree, state, stamp);
+            assert_eq!(
+                rotation_blocked_on(&name, true),
+                blocked,
+                "a job in state {state:?} decides the macOS rotation gate"
+            );
+            assert!(
+                !rotation_blocked_on(&name, false),
+                "off macOS the session shares the rotated file, whatever its job's state"
+            );
+        });
+    }
+}
+
+/// The fail-closed arms of the job term: a state this reader has never seen, a
+/// record with no `state` key, and a job dir whose record is not there yet (the
+/// mid-create shape) all block, since a false "finished" signs a session out.
+#[test]
+fn rotation_on_macos_reads_an_unknown_or_missing_job_state_as_unfinished() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("rotjob");
+        let tree = tmp.path().join(".tollgate/profiles/rotjob/runtime-4242-0");
+        fs::create_dir_all(&tree).expect("mkdir runtime");
+
+        let job = write_claude_job_in(tmp.path(), "3fde53e3", &tree, "hibernating", None);
+        assert!(
+            rotation_blocked_on(&name, true),
+            "an unknown state is unfinished"
+        );
+
+        let record = job.join("state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).expect("read job")).expect("parse job");
+        value.as_object_mut().expect("object").remove("state");
+        fs::write(&record, serde_json::to_vec(&value).expect("encode")).expect("rewrite job");
+        assert!(
+            rotation_blocked_on(&name, true),
+            "a record without a state is unfinished"
+        );
+
+        fs::remove_file(&record).expect("drop record");
+        fs::remove_dir(job.join("tmp")).expect("drop tmp");
+        assert!(
+            rotation_blocked_on(&name, true),
+            "a job dir without its record yet is unreadable, and unreadable blocks"
+        );
+
+        // A removed job's leftover (cloudy 2026-10-22): its supervisor's empty
+        // `tmp/` plus `exit-cause` is no job, so it blocks nothing.
+        fs::create_dir(job.join("tmp")).expect("leftover tmp");
+        fs::write(job.join("exit-cause"), b"SIGTERM").expect("leftover exit-cause");
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "a removed job's leftover dir is no unfinished job"
+        );
+
+        fs::remove_dir_all(&job).expect("claude rm");
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "with the job removed and no marker, nothing blocks"
+        );
+    });
+}
+
+/// The rotation narrowing never loosens the destructive gates: a stopped job
+/// still makes the profile live for delete, rename and disable, and its tree
+/// still survives GC, because a stopped job can be revived and read the tree
+/// again (`claude attach`).
+#[test]
+fn a_stopped_job_frees_rotation_but_keeps_the_profile_live() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("rotjob");
+        let profiles = tmp.path().join(".tollgate").join("profiles");
+        let (tree, sessions) = dead_pair(&profiles, "rotjob", "runtime-4242-0", "4242-0");
+        write_claude_job_in(
+            tmp.path(),
+            "3fde53e3",
+            &tree,
+            "stopped",
+            Some("2026-10-20T10:06:16.283Z"),
+        );
+
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "a stopped job frees rotation"
+        );
+        assert!(
+            has_live_session(&name),
+            "a stopped job still makes the profile live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            tree.join(".claude.json").is_file() && sessions.is_dir(),
+            "a stopped job's tree survives the sweep"
+        );
+    });
+}
+
 /// The profile-comparison half of the precondition, as a pure function the
 /// daemon's per-session walk shares. It exists so the two cannot drift: a
 /// candidate the executor refuses on CONFIG grounds has to be walked PAST, or the
@@ -6278,40 +9797,40 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut twin = make_profile("elig-twin");
     twin.env = launch.env.clone();
     twin.models = launch.models.clone();
-    assert_eq!(swap_eligible(&twin, &transport), Ok(()));
+    assert_eq!(swap_eligible(&twin, &transport, ModelsRule::Equal), Ok(()));
 
     let mut endpoint = twin.clone();
     endpoint.base_url = Some("https://api.example/anthropic".into());
     assert_eq!(
-        swap_eligible(&endpoint, &transport),
+        swap_eligible(&endpoint, &transport, ModelsRule::Equal),
         Err(SwapRefused::NotOauth)
     );
 
     let mut disabled = twin.clone();
     disabled.disabled = true;
     assert_eq!(
-        swap_eligible(&disabled, &transport),
+        swap_eligible(&disabled, &transport, ModelsRule::Equal),
         Err(SwapRefused::Disabled)
     );
 
     let mut env = twin.clone();
     env.env.insert("EXTRA".into(), "2".into());
     assert_eq!(
-        swap_eligible(&env, &transport),
+        swap_eligible(&env, &transport, ModelsRule::Equal),
         Err(SwapRefused::EnvDiffers)
     );
 
     let mut models = twin.clone();
     models.models.default = Some("opus".into());
     assert_eq!(
-        swap_eligible(&models, &transport),
+        swap_eligible(&models, &transport, ModelsRule::Equal),
         Err(SwapRefused::ModelsDiffers)
     );
 
     let mut keyed = twin.clone();
     keyed.api_key = Some("k".into());
     assert_eq!(
-        swap_eligible(&keyed, &transport),
+        swap_eligible(&keyed, &transport, ModelsRule::Equal),
         Err(SwapRefused::ApiKeyDiffers)
     );
 
@@ -6323,7 +9842,7 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut endpoint_and_disabled = endpoint.clone();
     endpoint_and_disabled.disabled = true;
     assert_eq!(
-        swap_eligible(&endpoint_and_disabled, &transport),
+        swap_eligible(&endpoint_and_disabled, &transport, ModelsRule::Equal),
         Err(SwapRefused::NotOauth),
         "the endpoint must be reported ahead of the disabled bit"
     );
@@ -6334,9 +9853,12 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut keyed_launch = launch.clone();
     keyed_launch.api_key = Some("k".into());
     let keyed_transport = LaunchTransport::of(&keyed_launch);
-    assert_eq!(swap_eligible(&keyed, &keyed_transport), Ok(()));
     assert_eq!(
-        swap_eligible(&twin, &keyed_transport),
+        swap_eligible(&keyed, &keyed_transport, ModelsRule::Equal),
+        Ok(())
+    );
+    assert_eq!(
+        swap_eligible(&twin, &keyed_transport, ModelsRule::Equal),
         Err(SwapRefused::ApiKeyDiffers)
     );
 }
@@ -6392,6 +9914,521 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
         assert_eq!(cleared("pre-disabled"), Err(SwapRefused::Disabled));
         assert_eq!(cleared("pre-keyed"), Err(SwapRefused::ApiKeyDiffers));
         assert_eq!(cleared("pre-absent"), Err(SwapRefused::NoCredentialStore));
+    });
+}
+
+/// The live-session row records the transport the session booted with: the
+/// one built from the on-disk profile the swap snapshots, so the daemon's leg
+/// and the executor judge members against one value. An `[env]` entry can
+/// carry an inference credential, so the row holds no `[env]` value at all.
+#[test]
+fn acquire_records_the_boot_transport_without_any_env_value() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let mut profile = make_profile("boot-env");
+        profile
+            .env
+            .insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-boot-secret-value".into());
+        profile
+            .env
+            .insert("OTHER_SETTING".into(), "plain-boot-value".into());
+        register_profile(&profile);
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+
+        let row = crate::live_sessions::get(rt.session_id()).expect("the session's row");
+        let on_disk = crate::profile::load_profile(&profile.name).expect("load the profile");
+        assert_eq!(row.boot_transport, Some(LaunchTransport::of(&on_disk)));
+
+        let raw = fs::read_to_string(
+            tmp.path()
+                .join(".tollgate")
+                .join("live_sessions")
+                .join(format!("{}.json", rt.session_id())),
+        )
+        .expect("read the row file");
+        for value in ["sk-boot-secret-value", "plain-boot-value"] {
+            assert!(
+                !raw.contains(value),
+                "the row must not hold `{value}`:\n{raw}"
+            );
+        }
+        drop(rt);
+    });
+}
+
+/// Two transports are equal exactly when their `[env]` maps are: a pair split
+/// at a different `=` is a different env, and a reordered insert is the same.
+/// The executor refuses `EnvDiffers` on this equality, so a collision here is
+/// a swap into a session whose child never received the target's env.
+#[test]
+fn launch_transports_differ_exactly_when_their_env_maps_do() {
+    let with_env = |pairs: &[(&str, &str)]| {
+        let mut p = make_profile("env-eq");
+        for (k, v) in pairs {
+            p.env.insert((*k).into(), (*v).into());
+        }
+        LaunchTransport::of(&p)
+    };
+    assert_eq!(
+        with_env(&[("A", "1"), ("B", "2")]),
+        with_env(&[("B", "2"), ("A", "1")])
+    );
+    assert_ne!(with_env(&[("A", "b=c")]), with_env(&[("A=b", "c")]));
+    assert_ne!(with_env(&[("AB", "")]), with_env(&[("A", "B")]));
+    assert_ne!(with_env(&[("A", "1"), ("B", "")]), with_env(&[("A", "1")]));
+    assert_ne!(with_env(&[("A", "1")]), with_env(&[]));
+    // A changed VALUE under the same key is a different env: a rotated
+    // `ANTHROPIC_AUTH_TOKEN` or a moved `ANTHROPIC_BASE_URL` never reaches a
+    // running child.
+    assert_ne!(with_env(&[("A", "1")]), with_env(&[("A", "2")]));
+    assert_ne!(with_env(&[("A", "12")]), with_env(&[("A", "21")]));
+}
+
+/// The transport is stored on the live-session row, and a row outlives a
+/// binary upgrade: a daemon on a newer build judges a session an older build
+/// started. So its serialized form is a format. The digests below were
+/// computed outside the crate (Python `hashlib.sha256` over the pair count,
+/// then each key and value, each as a little-endian `u64` byte length followed
+/// by its UTF-8 bytes, in sorted key order). A digest change makes every
+/// running session's row mismatch every member until it restarts; a shape
+/// change makes those rows unreadable, so they drop out of every row reader.
+#[test]
+fn a_launch_transport_serializes_to_a_stable_row_format() {
+    let empty = make_profile("fmt-empty");
+    assert_eq!(
+        serde_json::to_value(LaunchTransport::of(&empty)).expect("serialize"),
+        serde_json::json!({
+            "env_digest": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+            "models": {},
+            "has_api_key": false,
+        })
+    );
+
+    let mut routed = make_profile("fmt-routed");
+    routed.env.insert(
+        "ANTHROPIC_BASE_URL".into(),
+        "https://api.example/anthropic".into(),
+    );
+    routed.env.insert("Z".into(), "ü".into());
+    routed.api_key = Some("k".into());
+    let value = serde_json::to_value(LaunchTransport::of(&routed)).expect("serialize");
+    assert_eq!(
+        value["env_digest"],
+        "0a8287ebfd17c95b416cf2bd16f3bbcdc43fd5ccd6e6d4e8b0321d6014373929"
+    );
+    assert_eq!(value["has_api_key"], true);
+    let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");
+    assert_eq!(back, LaunchTransport::of(&routed));
+
+    // Every `ModelSettings` field is a `settings.json` key a session boots with,
+    // so a renamed serde key would read `None` on every pre-upgrade row and flip
+    // the leg to `ModelsDiffers`. Pin every key literal and the round-trip.
+    let mut modeled = make_profile("fmt-models");
+    modeled.models = crate::profile::ModelSettings {
+        default: Some("model-default".into()),
+        opus: Some("model-opus".into()),
+        sonnet: Some("model-sonnet".into()),
+        haiku: Some("model-haiku".into()),
+        fable: Some("model-fable".into()),
+        subagent: Some("model-subagent".into()),
+    };
+    let value = serde_json::to_value(LaunchTransport::of(&modeled)).expect("serialize");
+    assert_eq!(
+        value["models"],
+        serde_json::json!({
+            "default": "model-default",
+            "opus": "model-opus",
+            "sonnet": "model-sonnet",
+            "haiku": "model-haiku",
+            "fable": "model-fable",
+            "subagent": "model-subagent",
+        })
+    );
+    let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");
+    assert_eq!(back, LaunchTransport::of(&modeled));
+}
+
+/// A `credentials.json` that parses but holds no login installs an empty login
+/// into the session, signing it out. The swap's precondition re-reads the
+/// intended member's stored login lock-free and refuses the proven-none state.
+#[test]
+fn the_precondition_refuses_a_credentials_store_holding_no_login() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pc-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        for body in ["{}", "{\"mcpOauth\": {\"accessToken\": \"x\"}}"] {
+            let gamma = member("pc-empty");
+            let store = member_store(&gamma);
+            std::fs::write(&store, body).expect("write a login-less credentials store");
+
+            assert_eq!(
+                swap.precondition("pc-empty").map(|plan| plan.member),
+                Err(SwapRefused::NoCredentialStore),
+                "a store that parses with no login is refused, never installed"
+            );
+        }
+    });
+}
+
+/// A torn `credentials.json` reads [`crate::profile::StoredLogin::Unknown`],
+/// so the re-read — which runs BEFORE the profile load — refuses it as
+/// [`SwapRefused::LoginUnreadable`] and no parse-error text reaches the line.
+/// A readable login beside a torn `config.toml` still fails the load: see
+/// `the_precondition_refuses_a_pair_member_whose_config_is_torn_as_unreadable_profile`.
+#[test]
+fn the_precondition_refuses_a_torn_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pt-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pt-torn");
+        let store = member_store(&gamma);
+        std::fs::write(&store, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the intended member's store");
+
+        assert_eq!(
+            swap.precondition("pt-torn").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a torn credentials store is refused as an unreadable login"
+        );
+    });
+}
+
+/// A key member (api key in `config.toml`, no OAuth pair, no sidecar) whose
+/// `config.toml` is torn reads [`crate::profile::StoredLogin::Unknown`], so the
+/// re-read refuses it as [`SwapRefused::LoginUnreadable`] before `load_profile`
+/// can put the parse error's bytes on the line.
+#[test]
+fn the_precondition_refuses_a_key_member_whose_config_is_torn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pk-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let mut keyed = make_profile("pk-key");
+        keyed.api_key = Some("k".into());
+        member_store(&keyed);
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("pk-key"))
+            .expect("profile dir")
+            .join("config.toml");
+        std::fs::write(&config, "api_key = \"sk-").expect("tear the key member's config.toml");
+
+        assert_eq!(
+            swap.precondition("pk-key").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a key member whose config.toml is torn is refused as an unreadable login"
+        );
+    });
+}
+
+/// A pair member whose `credentials.json` reads fine but whose `config.toml` is
+/// torn reads [`crate::profile::StoredLogin::HoldsLogin`], so the re-read passes
+/// it through to `load_profile`, which refuses it as
+/// [`SwapRefused::ProfileUnreadable`] — the re-read must not swallow a genuine
+/// load failure past a readable login.
+#[test]
+fn the_precondition_refuses_a_pair_member_whose_config_is_torn_as_unreadable_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pp-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pp-torn-config");
+        member_store(&gamma);
+        let config =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("pp-torn-config"))
+                .expect("profile dir")
+                .join("config.toml");
+        std::fs::write(&config, "base_url = \"").expect("tear the pair member's config.toml");
+
+        assert!(
+            matches!(
+                swap.precondition("pp-torn-config"),
+                Err(SwapRefused::ProfileUnreadable(_))
+            ),
+            "a readable login beside a torn config.toml is refused as an unreadable profile"
+        );
+    });
+}
+
+/// The shared target check is a read-only question: a member holding a legacy
+/// `credentials.json.pending` sidecar is checked, and neither `credentials.json`
+/// nor the sidecar changes — the check must not adopt the sidecar the way
+/// `load_profile`'s recovery does. Modelled on
+/// `pending_sidecar_newer_than_the_commit_is_adopted_and_written_through`.
+#[test]
+fn the_shared_target_check_does_not_adopt_a_legacy_pending_sidecar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("scp-launch");
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let gamma = member("scp-pending");
+        let store = member_store(&gamma);
+        let pending =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("scp-pending"))
+                .expect("profile dir")
+                .join("credentials.json.pending");
+        std::fs::write(
+            &pending,
+            "{\"claudeAiOauth\":{\"accessToken\":\"at-pending\",\"refreshToken\":\"rt-pending\"}}",
+        )
+        .expect("write a legacy pending sidecar");
+        // Newer than the committed store, so a full load would adopt it.
+        let now = std::time::SystemTime::now();
+        crate::testutil::set_mtime(&store, now - std::time::Duration::from_secs(60));
+        crate::testutil::set_mtime(&pending, now);
+        let before_store = std::fs::read(&store).expect("read store before");
+        let before_pending = std::fs::read(&pending).expect("read pending before");
+
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &crate::profile::ProfileName::from("scp-pending"),
+                &launch,
+                crate::runtime::ModelsRule::Equal,
+            )
+            .is_ok(),
+            "a pair member with a legacy sidecar passes the shared check"
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("read store after"),
+            before_store,
+            "the shared check must not write credentials.json"
+        );
+        assert_eq!(
+            std::fs::read(&pending).expect("read pending after"),
+            before_pending,
+            "the shared check must not consume or rewrite the pending sidecar"
+        );
+    });
+}
+
+/// The shared target check resolves an adoptable legacy `.pending` exactly as a
+/// full load would: a member with NO committed `credentials.json`, a long-lived
+/// sidecar login, a leftover `base_url` and an adoptable `.pending` passes the
+/// check — `read_profile` adopts the sidecar in memory, so the pair wins over
+/// the leftover endpoint — while nothing on disk changes. Modelled on
+/// `pending_sidecar_is_adopted_when_no_commit_exists_at_all`.
+#[test]
+fn the_shared_target_check_resolves_an_adoptable_pending_sidecar_like_a_full_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("r10p-launch");
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let name = crate::profile::ProfileName::from("r10p-pend-baseurl");
+        // No committed credentials: `save_profile` with `credentials: None`
+        // writes config.toml only, so the sidecar below is the only pair.
+        let mut gamma = make_profile("r10p-pend-baseurl");
+        gamma.base_url = Some("https://api.example/anthropic".into());
+        crate::profile::save_profile(&gamma).expect("save profile");
+        crate::testutil::write_long_lived_sidecar(&name);
+        let pending = crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json.pending");
+        std::fs::write(
+            &pending,
+            "{\"claudeAiOauth\":{\"accessToken\":\"at-pending\",\"refreshToken\":\"rt-pending\"}}",
+        )
+        .expect("write a legacy pending sidecar");
+        let before_pending = std::fs::read(&pending).expect("read pending before");
+        let store = crate::claude::install_source_path(&name).expect("install source");
+        let before_store = std::fs::read(&store).expect("read store before");
+        let cred_path = crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json");
+
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &name,
+                &launch,
+                crate::runtime::ModelsRule::Equal
+            )
+            .is_ok(),
+            "the shared check resolves the adoptable sidecar exactly as a full load would"
+        );
+        assert_eq!(
+            std::fs::read(&pending).expect("read pending after"),
+            before_pending,
+            "the shared check must not consume or rewrite the pending sidecar"
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("read store after"),
+            before_store,
+            "the shared check must not write the install source"
+        );
+        assert!(
+            !cred_path.exists(),
+            "the resolve is in memory only: no credentials.json is written through"
+        );
+    });
+}
+
+/// The shared target check must not rewrite `config.toml`, and must not land a
+/// legacy `.pending` sidecar either: it reads through `read_profile`, which
+/// leaves both for the next ordinary load. The `[env]` key `A.B` keeps the
+/// check on its `Ok` path (a launch carrying the same env), so the read reaches
+/// past the transport gate. The fixture is asserted LIVE: a full load on a
+/// sibling copy still writes — it lands the sidecar as `credentials.json` — so
+/// the pin stays armed. Residual: no valid `config.toml` makes a full load
+/// rewrite it anymore (the render round-trips), so the control observes the
+/// sidecar write-through, never a config rewrite.
+#[test]
+fn the_shared_target_check_does_not_rewrite_config_toml() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let mut launch = member("scc-launch");
+        launch.env.insert("A.B".into(), "x".into());
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let seed = |name: &str| {
+            crate::profile::save_profile(&member(name)).expect("save member");
+            let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("profile dir");
+            let config = dir.join("config.toml");
+            std::fs::write(&config, "[env]\n\"A.B\" = \"x\"\n")
+                .expect("write the launch-matching env config");
+            let creds = dir.join("credentials.json");
+            // An adoptable legacy `.pending` sidecar, written after
+            // `credentials.json` so its mtime is not older: an ordinary load
+            // lands it under the flock.
+            let pending = dir.join("credentials.json.pending");
+            std::fs::write(
+                &pending,
+                "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}",
+            )
+            .expect("write the legacy sidecar");
+            (config, creds, pending)
+        };
+
+        // The fixture is live: a full load lands the sidecar, rewriting
+        // `credentials.json`.
+        let (_, live_creds, live_pending) = seed("scc-rewrite-live");
+        let live_creds_before = std::fs::read(&live_creds).expect("read live credentials before");
+        crate::profile::load_profile(&crate::profile::ProfileName::from("scc-rewrite-live"))
+            .expect("load live profile");
+        assert_ne!(
+            std::fs::read(&live_creds).expect("read live credentials after"),
+            live_creds_before,
+            "fixture liveness: a full load lands the sidecar"
+        );
+        assert!(
+            !live_pending.exists(),
+            "fixture liveness: a full load consumes the sidecar"
+        );
+
+        let (config, creds, pending) = seed("scc-rewrite");
+        let before = std::fs::read(&config).expect("read config before");
+        let creds_before = std::fs::read(&creds).expect("read credentials before");
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &crate::profile::ProfileName::from("scc-rewrite"),
+                &launch,
+                crate::runtime::ModelsRule::Equal,
+            )
+            .is_ok(),
+            "the check runs on its Ok path: the launch carries the same env"
+        );
+        assert_eq!(
+            std::fs::read(&config).expect("read config after"),
+            before,
+            "the shared check must not rewrite config.toml"
+        );
+        assert_eq!(
+            std::fs::read(&creds).expect("read credentials after"),
+            creds_before,
+            "the shared check must not land the sidecar"
+        );
+        assert!(
+            pending.exists(),
+            "the shared check must not consume the sidecar"
+        );
+    });
+}
+
+/// The `LoginUnreadable` refusal renders the approved copy and composes into the
+/// session's stay line exactly: the intended member is blamed, and the reason is
+/// the store's unreadability rather than a profile load failure.
+#[test]
+fn the_login_unreadable_refusal_composes_the_approved_line() {
+    assert_eq!(
+        refusal_line("3f2a", "alpha", "gamma", &SwapRefused::LoginUnreadable),
+        "tollgate: session 3f2a stays on alpha: gamma is not swappable (its stored login could not be read)",
+        "the exact approved copy: an unreadable stored login, not a profile load failure"
+    );
+}
+
+/// A sidecar-only member whose `session-token.json` is torn is an UNREADABLE
+/// login, never a proven absence: `install_source_path` falls back to the absent
+/// `credentials.json`, so the existence check alone would read `NoCredentialStore`.
+/// The re-read runs BEFORE that check and refuses `LoginUnreadable`.
+#[test]
+fn the_precondition_refuses_a_sidecar_only_member_whose_sidecar_is_torn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pst-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = make_profile("pst-side");
+        register_profile(&gamma);
+        crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from("pst-side"));
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("pst-side"))
+            .expect("profile dir")
+            .join("session-token.json");
+        std::fs::write(&sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the sidecar-only member's sidecar");
+
+        assert_eq!(
+            swap.precondition("pst-side").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a torn sidecar is an unreadable login, not a proven absence"
+        );
+    });
+}
+
+/// The pin the round-6 review asked for (Q1): `credentials.json` = `{}` beside a
+/// torn `session-token.json` loads fine, so `load_profile` cannot refuse it, and
+/// only the login re-read stands between it and installing an empty login.
+#[test]
+fn the_precondition_refuses_an_empty_store_beside_a_torn_sidecar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pes-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pes-empty-side");
+        let store = member_store(&gamma);
+        std::fs::write(&store, "{}").expect("write an empty credentials store");
+        crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from(
+            "pes-empty-side",
+        ));
+        let sidecar =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("pes-empty-side"))
+                .expect("profile dir")
+                .join("session-token.json");
+        std::fs::write(&sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the sidecar");
+
+        assert_eq!(
+            swap.precondition("pes-empty-side").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "an empty store beside a torn sidecar is refused as an unreadable login"
+        );
     });
 }
 
@@ -6496,7 +10533,8 @@ fn a_swap_keeps_both_members_marked_live_and_both_rotation_candidates() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("rot-b").expect("swap"),
@@ -7117,7 +11155,8 @@ fn teardown_removes_every_marker_a_swap_stamped() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("down-b").expect("swap"),
@@ -7805,6 +11844,67 @@ fn poll_executes_the_member_the_daemon_named() {
     });
 }
 
+/// A credit-cap leave is the ONE move that may land on a member whose
+/// `[models]` differ: the daemon's `credit_leave` flag on the row relaxes the
+/// models-equal rule, and its absence keeps it. Driven through `poll`, which
+/// reads the row the executor reads.
+#[test]
+fn poll_relaxes_models_for_a_credit_leave_and_only_then() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let launch = member("credit-a");
+        let mut intended = member("credit-b");
+        intended.models.default = Some("opus".to_owned());
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        crate::live_sessions::update_as_session(&sid, |s| {
+            s.set_launch_families(vec!["fable".to_owned()]);
+        })
+        .expect("session write");
+
+        // No credit reason: the models-equal rule refuses.
+        crate::live_sessions::update_as_daemon(&sid, |d| {
+            d.set_intended_member("credit-b");
+            d.set_credit_leave(false);
+        })
+        .expect("daemon write");
+        swap.poll();
+        assert_eq!(swap.member(), "credit-a", "models differ, no credit leave");
+        assert_eq!(
+            swap.cell().last_refusal,
+            Some(("credit-b".to_string(), SwapRefused::ModelsDiffers))
+        );
+
+        // A credit-cap leave: the relaxed rule admits.
+        crate::live_sessions::update_as_daemon(&sid, |d| {
+            d.set_intended_member("credit-b");
+            d.set_credit_leave(true);
+        })
+        .expect("daemon write");
+        swap.poll();
+        assert_eq!(
+            swap.member(),
+            "credit-b",
+            "a credit leave may land on differing models"
+        );
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            intended_store
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(
+            row.launch_families,
+            Some(vec!["fable".to_owned()]),
+            "a swap moves credentials only, never the launch demand"
+        );
+    });
+}
+
 /// A standing intent the executor refuses re-fires every tick, so announcing
 /// unconditionally writes one line per second for as long as it stands — but a
 /// refusal nothing ever says leaves the session on its launch account invisibly.
@@ -8204,10 +12304,11 @@ fn a_convergence_keychain_failure_memo_silences_a_standing_fault() {
 // ── bare `claude` session markers ────────────────────────────────────────────
 
 /// The whole safety argument for counting bare sessions: their markers live
-/// OUTSIDE `profiles/`, so `has_live_session` — which gates delete, disable, and
-/// every macOS rotation leg — reads exactly the `tollgate start` sessions it read
-/// before. Both directions, because a marker namespace that suppressed a real
-/// session's marker would be the same defect pointing the other way.
+/// OUTSIDE `profiles/`, so `has_live_session` (delete, disable, rename) and the
+/// marker term of the macOS rotation gate read exactly the profile's own
+/// markers, never a bare session's. Both directions, because a marker
+/// namespace that suppressed a real session's marker would be the same defect
+/// pointing the other way.
 #[test]
 fn a_bare_session_marker_is_invisible_to_has_live_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -8230,6 +12331,32 @@ fn a_bare_session_marker_is_invisible_to_has_live_session() {
         assert!(
             has_live_session(&crate::profile::ProfileName::from("work")),
             "a real `tollgate start` session still reads live with a bare marker present"
+        );
+    });
+}
+
+/// A live marker short-circuits the fresh [`has_live_session`] before the job
+/// store is read: the union checks the marker first and only walks
+/// `~/.claude/jobs` when no marker is live, so the common live-`tollgate start`
+/// case pays no store walk.
+#[test]
+fn a_fresh_has_live_session_reads_the_store_zero_times_while_a_marker_is_live() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("work");
+        let _live = hold_session_row_marker(&name, false, "4242-0").expect("hold a session");
+        assert!(
+            has_live_session(&name),
+            "fixture control: the held marker alone reads live"
+        );
+
+        crate::claude_jobs::reset_job_trees_reads();
+        let live = has_live_session(&name);
+        assert!(live, "the live marker keeps the session live");
+        assert_eq!(
+            crate::claude_jobs::job_trees_reads(),
+            0,
+            "a live marker must short-circuit the job-store read"
         );
     });
 }
@@ -8370,10 +12497,10 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         // `resolve_credential_winner` keeps canonical on an mtime tie.
         set_mtime(&canonical, SystemTime::now() - Duration::from_secs(60));
 
-        let a =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire a");
-        let b =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire a");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire b");
 
         // A hang guard, not a timing pin: the event path converges in
         // milliseconds, and the tick counters below are what separate it from
@@ -8794,12 +12921,16 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         start_profile: profile.to_string(),
         harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store,
@@ -8943,9 +13074,9 @@ fn no_live_session_is_not_rotatable() {
 
 /// The narrowing has to be WIRED, not merely defined. Every test above drives
 /// `live_session_holds_rotatable` directly, so deleting its conjunct from
-/// `rotation_blocked_for` would leave them all green. macOS-gated because that
-/// is the only host where the refusal is armed at all.
-#[cfg(target_os = "macos")]
+/// `rotation_blocked_for` would leave them all green. Driven through
+/// `rotation_blocked_on` with the macOS host posed, so the Linux gate pins it
+/// too.
 #[test]
 fn rotation_blocked_for_reads_what_the_live_session_holds() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -8956,7 +13087,7 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
         write_creds(&rotating, Some("rt-live"));
         let _a = live_session_launched_on("wired-rot", "88888-0", &rotating);
         assert!(
-            rotation_blocked_for(&crate::profile::ProfileName::from("wired-rot")),
+            rotation_blocked_on(&crate::profile::ProfileName::from("wired-rot"), true),
             "a live session on a rotating pair must still refuse"
         );
 
@@ -8967,9 +13098,196 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
         write_creds(&refreshless, None);
         let _b = live_session_launched_on("wired-roll", "99999-0", &refreshless);
         assert!(
-            !rotation_blocked_for(&crate::profile::ProfileName::from("wired-roll")),
+            !rotation_blocked_on(&crate::profile::ProfileName::from("wired-roll"), true),
             "the narrowing is not wired into rotation_blocked_for"
         );
+    });
+}
+
+/// An unfinished background job's tree under `profile`, its
+/// `.credentials.json` holding `refresh` (`None` = refresh-less).
+fn unfinished_job_tree(
+    home: &Path,
+    profile: &str,
+    runtime: &str,
+    id: &str,
+    refresh: Option<&str>,
+) -> PathBuf {
+    let tree = home.join(".tollgate/profiles").join(profile).join(runtime);
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    write_creds(&tree.join(".credentials.json"), refresh);
+    write_claude_job_in(home, id, &tree, "working", None)
+}
+
+/// The job term is scoped to the profile's own dir: a rotating job under
+/// `rotjob2` blocks `rotjob2` alone, never the profile whose name it extends,
+/// and a profile with no dir is blocked by nothing.
+#[test]
+fn an_unfinished_job_blocks_only_the_profile_whose_tree_it_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".tollgate/profiles/rotjob")).expect("mkdir");
+        unfinished_job_tree(tmp.path(), "rotjob2", "runtime-1-0", "cc000001", Some("rt"));
+        let blocked =
+            |name: &str| rotation_blocked_on(&crate::profile::ProfileName::from(name), true);
+        assert_eq!(
+            (blocked("rotjob"), blocked("rotjob2"), blocked("nodir")),
+            (false, true, false)
+        );
+    });
+}
+
+/// One rotating tree among several unfinished ones is enough to block: a
+/// refresh-less tree alone frees the chain, and adding a rotating one beside it
+/// blocks again (the fail-open side of the quantifier).
+#[test]
+fn any_rotating_unfinished_tree_blocks_beside_refreshless_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("mix");
+        unfinished_job_tree(tmp.path(), "mix", "runtime-1-0", "dd000001", None);
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "a refresh-less tree alone frees the chain"
+        );
+        unfinished_job_tree(tmp.path(), "mix", "runtime-2-0", "dd000002", Some("rt"));
+        assert!(
+            rotation_blocked_on(&name, true),
+            "a rotating tree beside it blocks"
+        );
+    });
+}
+
+/// A job naming its tree through a symlinked spelling of the profile dir
+/// still counts: both sides compare canonical identities.
+#[cfg(unix)]
+#[test]
+fn a_job_naming_the_tree_through_a_symlink_still_blocks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let real = tmp.path().join(".tollgate/profiles/sym/runtime-1-0");
+        fs::create_dir_all(&real).expect("mkdir");
+        write_creds(&real.join(".credentials.json"), Some("rt"));
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(tmp.path().join(".tollgate/profiles/sym"), &alias)
+            .expect("link");
+        write_claude_job_in(
+            tmp.path(),
+            "ee000001",
+            &alias.join("runtime-1-0"),
+            "working",
+            None,
+        );
+        assert!(rotation_blocked_on(
+            &crate::profile::ProfileName::from("sym"),
+            true
+        ));
+    });
+}
+
+/// A `state` of any shape keeps the store readable, so a retyped field never
+/// freezes every gate: missing, `null`, a number and an object all read as an
+/// unfinished job (blocking its own profile only), and only `"stopped"` frees.
+#[test]
+fn any_job_state_shape_keeps_the_store_readable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let job = unfinished_job_tree(tmp.path(), "st", "runtime-1-0", "ff000001", Some("rt"));
+        let record = job.join("state.json");
+        let set_state = |state: Option<serde_json::Value>| {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&record).expect("read")).expect("parse");
+            let object = value.as_object_mut().expect("object");
+            match state {
+                Some(state) => {
+                    object.insert("state".into(), state);
+                }
+                None => {
+                    object.remove("state");
+                }
+            }
+            fs::write(&record, serde_json::to_vec(&value).expect("encode")).expect("write");
+        };
+        let own = crate::profile::ProfileName::from("st");
+        let other = crate::profile::ProfileName::from("unrelated");
+        for (label, state, own_blocked) in [
+            ("missing", None, true),
+            ("null", Some(serde_json::Value::Null), true),
+            ("number", Some(serde_json::json!(42)), true),
+            ("object", Some(serde_json::json!({"kind": "stopped"})), true),
+            ("stopped", Some(serde_json::json!("stopped")), false),
+        ] {
+            set_state(state);
+            assert_eq!(
+                (
+                    matches!(
+                        crate::claude_jobs::job_trees(),
+                        crate::claude_jobs::JobTrees::Named(_)
+                    ),
+                    rotation_blocked_on(&own, true),
+                    has_live_session(&other),
+                    rotation_blocked_on(&other, true),
+                ),
+                (true, own_blocked, false, false),
+                "a {label} state"
+            );
+        }
+    });
+}
+
+/// The job term narrows the way the marker term does: it asks what the
+/// background session's tree HOLDS. A tree whose `.credentials.json` parses
+/// with no refresh token (a `session-token.json` sidecar, linked or copied)
+/// has nothing a rotation can strand, so an unfinished job on it frees the
+/// chain; a rotating pair, or anything this read cannot judge (no file, a
+/// dangling link, unparseable bytes), still blocks.
+#[test]
+fn an_unfinished_job_on_a_refreshless_tree_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("rotjob");
+        let dir = crate::profile::profile_dir(&name).expect("profile_dir");
+        let tree = dir.join("runtime-4242-0");
+        fs::create_dir_all(&tree).expect("mkdir runtime");
+        write_claude_job(tmp.path(), "3fde53e3", &tree);
+        let creds = tree.join(".credentials.json");
+
+        assert!(
+            rotation_blocked_on(&name, true),
+            "a tree with no credentials file cannot be judged, so it blocks"
+        );
+
+        write_creds(&creds, Some("rt-live"));
+        assert!(
+            rotation_blocked_on(&name, true),
+            "a tree holding a rotating pair blocks"
+        );
+
+        write_creds(&creds, None);
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "a tree holding no refresh token frees the chain"
+        );
+
+        fs::write(&creds, b"{\"claudeAiOauth\":").expect("torn creds");
+        assert!(
+            rotation_blocked_on(&name, true),
+            "unparseable credentials block"
+        );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(&creds).expect("drop creds");
+            let sidecar = dir.join("session-token.json");
+            write_creds(&sidecar, None);
+            std::os::unix::fs::symlink(&sidecar, &creds).expect("link creds");
+            assert!(
+                !rotation_blocked_on(&name, true),
+                "a tree linking a refresh-less sidecar frees the chain"
+            );
+            fs::remove_file(&sidecar).expect("drop sidecar");
+            assert!(rotation_blocked_on(&name, true), "a dangling link blocks");
+        }
     });
 }
 
@@ -9530,6 +13848,7 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].harness, crate::harness::Harness::Codex);
     assert_eq!(rows[0].start_profile, "cx");
+    assert!(!rows[0].is_delegate, "a codex row is own");
     assert_eq!(
         rows[0].launch_store.as_deref(),
         Some(session_home.join("auth.json").as_path()),
@@ -9597,6 +13916,141 @@ fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
             "teardown must never remove the profile's memory because the last session left"
         );
     });
+}
+
+/// An isolated codex session on a host that cannot symlink holds its marker
+/// under the bare `sessions-isolated` stem, where claude's isolated layout
+/// keeps the session suffix. The row probe must find it there, or GC reaps
+/// the live row and the tally and listing lose the session.
+#[test]
+fn a_fake_mode_isolated_codex_row_stays_live_and_survives_row_gc() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".tollgate/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+        let sid = runtime.session.as_str().to_owned();
+        assert_eq!(
+            runtime.pid_file,
+            profile.join("sessions-isolated").join(&sid),
+            "fixture: fake mode stamps the bare isolated stem"
+        );
+
+        assert!(
+            session_row_is_live(&ProfileName::from("cx"), true, &sid),
+            "the held marker must read live"
+        );
+        gc_live_session_rows();
+        let rows: Vec<String> = crate::live_sessions::list()
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect();
+        assert_eq!(rows, vec![sid], "row GC must keep the live session's row");
+
+        drop(runtime);
+    });
+}
+
+/// The isolated codex marker under real symlinks is keyed per session, so the
+/// probe must keep finding `sessions-isolated-<sid>` — the arm that must not be
+/// displaced by the fake-mode collapse.
+#[test]
+fn a_real_mode_isolated_codex_row_stays_live() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".tollgate/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    if !host_poses(&profile, "a real-symlink isolated codex home") {
+        return;
+    }
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+    let sid = runtime.session.as_str().to_owned();
+    assert_eq!(
+        runtime.pid_file,
+        profile.join(format!("sessions-isolated-{sid}")).join(&sid),
+        "fixture: real mode keeps the per-session stem"
+    );
+    assert!(
+        session_row_is_live(&ProfileName::from("cx"), true, &sid),
+        "the held marker must read live"
+    );
+
+    drop(runtime);
+}
+
+/// A shared codex session under the fake transport holds its marker in the bare
+/// `sessions` dir, the one path the claude shared-fake layout also uses; the
+/// probe must read it there for a codex row.
+#[test]
+fn a_fake_mode_shared_codex_row_stays_live() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".tollgate/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+        let sid = runtime.session.as_str().to_owned();
+        assert_eq!(
+            runtime.pid_file,
+            profile.join("sessions").join(&sid),
+            "fixture: fake mode stamps the bare shared stem"
+        );
+        assert!(
+            session_row_is_live(&ProfileName::from("cx"), false, &sid),
+            "the held marker must read live"
+        );
+
+        drop(runtime);
+    });
+}
+
+/// [`hold_session_row_marker`] stamps the first candidate, which must stay the
+/// claude per-session (`LinkMode::Real`) layout: the codex candidates sit after
+/// it, and under the fake transport the codex shared path is a bare dir.
+#[test]
+fn holding_a_row_marker_stamps_the_claude_real_layout() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("cx");
+
+    let _marker = hold_session_row_marker(&name, false, "4242-0").expect("hold a session");
+
+    assert!(
+        home.home()
+            .join(".tollgate/profiles/cx/sessions-4242-0/4242-0")
+            .is_file(),
+        "the held marker must sit in the per-session real layout"
+    );
+    assert!(
+        session_row_is_live(&name, false, "4242-0"),
+        "and the probe reads the marker it just held"
+    );
+}
+
+/// An isolated row's claude and codex arms collapse onto one path: both
+/// transports key that layout per session, and the codex real arm repeats the
+/// claude one. The probe must hold each path once and keep the claude real
+/// layout first, which is the candidate [`hold_session_row_marker`] stamps.
+#[test]
+fn an_isolated_row_probes_each_marker_path_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("cx");
+
+    let markers =
+        session_marker_paths(&name, true, "4242-0").expect("derive the isolated candidates");
+
+    let unique: std::collections::HashSet<&PathBuf> = markers.iter().collect();
+    assert_eq!(
+        unique.len(),
+        markers.len(),
+        "no candidate path is probed twice: {markers:?}"
+    );
+    assert_eq!(
+        markers[0],
+        home.home()
+            .join(".tollgate/profiles/cx/sessions-isolated-4242-0/4242-0"),
+        "the claude real layout stays first"
+    );
 }
 
 /// `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml`, and
@@ -9743,9 +14197,11 @@ fn fake_mode_refuses_the_second_flavor_of_one_profile() {
             Ok(_) => panic!("the second flavor would be a second carrier"),
             Err(e) => e.to_string(),
         };
-        assert!(
-            msg.contains("SEPARATE copies of one single-use chain"),
-            "the refusal names why: {msg}"
+        assert_eq!(
+            msg,
+            "'cx' already has a live shared codex session, and this host cannot symlink. The two \
+             would hold SEPARATE copies of one single-use chain, and the first refresh on either \
+             strands the other. Close the shared session before starting this one"
         );
         // Same flavor is still fine — that IS one home.
         let second =
@@ -10043,10 +14499,12 @@ fn live_marker(path: &std::path::Path) -> fs::File {
     file
 }
 
-/// The tombstone name GC renames an isolated runtime to must fall through both
+/// The tombstone name GC renames a dead runtime tree to must fall through both
 /// strict pairing predicates, or a later pass could re-pair it as a runtime and
-/// `remove_dir_all` it unrescued. The `.rescuing` suffix does that because a `.`
-/// is not in [`is_session_id`]'s alphabet.
+/// `remove_dir_all` it unrescued, while the stranded-tombstone sweep must still
+/// match every flavor of it, shared per-session trees included, or a crash
+/// mid-rescue strands the tree. The `.rescuing` suffix does the first because a
+/// `.` is not in [`is_session_id`]'s alphabet.
 #[test]
 fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
     for base in [
@@ -10065,9 +14523,11 @@ fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
     assert!(is_rescuing_runtime_dir_name(
         "runtime-isolated-4242-7.rescuing"
     ));
+    assert!(is_rescuing_runtime_dir_name("runtime.rescuing"));
+    assert!(is_rescuing_runtime_dir_name("runtime-4242-7.rescuing"));
     assert!(!is_rescuing_runtime_dir_name("runtime-4242-7"));
-    assert!(!is_rescuing_runtime_dir_name("runtime-4242-7.rescuing"));
     assert!(!is_rescuing_runtime_dir_name("sessions-isolated.rescuing"));
+    assert!(!is_rescuing_runtime_dir_name("sessions-4242-7.rescuing"));
 }
 
 /// The defect: a stale isolated tree with no live marker is deleted unrescued,
@@ -10158,6 +14618,898 @@ fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
     );
 }
 
+/// A dead shared copy-host tree: the bare `runtime` + `sessions` pair a
+/// `tollgate start` killed before its final sync leaves behind (#136), holding a
+/// transcript only the tree has and a `history.jsonl` newer than the global
+/// one (not a transcript or a sidecar, so no rescue carries it). Its copied
+/// `CLAUDE.md` is what marks the tree as a copy ([`link_mode_of`] reads
+/// `Fake`). Returns `(claude_home, runtime, sessions)`.
+fn dead_shared_fake_tree(root: &Path, profile: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let claude_home = fake_claude_home(root);
+    let profile_dir = root.join(".tollgate/profiles").join(profile);
+    let runtime = profile_dir.join("runtime");
+    let sessions = profile_dir.join("sessions");
+    fs::write(claude_home.join("CLAUDE.md"), "memory").unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(runtime.join("CLAUDE.md"), "memory").unwrap();
+    let base = SystemTime::now() - Duration::from_secs(3600);
+    fs::write(claude_home.join("history.jsonl"), "old\n").unwrap();
+    set_mtime(&claude_home.join("history.jsonl"), base);
+    fs::create_dir_all(runtime.join("projects/-w-kill")).unwrap();
+    fs::write(runtime.join("projects/-w-kill/s1.jsonl"), "transcript").unwrap();
+    fs::write(runtime.join("history.jsonl"), "old\nnew\n").unwrap();
+    set_mtime(
+        &runtime.join("history.jsonl"),
+        base + Duration::from_secs(60),
+    );
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("dead"), b"").unwrap();
+    (claude_home, runtime, sessions)
+}
+
+/// #136: the GC sweep of a dead shared copy-host tree publishes what only the
+/// tree holds before it removes the tree, so a killed start loses nothing.
+#[test]
+fn gc_publishes_a_dead_shared_fake_tree_before_removing_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "killed");
+
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl")).unwrap(),
+                "transcript",
+                "the tree-only transcript must land in the global store"
+            );
+            assert!(!runtime.exists(), "the dead tree must be gone");
+            assert!(!sessions.exists(), "the marker dir must be gone");
+        });
+    });
+}
+
+/// #136, the acquire leg: a start that finds the dead shared copy-host tree at
+/// its path rescues it out of the state flock's hold, before `acquire`
+/// returns, so the transcript reaches the global store and no tombstone stays.
+#[test]
+fn acquire_publishes_a_dead_shared_fake_tree_before_its_rebuild() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "relaunch");
+            let profile = configured_profile("relaunch");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl")).unwrap(),
+                "transcript",
+                "the tree-only transcript must land in the global store"
+            );
+            assert_eq!(
+                rt.config_dir(),
+                runtime.as_path(),
+                "the shared copy-host session runs out of the bare tree"
+            );
+            assert!(
+                !runtime.with_file_name("runtime.rescuing").exists(),
+                "a rescued tombstone is collected"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The linking transport needs no publish: its shared tree links `projects`
+/// into `~/.claude`, so a file only the tree holds is not one the GC copies out.
+/// Pins that the #136 publish stays gated to copy hosts.
+#[test]
+fn gc_publishes_nothing_from_a_dead_linked_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Real, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile_dir = tmp.path().join(".tollgate/profiles/linked");
+            let runtime = profile_dir.join("runtime-4242-7");
+            let sessions = profile_dir.join("sessions-4242-7");
+            fs::create_dir_all(&runtime).unwrap();
+            fs::write(runtime.join("stray.txt"), "tree only").unwrap();
+            fs::create_dir_all(&sessions).unwrap();
+
+            gc_stale_runtimes();
+
+            assert!(!runtime.exists(), "the dead tree must be gone");
+            assert!(
+                !claude_home.join("stray.txt").exists(),
+                "a linked tree's GC must publish nothing into ~/.claude"
+            );
+        });
+    });
+}
+
+/// A publish that stops part-way must not cost the tree: the copy host's
+/// tombstone keeps the transcript the walk could not land, and a later sweep
+/// finishes it once the fault clears. The fault is a regular file where
+/// `~/.claude/projects` belongs, so the walk cannot create the project dir.
+#[test]
+fn gc_keeps_a_copy_host_tombstone_whose_publish_failed_and_finishes_it_later() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "blocked");
+            let tombstone = runtime.with_file_name("runtime.rescuing");
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a failed publish must keep the transcript it could not land"
+            );
+            assert!(!runtime.exists(), "the tree leaves its live name first");
+            assert!(!sessions.exists(), "the marker dir must be gone");
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must publish the stranded tombstone"
+            );
+            assert!(!tombstone.exists(), "a published tombstone is collected");
+        });
+    });
+}
+
+/// The acquire leg's twin: a rescue that fails keeps the dead tree's tombstone,
+/// so the transcript survives beside the rebuilt tree and a later sweep lands
+/// it once the fault clears.
+#[test]
+fn acquire_keeps_a_dead_shared_fake_tree_whose_publish_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, _sessions) =
+                dead_shared_fake_tree(tmp.path(), "blocked-relaunch");
+            let tombstone = runtime.with_file_name("runtime.rescuing");
+            let profile = configured_profile("blocked-relaunch");
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a tree whose rescue failed must keep its transcript in the tombstone"
+            );
+
+            drop(rt);
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must land the kept tombstone's transcript"
+            );
+            assert!(!tombstone.exists(), "a rescued tombstone is collected");
+        });
+    });
+}
+
+/// A recycled `<pid>-<seq>` lands an isolated acquire on a dead session's tree
+/// no sweep has rescued yet. The wipe must lift its transcript into the global
+/// store first. The next sids this process mints are pre-seeded so the acquire
+/// meets one of them, whichever it draws.
+#[test]
+fn acquire_rescues_a_dead_isolated_tree_at_its_own_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("recycled");
+            let profile_dir = tmp.path().join(".tollgate/profiles/recycled");
+            let pid = std::process::id();
+            let next = SESSION_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+            let seeded = next..next + 8;
+            for seq in seeded.clone() {
+                let projects = profile_dir
+                    .join(format!("runtime-isolated-{pid}-{seq}"))
+                    .join("projects")
+                    .join(format!("-w-{seq}"));
+                fs::create_dir_all(&projects).unwrap();
+                fs::write(projects.join("s1.jsonl"), "dead transcript").unwrap();
+                fs::create_dir_all(profile_dir.join(format!("sessions-isolated-{pid}-{seq}")))
+                    .unwrap();
+            }
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            let seq = seeded
+                .clone()
+                .find(|seq| {
+                    rt.config_dir() == profile_dir.join(format!("runtime-isolated-{pid}-{seq}"))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is none of the pre-seeded trees",
+                        rt.config_dir().display()
+                    )
+                });
+            assert_eq!(
+                fs::read_to_string(
+                    claude_home
+                        .join("projects")
+                        .join(format!("-w-{seq}"))
+                        .join("s1.jsonl")
+                )
+                .ok()
+                .as_deref(),
+                Some("dead transcript"),
+                "the dead isolated tree's transcript must reach the global store"
+            );
+            assert!(
+                !rt.config_dir()
+                    .join("projects")
+                    .join(format!("-w-{seq}"))
+                    .exists(),
+                "the dead tree is still wiped before the rebuild"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The teardown leg: a copy host's last session whose final tick fails must not
+/// take the tree with it, and a later sweep publishes what the tick could not.
+/// The watchdog is stopped before the transcript lands so only the final tick
+/// can meet it; the fault is a regular file where `~/.claude/projects` belongs.
+#[test]
+fn drop_spares_a_copy_host_tree_whose_final_tick_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("torn-down");
+            let mut rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            drop(rt.watchdog_signal.take());
+            if let Some(handle) = rt.watchdog_handle.take() {
+                handle.join().expect("join the watchdog");
+            }
+            let runtime = rt.config_dir().to_path_buf();
+            fs::create_dir_all(runtime.join("projects/-w-exit")).unwrap();
+            fs::write(runtime.join("projects/-w-exit/s1.jsonl"), "transcript").unwrap();
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(runtime.join("projects/-w-exit/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a tree whose final tick failed must survive its teardown"
+            );
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-exit/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must publish the spared tree"
+            );
+            assert!(!runtime.exists(), "the published tree is collected");
+        });
+    });
+}
+
+/// The copy-host test reads the tree, never the sweeping process: a copy
+/// host's dead tree swept by a process that can link (Developer Mode turned on
+/// after the kill, or an elevated tollgate) still holds the only copy of its
+/// transcript, so it is rescued all the same.
+#[test]
+fn gc_rescues_a_copy_host_tree_that_a_linking_sweep_finds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "flipped");
+
+        with_link_mode(LinkMode::Real, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("transcript"),
+            "a copy host's transcript must survive a sweep that can link"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+        assert!(!sessions.exists(), "the marker dir must be gone");
+    });
+}
+
+/// Sweep a dead copy-host tree whose `projects/-w-kill/s2.jsonl` holds `tree`
+/// (stamped `tree_age` before now) beside a global copy holding `global`
+/// (stamped `global_age` before now). The two stamps are set against the
+/// outcome each test pins, so an mtime rule reds where the byte rule passes.
+/// Returns `~/.claude`.
+fn sweep_transcript_pair(
+    root: &Path,
+    tree: &str,
+    tree_age: u64,
+    global: &str,
+    global_age: u64,
+) -> PathBuf {
+    let (claude_home, runtime, _sessions) = dead_shared_fake_tree(root, "pair");
+    let now = SystemTime::now();
+    let global_file = claude_home.join("projects/-w-kill/s2.jsonl");
+    fs::create_dir_all(global_file.parent().unwrap()).unwrap();
+    fs::write(&global_file, global).unwrap();
+    set_mtime(&global_file, now - Duration::from_secs(global_age));
+    let tree_file = runtime.join("projects/-w-kill/s2.jsonl");
+    fs::write(&tree_file, tree).unwrap();
+    set_mtime(&tree_file, now - Duration::from_secs(tree_age));
+
+    with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    claude_home
+}
+
+/// The killed session's own transcript: the global copy is what its last tick
+/// published, the tree holds that plus the lines after it. The longer file
+/// replaces the global one under its own name, so `--resume <id>` opens it,
+/// even when the global copy carries the newer stamp.
+#[test]
+fn gc_replaces_a_global_transcript_the_dead_tree_extends() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\nl2\n", 600, "l1\n", 60);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nl2\n",
+            "the tree's unsynced tail must land under the transcript's own name"
+        );
+        assert!(
+            !claude_home
+                .join("projects/-w-kill/s2.rescued-0.jsonl")
+                .exists(),
+            "an extension is no collision: no sibling"
+        );
+    });
+}
+
+/// Another session's transcript the dead tree holds a stale copy of: the global
+/// file grew after the tree copied it. The stale copy is dropped, even when it
+/// carries the newer stamp.
+#[test]
+fn gc_drops_a_dead_trees_stale_copy_of_a_longer_global_transcript() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\n", 60, "l1\nl2\n", 600);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nl2\n",
+            "the longer global transcript must stay as it is"
+        );
+        assert!(
+            !claude_home
+                .join("projects/-w-kill/s2.rescued-0.jsonl")
+                .exists(),
+            "a stale prefix is no collision: no sibling"
+        );
+    });
+}
+
+/// Two copies that each hold lines the other lacks: neither is lost. The global
+/// one stays, the tree's lands beside it, whichever carries the newer stamp.
+#[test]
+fn gc_keeps_a_diverged_dead_tree_transcript_beside_the_global_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\nB\n", 600, "l1\nA\n", 60);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nA\n",
+            "the global transcript must stay as it is"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.rescued-0.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("l1\nB\n"),
+            "the tree's diverged copy must land beside it"
+        );
+    });
+}
+
+/// A copy host's tree holds a copy of every global sidecar: one the global store
+/// already has is a stale copy and is dropped, whichever stamp is newer; one
+/// only the tree has is the killed session's and moves.
+#[test]
+fn gc_moves_only_new_sidecars_out_of_a_dead_copy_host_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "sidecars");
+        let now = SystemTime::now();
+        fs::create_dir_all(claude_home.join("plans")).unwrap();
+        fs::write(claude_home.join("plans/p.md"), "global").unwrap();
+        set_mtime(
+            &claude_home.join("plans/p.md"),
+            now - Duration::from_secs(600),
+        );
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/p.md"), "stale copy").unwrap();
+        set_mtime(&runtime.join("plans/p.md"), now - Duration::from_secs(60));
+        fs::write(runtime.join("plans/q.md"), "tree only").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("plans/p.md")).unwrap(),
+            "global",
+            "a sidecar the global store has must stay as it is"
+        );
+        assert!(
+            !claude_home.join("plans/p.rescued-0.md").exists(),
+            "a stale sidecar copy must not land as a sibling"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("plans/q.md"))
+                .ok()
+                .as_deref(),
+            Some("tree only"),
+            "a sidecar only the tree has must move"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// Only transcripts and sidecars leave a dead copy-host tree: a skill the
+/// operator deleted from `~/.claude` after the kill stays deleted, and the
+/// tree's newer `history.jsonl` is not published.
+#[test]
+fn gc_carries_nothing_else_out_of_a_dead_copy_host_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "deleted");
+        fs::create_dir_all(runtime.join("skills/gone")).unwrap();
+        fs::write(runtime.join("skills/gone/SKILL.md"), "removed since").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert!(
+            !claude_home.join("skills/gone").exists(),
+            "a deleted skill must not come back"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("history.jsonl")).unwrap(),
+            "old\n",
+            "the tree's history.jsonl must not be published"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// The rescue is one-way: a tombstone kept after a failed rescue never takes in
+/// what `~/.claude` holds, so a sparse tree killed mid-build costs no reverse
+/// copy of the global store.
+#[test]
+fn gc_copies_nothing_into_a_copy_host_tombstone_it_keeps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "sparse");
+        let tombstone = runtime.with_file_name("runtime.rescuing");
+        fs::create_dir_all(claude_home.join("agents")).unwrap();
+        fs::write(claude_home.join("agents/a.md"), "global only").unwrap();
+        fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("transcript"),
+            "a failed rescue must keep the tombstone"
+        );
+        assert!(
+            !tombstone.join("agents").exists(),
+            "a kept tombstone must not receive the global store's entries"
+        );
+    });
+}
+
+/// An isolated tombstone whose transcript rescue failed is kept like a shared
+/// one, and the next sweep lands it: removing it would delete the only copy.
+#[test]
+fn gc_keeps_an_isolated_tombstone_whose_transcript_rescue_failed() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let profile_dir = sb.home().join(".tollgate/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    let tombstone = profile_dir.join("runtime-isolated-4242-7.rescuing");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+    fs::create_dir_all(&claude_home).unwrap();
+    fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a failed transcript rescue must keep the tombstone"
+    );
+
+    fs::remove_file(claude_home.join("projects")).unwrap();
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the next sweep must land the kept tombstone's transcript"
+    );
+    assert!(!tombstone.exists(), "a rescued tombstone is collected");
+}
+
+/// A clean isolated exit, in the shape `start::run` and the MCP delegate use
+/// (the teardown rescue, then the drop): a rescue that could not land the
+/// transcript must not let the drop delete its only copy; the next sweep lands
+/// it once the fault clears.
+#[test]
+fn an_isolated_exit_keeps_a_transcript_its_rescue_could_not_land() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("isoexit");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let runtime = rt.config_dir().to_path_buf();
+            let tombstone = runtime.with_file_name(format!(
+                "{}.rescuing",
+                runtime.file_name().unwrap().to_str().unwrap()
+            ));
+            fs::create_dir_all(runtime.join("projects/-w-x")).unwrap();
+            fs::write(runtime.join("projects/-w-x/s.jsonl"), "only copy").unwrap();
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            let _ = crate::start::rescue_teardown(rt.config_dir(), rt.sessions_dir(), &claude_home);
+            drop(rt);
+
+            assert!(
+                runtime.join("projects/-w-x/s.jsonl").exists()
+                    || tombstone.join("projects/-w-x/s.jsonl").exists(),
+                "the only copy of the transcript must survive the teardown"
+            );
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-x/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("only copy"),
+                "the next sweep must land the kept transcript"
+            );
+        });
+    });
+}
+
+/// A `profiles/<p>/runtime` that is itself a link (a Windows junction needs no
+/// privilege) points at a store the rescue would walk as its own source: the
+/// sweep removes the link alone and never walks through it, so the global
+/// store it points at keeps every file.
+#[test]
+fn gc_unlinks_a_linked_runtime_root_without_walking_it() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+    fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    fs::create_dir_all(&profile_dir).unwrap();
+    pose_dir_link(&profile_dir.join("runtime"), &claude_home);
+    fs::create_dir_all(profile_dir.join("sessions")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a global transcript must survive a sweep of a linked runtime root"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/p.md"))
+            .ok()
+            .as_deref(),
+        Some("global plan"),
+        "a global sidecar must survive a sweep of a linked runtime root"
+    );
+    assert!(
+        profile_dir.join("runtime").symlink_metadata().is_err(),
+        "the dead link itself is collected"
+    );
+    assert!(
+        !profile_dir.join("runtime.rescuing").exists(),
+        "a linked root is never renamed to a tombstone"
+    );
+}
+
+/// A linking host's legacy bare tree built before `~/.claude/projects` existed
+/// holds a real `projects`: its transcript lives only in the tree, so it is
+/// rescued like a copy host's, whatever the sweeping process can create.
+#[test]
+fn gc_rescues_a_legacy_linked_bare_tree_with_a_real_projects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("skills")).unwrap();
+        let profile_dir = tmp.path().join(".tollgate/profiles/legacy");
+        let runtime = profile_dir.join("runtime");
+        fs::create_dir_all(runtime.join("projects/-w-l")).unwrap();
+        fs::write(runtime.join("projects/-w-l/t.jsonl"), "tree only").unwrap();
+        pose_dir_link(&runtime.join("skills"), &claude_home.join("skills"));
+        fs::create_dir_all(profile_dir.join("sessions")).unwrap();
+
+        with_link_mode(LinkMode::Real, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-l/t.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("tree only"),
+            "a legacy linked tree's tree-only transcript must be rescued"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A copy host's session that wrote sidecars but no transcript yet has no
+/// `projects` in its tree: a failed final tick still spares the tree, and the
+/// next sweep lands the sidecar.
+#[test]
+fn drop_spares_a_copy_host_tree_without_projects_whose_final_tick_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("noproj");
+            let mut rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            drop(rt.watchdog_signal.take());
+            if let Some(handle) = rt.watchdog_handle.take() {
+                handle.join().expect("join the watchdog");
+            }
+            let runtime = rt.config_dir().to_path_buf();
+            assert!(
+                runtime.join("projects").symlink_metadata().is_err(),
+                "fixture: the tree holds no projects"
+            );
+            fs::create_dir_all(runtime.join("plans")).unwrap();
+            fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+            fs::write(claude_home.join("plans"), "not a dir").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(runtime.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "a tree whose final tick failed must survive its teardown"
+            );
+
+            fs::remove_file(claude_home.join("plans")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "the next sweep must land the spared sidecar"
+            );
+        });
+    });
+}
+
+/// A shared tree's rescue writes through a sidecar dir the operator linked out
+/// of `~/.claude`, the way the live tick does, so a killed copy-host session's
+/// new plan lands where the operator keeps them.
+#[test]
+fn gc_rescues_a_copy_host_sidecar_through_an_operator_linked_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "linkplans");
+        let elsewhere = tmp.path().join("dotfiles/plans");
+        fs::create_dir_all(&elsewhere).unwrap();
+        pose_dir_link(&claude_home.join("plans"), &elsewhere);
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/new.md"), "tree only plan").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("new.md")).ok().as_deref(),
+            Some("tree only plan"),
+            "the new plan must land through the operator's link"
+        );
+        assert!(
+            claude_home
+                .join("plans")
+                .symlink_metadata()
+                .is_ok_and(|m| !m.file_type().is_dir()),
+            "the operator's link stays a link"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A dead per-session tree on a linking host links what `~/.claude` held at
+/// build; a sidecar dir it lacked then (a first-ever `plans/`) is a real dir
+/// only that tree holds, rescued before the tree goes.
+#[test]
+fn gc_rescues_a_new_sidecar_dir_from_a_dead_linked_session_tree() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-7");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-7")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/new.md"))
+            .ok()
+            .as_deref(),
+        Some("tree only"),
+        "the dead session's new sidecar must land in the global store"
+    );
+    assert!(!runtime.exists(), "the dead tree must be gone");
+}
+
+/// The teardown leg of the same rule: a linking host's session ending with a
+/// sidecar dir `~/.claude` lacked at build hands it to the global store before
+/// its tree is removed.
+#[test]
+fn a_linked_session_teardown_rescues_a_new_sidecar_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        if !host_poses(&claude_home, "a linking host's per-session tree") {
+            return;
+        }
+        with_link_mode(LinkMode::Real, || {
+            let profile = configured_profile("linked-exit");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let runtime = rt.config_dir().to_path_buf();
+            fs::create_dir_all(runtime.join("plans")).unwrap();
+            fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "the session's new sidecar must land in the global store"
+            );
+            assert!(!runtime.exists(), "the ended session's tree is removed");
+        });
+    });
+}
+
+/// A sidecar a linked session wrote under a name the global store gained
+/// meanwhile is that session's own, never a stale copy: it lands as a sibling
+/// and the global one stays.
+#[test]
+fn gc_keeps_a_linked_trees_colliding_sidecar_as_a_sibling() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/x.md"), "global").unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-8");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/x.md"), "mine").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-8")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/x.md")).unwrap(),
+        "global",
+        "the global sidecar must stay as it is"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/x.rescued-0.md"))
+            .ok()
+            .as_deref(),
+        Some("mine"),
+        "the session's own colliding sidecar must land beside it"
+    );
+}
+
+/// The append arm writes the missing tail into the global transcript itself,
+/// never a replacement file: a process holding the global file open keeps
+/// writing into the file the store names.
+#[cfg(unix)]
+#[test]
+fn gc_appends_a_dead_trees_tail_into_the_same_global_file() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, _runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "inode");
+        let global = claude_home.join("projects/-w-kill/s1.jsonl");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(&global, "transc").unwrap();
+        let before = fs::metadata(&global).unwrap().ino();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(&global).unwrap(),
+            "transcript",
+            "the tree's tail must land in the global transcript"
+        );
+        assert_eq!(
+            fs::metadata(&global).unwrap().ino(),
+            before,
+            "the global transcript must stay the same file"
+        );
+    });
+}
+
 /// A live marker in the pair's marker dir blocks every leg: nothing is renamed,
 /// nothing is rescued, the tree stays put.
 #[test]
@@ -10196,28 +15548,43 @@ fn gc_spares_an_isolated_tree_with_a_live_marker() {
     );
 }
 
-/// A shared pair with no live marker keeps today's removal: deleted under the
-/// lock, never rescued.
+/// A dead bare shared tree whose stores link into `~/.claude` (a linking
+/// host's legacy tree): the rescue never walks through its links, so the
+/// global transcript behind `projects` stays as it is, while a real sidecar
+/// only the tree holds still lands in the global store.
 #[test]
-fn gc_removes_a_shared_pair_without_rescuing() {
+fn gc_rescues_only_the_real_entries_of_a_linked_bare_tree() {
     let sb = HomeSandbox::new();
     let claude_home = sb.home().join(".claude");
     let runtime = sb.home().join(".tollgate/profiles/sh/runtime");
     let sessions = sb.home().join(".tollgate/profiles/sh/sessions");
-    fs::create_dir_all(runtime.join("projects/-w-sh")).unwrap();
-    fs::write(runtime.join("projects/-w-sh/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(claude_home.join("projects/-w-sh")).unwrap();
+    fs::write(claude_home.join("projects/-w-sh/s1.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("skills")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    pose_dir_link(&runtime.join("skills"), &claude_home.join("skills"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/q.md"), "tree only").unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::write(sessions.join("dead"), b"").unwrap();
 
-    gc_stale_runtimes();
+    with_link_mode(LinkMode::Fake, gc_stale_runtimes);
 
     assert!(!runtime.exists(), "the shared tree must be removed");
     assert!(!sessions.exists(), "the shared marker dir must be removed");
-    assert!(
-        !claude_home.join("projects").exists(),
-        "a shared tree is never rescued"
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-sh/s1.jsonl")).unwrap(),
+        "global",
+        "removing the tree must not reach through its links"
     );
-    assert!(!claude_home.join("shell-snapshots").exists());
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/q.md"))
+            .ok()
+            .as_deref(),
+        Some("tree only"),
+        "a real sidecar only the tree holds must be rescued"
+    );
 }
 
 /// A `.rescuing` directory left by a crash between the rename and the delete is
@@ -10247,6 +15614,986 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
         "the sidecar must be rescued from the stranded tombstone"
     );
     assert!(!tombstone.exists(), "the tombstone must be collected");
+}
+
+/// The append rule holds for an isolated tree too: a global transcript its
+/// session's copy extends is replaced under its own name, with no sibling.
+#[test]
+fn gc_replaces_a_global_transcript_an_isolated_tree_extends() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let profile_dir = sb.home().join(".tollgate/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "l1\nl2\n").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+    fs::create_dir_all(claude_home.join("projects/-w-iso")).unwrap();
+    fs::write(claude_home.join("projects/-w-iso/s1.jsonl"), "l1\n").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl")).unwrap(),
+        "l1\nl2\n",
+        "the isolated tree's longer transcript must replace the global prefix"
+    );
+    assert!(
+        !claude_home
+            .join("projects/-w-iso/s1.rescued-0.jsonl")
+            .exists(),
+        "an extension is no collision: no sibling"
+    );
+    assert!(!runtime.exists(), "the rescued tree must be gone");
+    assert!(
+        !profile_dir
+            .join("runtime-isolated-4242-7.rescuing")
+            .exists(),
+        "the rescued tombstone must be collected"
+    );
+}
+
+/// A tombstone whose `projects` is a link resolves into the global store
+/// itself: the rescue never walks it, so no global transcript is deleted as an
+/// already-rescued copy of itself.
+#[test]
+fn gc_never_rescues_through_a_linked_projects_store() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let tombstone = sb
+        .home()
+        .join(".tollgate/profiles/iso/runtime-isolated.rescuing");
+    fs::create_dir_all(claude_home.join("projects/-w-iso")).unwrap();
+    fs::write(claude_home.join("projects/-w-iso/s1.jsonl"), "global").unwrap();
+    fs::create_dir_all(&tombstone).unwrap();
+    pose_dir_link(&tombstone.join("projects"), &claude_home.join("projects"));
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a rescue must not reach the global store through a linked projects"
+    );
+    assert!(!tombstone.exists(), "the tombstone must be collected");
+}
+
+/// A transcript gone from under the rescue (a concurrent sweep moved it first)
+/// leaves nothing to keep: the tombstone is collected, never kept for a retry
+/// that cannot land. A link resolving to nothing poses the vanished source: its
+/// read fails `NotFound` at the same step a moved-away file's does.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tombstone_whose_unmoved_transcript_is_gone() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let tombstone = sb
+        .home()
+        .join(".tollgate/profiles/iso/runtime-isolated.rescuing");
+    let slug = tombstone.join("projects/-w-iso");
+    fs::create_dir_all(&slug).unwrap();
+    fs::write(slug.join("s1.jsonl"), "transcript").unwrap();
+    std::os::unix::fs::symlink(slug.join("moved-away.jsonl"), slug.join("gone.jsonl")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the transcript still in the tombstone must be rescued"
+    );
+    assert!(
+        !tombstone.exists(),
+        "a vanished source must not keep the tombstone"
+    );
+}
+
+/// A dead copy-host tree whose tombstone name a kept tombstone already holds
+/// cannot be renamed aside: the start builds over it, never wipes it, and the
+/// kept tombstone stays for its own sweep. `daemon.json` is a name the build and
+/// the mirror both skip, so only a wipe can remove it.
+#[test]
+fn acquire_builds_over_a_dead_copy_host_tree_it_cannot_rename() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (_claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "occupied");
+            let kept = runtime.with_file_name("runtime.rescuing");
+            fs::create_dir_all(kept.join("projects/-w-old")).unwrap();
+            fs::write(kept.join("projects/-w-old/s0.jsonl"), "kept").unwrap();
+            fs::write(runtime.join("daemon.json"), "tree only").unwrap();
+            let profile = configured_profile("occupied");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                rt.config_dir(),
+                runtime.as_path(),
+                "the shared copy-host session runs out of the bare tree"
+            );
+            assert_eq!(
+                fs::read_to_string(runtime.join("daemon.json"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "a tree the start cannot rename aside is built over, never wiped"
+            );
+            assert_eq!(
+                fs::read_to_string(kept.join("projects/-w-old/s0.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("kept"),
+                "the kept tombstone stays for its own sweep"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The acquire leg of a linked runtime root: a start that finds its path is a
+/// link into `~/.claude` unlinks it and builds a real tree there, never
+/// renaming the link to a tombstone or walking the store behind it.
+#[test]
+fn acquire_unlinks_a_linked_runtime_root_without_walking_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::write(claude_home.join("CLAUDE.md"), "memory").unwrap();
+            fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+            fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+            fs::create_dir_all(claude_home.join("plans")).unwrap();
+            fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+            let profile = configured_profile("lnkacq");
+            let runtime = tmp.path().join(".tollgate/profiles/lnkacq/runtime");
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("global"),
+                "a global transcript must survive a start over a linked runtime root"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/p.md"))
+                    .ok()
+                    .as_deref(),
+                Some("global plan"),
+                "a global sidecar must survive a start over a linked runtime root"
+            );
+            assert!(
+                runtime.symlink_metadata().is_ok_and(|m| m.is_dir()),
+                "the session runs out of a real tree at the runtime path"
+            );
+            assert!(
+                runtime
+                    .with_file_name("runtime.rescuing")
+                    .symlink_metadata()
+                    .is_err(),
+                "a linked root is never renamed to a tombstone"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// An isolated tree's rescue never writes through a sidecar dir the operator
+/// linked out of `~/.claude`: its session never wrote through it. The
+/// transcript beside it is the control that the rescue ran.
+#[test]
+fn gc_never_writes_an_isolated_sidecar_through_an_operator_linked_dir() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let elsewhere = sb.home().join("dotfiles/plans");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(&claude_home).unwrap();
+    pose_dir_link(&claude_home.join("plans"), &elsewhere);
+    let profile_dir = sb.home().join(".tollgate/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "iso plan").unwrap();
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the isolated tree's rescue ran"
+    );
+    assert!(
+        elsewhere.join("new.md").symlink_metadata().is_err(),
+        "an isolated rescue must not write through the operator's link"
+    );
+}
+
+/// Two sweeps can reach one tombstone at once (the renaming sweep's own tail and
+/// another process's stranded-tombstone arm). The global transcript must end up
+/// holding the tree's bytes exactly once: the tail is never appended twice. The
+/// 8 MiB prefix widens the window between the compare and the append.
+#[test]
+fn two_rescues_of_one_tombstone_append_the_tail_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let prefix = "p".repeat(8 << 20) + "\n";
+        let tail: String = (0..20_000)
+            .map(|i| format!("{{\"line\":{i:08}}}\n"))
+            .collect();
+        let whole = format!("{prefix}{tail}");
+        for trial in 0..10 {
+            let tombstone = tmp
+                .path()
+                .join(format!(".tollgate/profiles/race{trial}/runtime.rescuing"));
+            let rel = format!("projects/-w-race{trial}/s.jsonl");
+            fs::create_dir_all(claude_home.join(&rel).parent().unwrap()).unwrap();
+            fs::write(claude_home.join(&rel), &prefix).unwrap();
+            fs::create_dir_all(tombstone.join(&rel).parent().unwrap()).unwrap();
+            fs::write(tombstone.join(&rel), &whole).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let rescuers: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let tombstone = tombstone.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        rescue_tombstone(&tombstone);
+                    })
+                })
+                .collect();
+            for rescuer in rescuers {
+                rescuer.join().expect("join a rescuer");
+            }
+
+            assert!(
+                fs::read_to_string(claude_home.join(&rel)).unwrap() == whole,
+                "trial {trial}: the global transcript must hold the tree's bytes once"
+            );
+        }
+    });
+}
+
+/// A linked runtime root that acquire's liveness checks spare (its target
+/// carries a supervisor record they cannot verify) is never built into: the
+/// start refuses by name, and the store the link points at is untouched.
+#[test]
+fn acquire_refuses_a_spared_linked_runtime_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::write(claude_home.join("settings.json"), "{\"operator\":true}").unwrap();
+            fs::write(claude_home.join("daemon.lock"), b"{}").unwrap();
+            let profile = configured_profile("lnkspared");
+            let runtime = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("lnkspared")
+                .join("runtime");
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let Err(err) =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            else {
+                panic!("a start over a linked runtime root must refuse");
+            };
+
+            assert_eq!(
+                err.root_cause().to_string(),
+                format!(
+                    "{} is a link, not a runtime tree tollgate made; remove it and start again",
+                    runtime.display()
+                ),
+                "the refusal names the link and the fix"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("settings.json")).unwrap(),
+                "{\"operator\":true}",
+                "a start must never write through a linked runtime root"
+            );
+        });
+    });
+}
+
+/// A stranded tombstone that is a link (a crash between renaming a linked root
+/// and unlinking it) is unlinked by the next sweep and never walked: the store
+/// it points at keeps every file.
+#[test]
+fn gc_unlinks_a_stranded_linked_tombstone_without_walking_it() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+    fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let tombstone = profile_dir.join("runtime.rescuing");
+    pose_dir_link(&tombstone, &claude_home);
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a global transcript must survive a linked tombstone"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/p.md"))
+            .ok()
+            .as_deref(),
+        Some("global plan"),
+        "a global sidecar must survive a linked tombstone"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "the linked tombstone itself is collected"
+    );
+}
+
+/// A copy host whose `~/.claude` holds neither `CLAUDE.md` nor `skills` builds
+/// a tree with no link in it at all: it is still a copy, so its stale copy of a
+/// global sidecar is dropped, never landed beside the global one.
+#[test]
+fn gc_drops_a_plain_copy_trees_stale_sidecar_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let profile_dir = tmp.path().join(".tollgate/profiles/plain");
+        let runtime = profile_dir.join("runtime");
+        let sessions = profile_dir.join("sessions");
+        fs::create_dir_all(runtime.join("projects/-w")).unwrap();
+        fs::create_dir_all(claude_home.join("sessions")).unwrap();
+        fs::write(
+            claude_home.join("sessions/777.json"),
+            "{\"status\":\"busy\"}",
+        )
+        .unwrap();
+        fs::create_dir_all(runtime.join("sessions")).unwrap();
+        fs::write(runtime.join("sessions/777.json"), "{\"status\":\"idle\"}").unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("dead"), b"").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("sessions/777.json")).unwrap(),
+            "{\"status\":\"busy\"}",
+            "the global sidecar must stay as it is"
+        );
+        assert!(
+            !claude_home.join("sessions/777.rescued-0.json").exists(),
+            "a copy's stale sidecar must be dropped, not landed beside the global one"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A shared tree's real sidecar whose global dir is a dangling operator link
+/// can be neither moved nor written through: it is left, so the tree is kept
+/// for a later sweep instead of being deleted with it.
+#[cfg(unix)]
+#[test]
+fn gc_keeps_a_tree_whose_sidecar_meets_a_dangling_global_link() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-9");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-9")).unwrap();
+
+    gc_stale_runtimes();
+
+    let tombstone = profile_dir.join("runtime-4242-9.rescuing");
+    assert!(
+        runtime.join("plans/new.md").exists() || tombstone.join("plans/new.md").exists(),
+        "a sidecar the rescue could not land must not be deleted with the tree"
+    );
+}
+
+/// A dead linked runtime root is unlinked where it stands, never renamed to its
+/// tombstone: beside a tombstone a failed rescue kept, that rename fails and
+/// leaves the link, so the start would refuse instead of building.
+#[test]
+fn acquire_unlinks_a_linked_root_beside_a_kept_tombstone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+            fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+            let profile = configured_profile("lnkkept");
+            let runtime = tmp.path().join(".tollgate/profiles/lnkkept/runtime");
+            let kept = runtime.with_file_name("runtime.rescuing");
+            fs::create_dir_all(kept.join("projects/-w-old")).unwrap();
+            fs::write(kept.join("projects/-w-old/s0.jsonl"), "kept").unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("a dead linked root beside a kept tombstone must not refuse the start");
+
+            assert!(
+                runtime.symlink_metadata().is_ok_and(|m| m.is_dir()),
+                "the session runs out of a real tree at the runtime path"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("global"),
+                "the store behind the link is untouched"
+            );
+            assert_eq!(
+                fs::read_to_string(kept.join("projects/-w-old/s0.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("kept"),
+                "the kept tombstone stays for its own sweep"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// A claim file a crashed rescue left is held by nobody: beside its tombstone
+/// it does not stop the next sweep finishing the rescue, and it goes with the
+/// tombstone; alone, it is collected.
+#[test]
+fn gc_finishes_a_tombstone_past_a_crashed_rescues_claim() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb
+        .home()
+        .join(".tollgate/profiles/crash/runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let claim = tombstone.with_file_name("runtime-isolated.rescuing.claim");
+    fs::write(&claim, b"").unwrap();
+    let orphan = sb
+        .home()
+        .join(".tollgate/profiles/gone/runtime.rescuing.claim");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a stale claim must not stop the rescue"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "the rescued tombstone is removed"
+    );
+    assert!(
+        claim.symlink_metadata().is_err(),
+        "the claim goes with its tombstone"
+    );
+    assert!(
+        orphan.symlink_metadata().is_err(),
+        "a claim whose tombstone is gone is collected"
+    );
+}
+
+/// A sweep that opened a rescue claim just before its holder unlinked it locks
+/// an orphan once the holder lets go, while a later sweep may create and lock a
+/// new claim at the same name: the orphan must not count as the claim, or both
+/// rescue one tombstone.
+#[cfg(unix)]
+#[test]
+fn a_rescue_claim_unlinked_under_its_opener_is_not_the_claim() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("runtime.rescuing.claim");
+    let opened = open_rescue_claim(&path).unwrap();
+    assert!(
+        claim_is_named(&opened, &path),
+        "control: the file the name points at is the claim"
+    );
+
+    fs::remove_file(&path).unwrap();
+    let _recreated = open_rescue_claim(&path).unwrap();
+
+    assert!(
+        !claim_is_named(&opened, &path),
+        "a claim file unlinked under its opener must not be the claim"
+    );
+}
+
+/// Two dead trees holding different tails of one global transcript, rescued at
+/// the same moment by two sweeps: one tail extends the global file, the other
+/// lands beside it as a sibling, and neither lands twice or torn into the
+/// other. The 8 MiB prefix widens the window between compare and append.
+#[test]
+fn two_trees_extending_one_transcript_never_both_append() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let prefix = "p".repeat(8 << 20) + "\n";
+        let tail_a: String = (0..10_000).map(|i| format!("{{\"a\":{i:08}}}\n")).collect();
+        let tail_b: String = (0..10_000).map(|i| format!("{{\"b\":{i:08}}}\n")).collect();
+        let with_a = format!("{prefix}{tail_a}");
+        let with_b = format!("{prefix}{tail_b}");
+        for trial in 0..10 {
+            let rel = format!("projects/-w-cross{trial}/s.jsonl");
+            let global = claude_home.join(&rel);
+            fs::create_dir_all(global.parent().unwrap()).unwrap();
+            fs::write(&global, &prefix).unwrap();
+            let tombstones: Vec<PathBuf> = [("a", &with_a), ("b", &with_b)]
+                .into_iter()
+                .map(|(side, body)| {
+                    let tombstone = tmp.path().join(format!(
+                        ".tollgate/profiles/cross{trial}{side}/runtime.rescuing"
+                    ));
+                    fs::create_dir_all(tombstone.join(&rel).parent().unwrap()).unwrap();
+                    fs::write(tombstone.join(&rel), body).unwrap();
+                    tombstone
+                })
+                .collect();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let rescuers: Vec<_> = tombstones
+                .iter()
+                .cloned()
+                .map(|tombstone| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        rescue_tombstone(&tombstone);
+                    })
+                })
+                .collect();
+            for rescuer in rescuers {
+                rescuer.join().expect("join a rescuer");
+            }
+
+            let landed = fs::read_to_string(&global).unwrap();
+            let sibling =
+                fs::read_to_string(global.with_file_name("s.rescued-0.jsonl")).unwrap_or_default();
+            assert!(
+                (landed == with_a && sibling == with_b) || (landed == with_b && sibling == with_a),
+                "trial {trial}: one tail extends the global transcript, the other lands as its \
+                 sibling (global {} bytes, sibling {} bytes)",
+                landed.len(),
+                sibling.len()
+            );
+        }
+    });
+}
+
+/// An empty sidecar dir under a dangling global link holds nothing to lose: it
+/// never keeps its tree, which would otherwise sit as a tombstone forever.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tree_whose_only_refused_sidecar_is_empty() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-11");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-11")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    assert!(
+        !profile_dir.join("runtime-4242-11.rescuing").exists(),
+        "an empty refused sidecar must not keep a tombstone"
+    );
+}
+
+/// A copy tree's copy of a global sidecar file the operator linked elsewhere is
+/// a stale copy like any other: dropped, never a reason to keep the tree (a kept
+/// `runtime.rescuing` would block every later retire of the bare `runtime`).
+#[cfg(unix)]
+#[test]
+fn gc_drops_a_copy_trees_copy_of_a_linked_global_sidecar_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "filelink");
+        let elsewhere = tmp.path().join("dotfiles/x.md");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::write(&elsewhere, "operator's").unwrap();
+        fs::create_dir_all(claude_home.join("plans")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, claude_home.join("plans/x.md")).unwrap();
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/x.md"), "stale copy").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert!(!runtime.exists(), "the dead tree must be gone");
+        assert!(
+            !runtime.with_file_name("runtime.rescuing").exists(),
+            "a stale copy must not keep a tombstone"
+        );
+        assert_eq!(
+            fs::read_to_string(&elsewhere).unwrap(),
+            "operator's",
+            "the operator's file stays as it is"
+        );
+    });
+}
+
+/// A finished rescue's claim file goes while its lock is still held: a sweep
+/// that opened the claim during the rescue must not lock it in between, or it
+/// holds a claim at a name the next claimant recreates and locks too.
+#[cfg(unix)]
+#[test]
+fn a_released_claims_name_goes_while_it_is_still_held() {
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    let tombstone = sb.home().join(".tollgate/profiles/rel/runtime.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let taken = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = taken.clone();
+    let probe = tombstone.clone();
+    set_claim_hook(
+        &CLAIM_UNLINK_HOOK,
+        Box::new(move |_path| seen.set(Some(RescueClaim::take(&probe).is_some()))),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "control: the rescue finished and released its claim"
+    );
+    assert_eq!(
+        taken.get(),
+        Some(false),
+        "a claim being released must still be held when its name goes"
+    );
+}
+
+/// A sweep that opened a rescue claim just before its holder unlinked it locks
+/// that orphan once the holder lets go, while a later sweep holds a new claim at
+/// the same name over a tombstone retired since: the orphan's holder must leave
+/// that tombstone to the new claim's holder.
+#[cfg(unix)]
+#[test]
+fn a_sweep_locking_an_unlinked_claim_leaves_the_tombstone_alone() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb.home().join(".tollgate/profiles/orph/runtime.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let holder: std::rc::Rc<std::cell::RefCell<Option<File>>> = Default::default();
+    let keep = holder.clone();
+    set_claim_hook(
+        &CLAIM_OPENED_HOOK,
+        Box::new(move |path| {
+            fs::remove_file(path).unwrap();
+            let claim = open_rescue_claim(path).unwrap();
+            claim.try_lock().unwrap();
+            *keep.borrow_mut() = Some(claim);
+        }),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert!(
+        holder.borrow().is_some(),
+        "control: a new claim was taken between the open and the lock"
+    );
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a sweep holding an unlinked claim must leave the tombstone to the claim's holder"
+    );
+    assert!(
+        !claude_home.join("projects/-w/s.jsonl").exists(),
+        "nothing lands from a tombstone another sweep holds"
+    );
+}
+
+/// A rescue that cannot take the box-wide rescue lock in time leaves the file
+/// in its tombstone, which stays; once the lock is free the next sweep finishes
+/// it.
+#[test]
+fn a_rescue_that_cannot_take_the_file_lock_keeps_its_tombstone() {
+    struct ClearWait;
+    impl Drop for ClearWait {
+        fn drop(&mut self) {
+            crate::sessions::set_rescue_lock_wait_override(None);
+        }
+    }
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb
+        .home()
+        .join(".tollgate/profiles/wait/runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let held = crate::profile::open_state_file(&sb.home().join(".tollgate/rescue.lock")).unwrap();
+    held.lock().unwrap();
+    let _clear = ClearWait;
+    crate::sessions::set_rescue_lock_wait_override(Some(Duration::from_millis(50)));
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a file whose lock wait ran out stays in its tombstone"
+    );
+    assert!(
+        !claude_home.join("projects/-w/s.jsonl").exists(),
+        "nothing lands without the lock"
+    );
+
+    drop(held);
+    // The positive control runs with the whole wait: a parallel test thread's
+    // fork that copied `held`'s fd keeps the flock until its exec.
+    crate::sessions::set_rescue_lock_wait_override(None);
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the next sweep finishes it once the lock is free"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "and removes the tombstone"
+    );
+}
+
+/// A wedged holder of the rescue lock costs one sweep its wait once, never once
+/// per file or per tree: three tombstones whose files all wait on a held lock
+/// leave the sweep short of the three waits a per-file or per-tree budget
+/// spends.
+#[test]
+fn a_sweep_against_a_held_rescue_lock_spends_its_wait_once() {
+    struct ClearWait;
+    impl Drop for ClearWait {
+        fn drop(&mut self) {
+            crate::sessions::set_rescue_lock_wait_override(None);
+        }
+    }
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    let transcripts: Vec<PathBuf> = ["1-0", "2-0", "3-0"]
+        .into_iter()
+        .map(|sid| {
+            let slug = sb.home().join(format!(
+                ".tollgate/profiles/wedge/runtime-isolated-{sid}.rescuing/projects/-w-{sid}"
+            ));
+            fs::create_dir_all(&slug).unwrap();
+            fs::write(slug.join("s.jsonl"), "transcript").unwrap();
+            slug.join("s.jsonl")
+        })
+        .collect();
+    let held = crate::profile::open_state_file(&sb.home().join(".tollgate/rescue.lock")).unwrap();
+    held.lock().unwrap();
+    let _clear = ClearWait;
+    let wait = Duration::from_millis(800);
+    crate::sessions::set_rescue_lock_wait_override(Some(wait));
+
+    let started = std::time::Instant::now();
+    gc_stale_runtimes();
+    let spent = started.elapsed();
+
+    for transcript in &transcripts {
+        assert!(
+            transcript.exists(),
+            "control: {} landed without the lock",
+            transcript.display()
+        );
+    }
+    assert!(
+        spent >= wait,
+        "control: the first file waited out the bound ({spent:?})"
+    );
+    assert!(
+        spent < wait * 3,
+        "three trees waiting on one held lock spent {spent:?}, past the one {wait:?} the sweep \
+         shares"
+    );
+}
+
+/// A second sweep reaching a tombstone whose rescue is about to remove it must
+/// leave it to that rescue: removing it would free the name, and a dead tree
+/// retired onto it then would go unwalked with the first rescue's removal.
+#[test]
+fn a_tombstone_mid_rescue_keeps_its_name_from_the_next_retired_tree() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/reuse");
+    let tombstone = profile_dir.join("runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w-old")).unwrap();
+    fs::write(tombstone.join("projects/-w-old/old.jsonl"), "old").unwrap();
+    let next = profile_dir.join("runtime-isolated");
+    fs::create_dir_all(next.join("projects/-w-next")).unwrap();
+    fs::write(next.join("projects/-w-next/next.jsonl"), "next").unwrap();
+    let other_sweep = tombstone.clone();
+    let retired = next.clone();
+    set_claim_hook(
+        &TOMBSTONE_REMOVAL_HOOK,
+        Box::new(move |_path| {
+            rescue_tombstone(&other_sweep);
+            let _ = retire_tree(&retired);
+        }),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-old/old.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("old"),
+        "control: the first rescue landed its transcript"
+    );
+    let survivors: Vec<PathBuf> = [
+        next.join("projects/-w-next/next.jsonl"),
+        tombstone.join("projects/-w-next/next.jsonl"),
+        claude_home.join("projects/-w-next/next.jsonl"),
+    ]
+    .into_iter()
+    .filter(|path| fs::read_to_string(path).is_ok_and(|body| body == "next"))
+    .collect();
+    assert_eq!(
+        survivors.len(),
+        1,
+        "the next dead tree's transcript must survive the first rescue's removal"
+    );
+}
+
+/// A refused sidecar dir holding only links carries nothing the walk would
+/// move: it never keeps its tree.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tree_whose_refused_sidecar_holds_only_links() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-12");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    std::os::unix::fs::symlink(sb.home().join("elsewhere.md"), runtime.join("plans/l.md")).unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-12")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    assert!(
+        !profile_dir.join("runtime-4242-12.rescuing").exists(),
+        "a refused sidecar holding only links must not keep a tombstone"
+    );
+}
+
+/// A refused sidecar dir the rescue cannot read may hold anything: it counts
+/// one file left, so its tree is kept for a later sweep.
+#[cfg(unix)]
+#[test]
+fn gc_keeps_a_tree_whose_refused_sidecar_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Readable([PathBuf; 2]);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".tollgate/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-13");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-13")).unwrap();
+    let tombstone = profile_dir.join("runtime-4242-13.rescuing");
+    let _readable = Readable([runtime.join("plans"), tombstone.join("plans")]);
+    fs::set_permissions(runtime.join("plans"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(runtime.join("plans")).is_ok() {
+        println!("skipped: this host reads through a 0o000 dir");
+        return;
+    }
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("could not be rescued"))
+            .collect::<Vec<_>>(),
+        vec![&format!(
+            "tollgate: kept {}: 1 file(s) could not be rescued; a later sweep retries",
+            tombstone.display()
+        )],
+        "an unreadable refused sidecar counts one file left"
+    );
 }
 
 #[test]
@@ -11401,6 +17748,28 @@ fn a_corrupt_in_flight_record_refuses_the_write_fail_closed() {
     assert!(format!("{err:#}").contains("not-a-namespaced-service"));
 }
 
+/// The live-pid arm of the in-flight refusal, pinned by equality so the
+/// `whose security child` phrasing and the live pid cannot drift.
+// pid liveness is unix-only (`pid_alive` is false on windows by design).
+#[cfg(unix)]
+#[test]
+fn an_in_flight_delete_with_a_live_child_pins_the_refusal() {
+    let pid = std::process::id();
+    let err = namespaced_keychain_ledger::DeleteInFlight {
+        service: "x".to_string(),
+        stamp_secs: 0,
+        pids: vec![pid],
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "a sweep's delete for the same per-session Keychain item is still in flight (`x`, \
+             whose `security` child, pid {pid}, is still alive). The write would race it. It \
+             lands once the delete records its outcome or its record is swept as stale"
+        )
+    );
+}
+
 /// The seed's retry mapping: a refusal over an in-flight delete arms the
 /// watchdog-tick retry, the same arm the classified locked-keychain transient
 /// takes — the record clears when the delete lands or fails, and a crashed
@@ -11520,6 +17889,654 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
     );
 }
 
+/// A session swapped from `item-retry-a` onto `item-retry-b` whose row still
+/// names the outgoing store: the state a macOS swap leaves when its Keychain
+/// item leg failed (the row follows only a landed leg). Returns the swap and
+/// both stores.
+fn swapped_with_unlanded_item_leg(
+    prefix: &str,
+) -> (
+    std::sync::Arc<SessionSwap>,
+    SwappedMarkers,
+    PathBuf,
+    PathBuf,
+) {
+    let launch = member(&format!("{prefix}-a"));
+    let intended = member(&format!("{prefix}-b"));
+    let launch_store = member_store(&launch);
+    let intended_store = member_store(&intended);
+    let (swap, markers) = lone_session(&launch, Isolation::Shared);
+    assert_eq!(
+        swap.swap_to(&format!("{prefix}-b")).expect("swap"),
+        SwapOutcome::Swapped
+    );
+    crate::live_sessions::update_as_session(swap.session.as_str(), |fields| {
+        fields.set_launch_store(launch_store.clone());
+    })
+    .expect("pose the unlanded item leg's row");
+    (swap, markers, launch_store, intended_store)
+}
+
+fn item_retry_for(prefix: &str, store: &Path, previous_store: &Path) -> SwapItemRetry {
+    SwapItemRetry {
+        member: crate::profile::ProfileName::from(format!("{prefix}-b").as_str()),
+        store: store.to_path_buf(),
+        previous_store: previous_store.to_path_buf(),
+    }
+}
+
+fn row_store(swap: &SessionSwap) -> Option<PathBuf> {
+    crate::live_sessions::get(swap.session.as_str())
+        .expect("row")
+        .launch_store
+}
+
+/// A swap's item leg that failed on the locked-keychain transient stays armed:
+/// the next poll runs the leg again, and while it keeps failing the
+/// same way the target survives and the row keeps naming the outgoing store.
+#[test]
+fn a_transient_swap_item_leg_stays_armed_for_the_next_tick() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-t");
+        let retry = item_retry_for("item-retry-t", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|target| {
+            calls.set(calls.get() + 1);
+            assert_eq!(target, &retry, "the leg runs against the armed target");
+            SwapItemLeg::Transient
+        });
+
+        assert_eq!(calls.get(), 1, "one attempt per tick");
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "a transient keeps the retry armed"
+        );
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "the row follows only a landed leg"
+        );
+    });
+}
+
+/// A retried leg that lands drops the target and moves the row's store onto
+/// the incoming member, so the rotation verdict follows what the session reads.
+#[test]
+fn a_landed_swap_item_retry_repoints_the_row_and_disarms() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-l");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-l",
+            &intended_store,
+            &launch_store,
+        ));
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+
+        assert_eq!(swap.item_retry(), None, "a landed leg disarms the retry");
+        assert_eq!(
+            row_store(&swap),
+            Some(intended_store),
+            "the row names the store the session reads now"
+        );
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+        assert_eq!(calls.get(), 0, "a disarmed retry runs no leg");
+    });
+}
+
+/// A retry failing on anything but the transient is dropped: the pre-fix loud
+/// degrade, and no leg on the ticks after it.
+#[test]
+fn a_failed_swap_item_retry_disarms_and_leaves_the_row() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-f");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-f",
+            &intended_store,
+            &launch_store,
+        ));
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Failed);
+
+        assert_eq!(
+            swap.item_retry(),
+            None,
+            "a non-transient failure disarms the retry"
+        );
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "a failed leg never repoints the row"
+        );
+    });
+}
+
+/// A target for a member the session no longer runs on is stale: the cell's
+/// own swap legs own the item from there, so the retry runs no leg and drops.
+#[test]
+fn a_stale_swap_item_retry_runs_no_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, _intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-s");
+        let elsewhere = tmp.path().join("not-the-cells-store.json");
+        swap.arm_item_retry(item_retry_for("item-retry-s", &elsewhere, &launch_store));
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a target the cell's store no longer matches runs no leg"
+        );
+        assert_eq!(swap.item_retry(), None, "a stale target is dropped");
+        assert_eq!(
+            row_store(&swap),
+            Some(launch_store),
+            "a stale target never repoints the row"
+        );
+    });
+}
+
+/// A later swap owns the item from its own legs, so publishing it clears a
+/// target an earlier swap armed.
+#[test]
+fn a_later_swap_clears_an_armed_item_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-c");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-c",
+            &intended_store,
+            &launch_store,
+        ));
+        let third = member("item-retry-c-c");
+        member_store(&third);
+
+        assert_eq!(
+            swap.swap_to("item-retry-c-c").expect("swap"),
+            SwapOutcome::Swapped
+        );
+
+        assert_eq!(
+            swap.item_retry(),
+            None,
+            "the later swap's publish clears the retry"
+        );
+    });
+}
+
+/// The retry writes the incoming member's store into the item, so it holds
+/// that member's rotation lock for the leg; a lock another process holds skips
+/// this tick without blocking the watchdog, and the target stays armed.
+#[test]
+fn a_swap_item_retry_skips_a_tick_while_the_rotation_lock_is_held() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-r");
+        let retry = item_retry_for("item-retry-r", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+        let _holder = crate::testutil::hold_rotation_lock("item-retry-r-b");
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(calls.get(), 0, "a held rotation lock runs no leg this tick");
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "the target waits for the next tick"
+        );
+        assert_eq!(row_store(&swap), Some(launch_store), "nothing moved");
+    });
+}
+
+/// The retry hands the session the incoming member's store, so a live stage a
+/// failed persist left beside it lands before the leg reads that store.
+#[test]
+fn a_swap_item_retry_lands_the_incoming_members_stage_before_its_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-g");
+        staged_profile("item-retry-g-b");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-g",
+            &intended_store,
+            &launch_store,
+        ));
+
+        let seen = std::cell::RefCell::new(None);
+        swap.retry_item_leg_with(|target| {
+            let store: ClaudeCredentials =
+                crate::profile::read_json_file(&target.store).expect("the incoming store");
+            *seen.borrow_mut() = store.refresh_token().map(str::to_string);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            seen.into_inner().as_deref(),
+            Some("rt-mid"),
+            "the leg reads the landed stage, never the lagging store"
+        );
+    });
+}
+
+/// A target naming another member than the cell runs on is stale even when
+/// its store matches the cell's.
+#[test]
+fn a_swap_item_retry_for_another_member_runs_no_leg() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-m");
+        swap.arm_item_retry(SwapItemRetry {
+            member: crate::profile::ProfileName::from("item-retry-m-a"),
+            store: intended_store,
+            previous_store: launch_store.clone(),
+        });
+
+        let calls = std::cell::Cell::new(0_u32);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(calls.get(), 0, "a target for another member runs no leg");
+        assert_eq!(swap.item_retry(), None, "a stale target is dropped");
+        assert_eq!(row_store(&swap), Some(launch_store), "nothing moved");
+    });
+}
+
+/// A retry that cannot start for a reason other than contention (here a stage
+/// the unreadable spent record leaves unjudgeable) stays armed and says why
+/// once, not once per poll.
+#[test]
+fn a_swap_item_retry_that_cannot_land_its_stage_says_why_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-w");
+        staged_profile("item-retry-w-b");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("item-retry-w-b"))
+            .expect("dir");
+        fs::remove_file(dir.join("auth.spent.json")).expect("drop the record");
+        fs::create_dir(dir.join("auth.spent.json")).expect("block the record");
+        let retry = item_retry_for("item-retry-w", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        let calls = std::cell::Cell::new(0_u32);
+        let start = std::time::Instant::now();
+        // The second attempt runs past any first backoff gap, so both reach
+        // the stage landing.
+        for at in [start, start + ITEM_RETRY_MAX_GAP] {
+            swap.retry_item_leg_at(at, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Landed
+            });
+        }
+
+        assert_eq!(calls.get(), 0, "an unlanded stage runs no leg");
+        assert_eq!(swap.item_retry(), Some(retry), "the target stays armed");
+        assert_eq!(
+            lines.snapshot(),
+            vec![stall_line(&swap, "item-retry-w-b")],
+            "two attempts on one cause announce it once"
+        );
+    });
+}
+
+/// The stall line for a retry onto `member` whose stage the unreadable spent
+/// record leaves unjudgeable.
+fn stall_line(swap: &SessionSwap, member: &str) -> String {
+    format!(
+        "tollgate: session {} could not retry its swap onto {member}'s per-session Keychain leg: \
+         could not lock '{member}' for a token refresh; check permissions on ~/.tollgate. The \
+         watchdog keeps retrying on its swap polls, backing off to at most every 30 s",
+        swap.session.as_str()
+    )
+}
+
+/// A retry onto `<prefix>-b` whose stage cannot land: the stage posed and the
+/// spent record beside it blocked.
+fn block_stage_landing(prefix: &str) {
+    staged_profile(&format!("{prefix}-b"));
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(
+        format!("{prefix}-b").as_str(),
+    ))
+    .expect("dir");
+    fs::remove_file(dir.join("auth.spent.json")).expect("drop the record");
+    fs::create_dir(dir.join("auth.spent.json")).expect("block the record");
+}
+
+/// The stall latch belongs to one swap: a swap away and back onto the same
+/// member whose retry stalls on the same cause announces it again.
+#[test]
+fn a_later_swap_clears_the_item_retry_stall_latch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-x");
+        block_stage_landing("item-retry-x");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-x",
+            &intended_store,
+            &launch_store,
+        ));
+        let first = crate::logline::LogLines::new();
+        {
+            let _capture = first.capture_here();
+            swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+        }
+        assert_eq!(first.snapshot(), vec![stall_line(&swap, "item-retry-x-b")]);
+
+        // Clear the blocked landing so the swap back onto the member can land.
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("item-retry-x-b"))
+            .expect("dir");
+        fs::remove_dir(dir.join("auth.spent.json")).expect("unblock the record");
+        fs::remove_file(dir.join("credentials.json.staged")).expect("drop the stage");
+        let third_store = member_store(&member("item-retry-x-c"));
+        assert_eq!(
+            swap.swap_to("item-retry-x-c").expect("swap away"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("item-retry-x-b").expect("swap back"),
+            SwapOutcome::Swapped
+        );
+
+        block_stage_landing("item-retry-x");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-x",
+            &intended_store,
+            &third_store,
+        ));
+        let second = crate::logline::LogLines::new();
+        {
+            let _capture = second.capture_here();
+            swap.retry_item_leg_with(|_| SwapItemLeg::Landed);
+        }
+        assert_eq!(
+            second.snapshot(),
+            vec![stall_line(&swap, "item-retry-x-b")],
+            "the swap back published a fresh latch, so the same cause is announced again"
+        );
+    });
+}
+
+/// A transient pushes the next attempt out: a poll right after it runs no leg
+/// and keeps the target armed.
+#[test]
+fn a_swap_item_retry_waits_out_its_backoff_after_a_transient() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-b");
+        let retry = item_retry_for("item-retry-b", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        for _ in 0..2 {
+            swap.retry_item_leg_with(|_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Transient
+            });
+        }
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the poll right after a transient runs no leg"
+        );
+        assert_eq!(swap.item_retry(), Some(retry), "the target stays armed");
+    });
+}
+
+/// The waits between attempts double from one second and cap at thirty, and
+/// arming again starts over with an immediate attempt.
+#[test]
+fn a_swap_item_retry_backs_off_doubling_to_a_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-k");
+        let retry = item_retry_for("item-retry-k", &intended_store, &launch_store);
+        swap.arm_item_retry(retry.clone());
+
+        let calls = std::cell::Cell::new(0_u32);
+        let attempt = |at: std::time::Instant| {
+            swap.retry_item_leg_at(at, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Transient
+            });
+        };
+        let mut at = std::time::Instant::now();
+        attempt(at);
+        assert_eq!(
+            calls.get(),
+            1,
+            "the first attempt after arming is immediate"
+        );
+        for (n, secs) in [1_u64, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let gap = Duration::from_secs(secs);
+            attempt(at + gap - Duration::from_millis(1));
+            assert_eq!(
+                calls.get(),
+                1 + n as u32,
+                "an attempt before the {secs} s gap ends runs no leg"
+            );
+            at += gap;
+            attempt(at);
+            assert_eq!(
+                calls.get(),
+                2 + n as u32,
+                "the attempt at the {secs} s gap runs"
+            );
+        }
+
+        swap.arm_item_retry(retry);
+        swap.retry_item_leg_with(|_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Transient
+        });
+        assert_eq!(calls.get(), 9, "arming again resets the backoff");
+    });
+}
+
+/// A held rotation lock skips the attempt by contention, not by the backoff:
+/// once the holder lets go, the attempt one second later (past the first gap)
+/// runs the leg.
+#[test]
+fn a_swap_item_retry_runs_once_a_held_rotation_lock_is_released() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (swap, _markers, launch_store, intended_store) =
+            swapped_with_unlanded_item_leg("item-retry-h");
+        swap.arm_item_retry(item_retry_for(
+            "item-retry-h",
+            &intended_store,
+            &launch_store,
+        ));
+        let calls = std::cell::Cell::new(0_u32);
+        let start = std::time::Instant::now();
+        {
+            let _holder = crate::testutil::hold_rotation_lock("item-retry-h-b");
+            swap.retry_item_leg_at(start, |_| {
+                calls.set(calls.get() + 1);
+                SwapItemLeg::Landed
+            });
+            assert_eq!(calls.get(), 0, "a held rotation lock runs no leg");
+        }
+
+        swap.retry_item_leg_at(start + Duration::from_secs(1), |_| {
+            calls.set(calls.get() + 1);
+            SwapItemLeg::Landed
+        });
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the released lock lets the next attempt run"
+        );
+        assert_eq!(swap.item_retry(), None, "the landed leg disarms the retry");
+        assert_eq!(row_store(&swap), Some(intended_store));
+    });
+}
+
+/// While a retry is armed the item still holds the login of the retry's
+/// outgoing store, so a swap's carry-back goes there; with none armed it goes
+/// into the store the cell names.
+#[test]
+fn a_swap_carries_the_item_into_an_armed_retrys_outgoing_store() {
+    let canonical = Path::new("/profiles/carry-b/credentials.json");
+    let outgoing = Path::new("/profiles/carry-a/credentials.json");
+    assert_eq!(
+        item_carry_target(Some(outgoing), canonical),
+        Path::new("/profiles/carry-a/credentials.json")
+    );
+    assert_eq!(
+        item_carry_target(None, canonical),
+        Path::new("/profiles/carry-b/credentials.json")
+    );
+}
+
+/// The convergence's carry would write the item's login into this member's
+/// store, and while a retry is armed that login is the outgoing member's: the
+/// poll converges nothing until the retry lands or drops.
+#[test]
+fn a_convergence_waits_while_an_item_retry_is_armed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("conv-r");
+        let store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-r"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+        let retry = SwapItemRetry {
+            member: crate::profile::ProfileName::from("conv-r"),
+            store: store.clone(),
+            previous_store: tmp.path().join("outgoing-store.json"),
+        };
+        swap.arm_item_retry(retry.clone());
+
+        swap.poll();
+
+        assert_eq!(
+            swap.canonical(),
+            store,
+            "no convergence while the retry is armed"
+        );
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            store,
+            "the link stays on the store the retry is for"
+        );
+        assert_eq!(
+            swap.item_retry(),
+            Some(retry),
+            "the poll leaves the retry armed"
+        );
+
+        swap.retry_item_leg_with(|_| SwapItemLeg::Failed);
+        swap.poll();
+
+        assert_eq!(
+            swap.canonical(),
+            sidecar,
+            "a dropped retry lets the next poll converge"
+        );
+    });
+}
+
+/// A Keychain leg's failure retries on the watchdog only where it clears on its
+/// own: a locked keychain (skipped or classified) and a sweep's in-flight
+/// delete. Every other class drops to a later start or swap.
+#[test]
+fn keychain_leg_retry_clears_retries_only_what_clears_on_its_own() {
+    use crate::claude::SecurityExitClass;
+    let unlock = Some("so it lands once the keychain unlocks");
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::SkippedLocked),
+        unlock
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::DeleteInFlight),
+        Some("so it lands once the sweep's delete completes and its in-flight record clears")
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(
+            SecurityExitClass::InteractionNotAllowed
+        )),
+        unlock
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(SecurityExitClass::ItemNotFound)),
+        None
+    );
+    assert_eq!(
+        keychain_leg_retry_clears(KeychainLegFault::Exit(SecurityExitClass::Unclassified)),
+        None
+    );
+}
+
+/// An adopted row whose store still names another store than the link
+/// resolves to records item legs the launcher left unlanded: the adoption
+/// re-arms them. A landed row, or one never swapped, arms nothing.
+#[test]
+fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
+    let member = crate::profile::ProfileName::from("adopt-retry-b");
+    let canonical = Path::new("/profiles/adopt-retry-b/credentials.json");
+    let outgoing = Path::new("/profiles/adopt-retry-a/credentials.json");
+    assert_eq!(
+        adopted_item_retry(Some(outgoing), canonical, &member),
+        Some(SwapItemRetry {
+            member: crate::profile::ProfileName::from("adopt-retry-b"),
+            store: PathBuf::from("/profiles/adopt-retry-b/credentials.json"),
+            previous_store: PathBuf::from("/profiles/adopt-retry-a/credentials.json"),
+        })
+    );
+    assert_eq!(
+        adopted_item_retry(Some(canonical), canonical, &member),
+        None,
+        "a landed leg moved the row onto the link's store"
+    );
+    assert_eq!(
+        adopted_item_retry(None, canonical, &member),
+        None,
+        "a row that never swapped"
+    );
+}
+
 // ── coexistence with upstream clauth ─────────────────────────────────────────
 
 /// A runtime copy turns upstream clauth's plugin off when the base enables it,
@@ -11559,7 +18576,7 @@ fn the_seed_drops_upstreams_mcp_server() {
     }))
     .expect("json");
     let out: serde_json::Value =
-        serde_json::from_slice(&strip_oauth_account_on_seed(bytes)).expect("json");
+        serde_json::from_slice(&strip_oauth_account_on_seed(&bytes)).expect("json");
     assert!(out["mcpServers"].get("clauth").is_none(), "{out}");
     assert_eq!(
         out["mcpServers"]["other"],
@@ -11628,7 +18645,14 @@ fn a_guest_session_writes_only_its_runtime_and_never_syncs_back_to_the_base() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         assert!(
             runtime.starts_with(tmp.path().join(".tollgate")),
@@ -11749,7 +18773,14 @@ fn a_guest_session_keeps_plugins_and_projects_off_the_operator_trees_under_real_
         let projects_before = guest_tree_snapshot(&claude_home.join("projects"));
 
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         let store = guest_projects_store().expect("guest store");
 
@@ -11837,7 +18868,14 @@ fn a_guest_plugin_copy_repoints_the_registrys_absolute_paths_at_itself() {
         let before = guest_tree_snapshot(&op_plugins);
 
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
         let own = rt.config_dir().join("plugins");
         let own_str = own.to_str().expect("utf-8 path").to_string();
 
@@ -11936,8 +18974,14 @@ fn a_guest_fake_link_mirror_never_writes_into_the_operator_tree() {
         with_link_mode(LinkMode::Fake, || {
             let claude_home = stage_guest_claude_home(tmp.path());
             let profile = configured_profile("guest");
-            let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+            let rt = ProfileRuntime::acquire(
+                &profile,
+                Isolation::Shared,
+                &[],
+                false,
+                crate::live_sessions::Launcher::Own,
+            )
+            .expect("acquire");
             let runtime = rt.config_dir().to_path_buf();
             let store = guest_projects_store().expect("guest store");
             assert!(
@@ -12011,7 +19055,14 @@ fn a_guest_resume_seeds_its_transcript_privately_and_leaves_the_operator_store_a
         );
 
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         let resumed = runtime.join("projects/-ws/old-session.jsonl");
         let mut appended = fs::read(&resumed).expect("the resumed session finds its transcript");
@@ -12242,8 +19293,14 @@ fn a_guest_registry_the_rewrite_cannot_repoint_starts_the_session_with_no_plugin
         let logs = crate::logline::LogLines::new();
         let capture = logs.capture_here();
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
-            .expect("the session still starts");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("the session still starts");
         drop(capture);
         let runtime = rt.config_dir().to_path_buf();
         let own = runtime.join("plugins");
@@ -12408,7 +19465,14 @@ fn a_guest_real_link_session_keeps_claude_code_state_in_the_guest_store() {
         let before = guest_tree_snapshot(&claude_home);
 
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         let root = guest_claude_root().expect("guest root");
 
@@ -12541,9 +19605,13 @@ fn a_guest_isolated_rescue_lands_in_the_guest_store_not_the_operators() {
         fs::create_dir_all(iso_root.join("todos")).expect("mkdir iso todos");
         fs::write(iso_root.join("todos/t.json"), b"[]").expect("todo");
 
-        let (moved, sidecars) = rescue_isolated_runtime(&iso_root, &claude_home);
+        let (transcripts, sidecars) = rescue_runtime(
+            &iso_root,
+            &claude_home,
+            crate::sessions::SidecarSource::Isolated,
+        );
 
-        assert_eq!((moved, sidecars), (1, 1));
+        assert_eq!((transcripts.moved, sidecars.moved), (1, 1));
         assert_eq!(
             guest_tree_snapshot(&claude_home),
             before,
@@ -12555,6 +19623,183 @@ fn a_guest_isolated_rescue_lands_in_the_guest_store_not_the_operators() {
             b"{}\n"
         );
         assert!(root.join("todos/t.json").exists(), "the sidecar rode along");
+    });
+}
+
+/// C-G1, C-G5 (ledger): a guest SHARED rescue lands in tollgate's guest store
+/// as an isolated one does. A tree transcript that extends one the operator's
+/// store holds never appends there, and `~/.claude` stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_guest_shared_rescue_lands_in_the_guest_store_and_appends_nothing_to_the_operators() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let before = guest_tree_snapshot(&claude_home);
+        let root = tmp.path().join(".tollgate/profiles/guest/runtime-4243-0");
+        fs::create_dir_all(root.join("projects/-ws")).expect("mkdir shared projects");
+        // The operator's store holds `{"old":1}\n`; this copy extends it.
+        fs::write(
+            root.join("projects/-ws/old-session.jsonl"),
+            b"{\"old\":1}\n{\"tail\":2}\n",
+        )
+        .expect("extended transcript");
+        fs::write(root.join("projects/-ws/new-session.jsonl"), b"{}\n").expect("new transcript");
+        fs::create_dir_all(root.join("file-history/s1")).expect("mkdir sidecar");
+        fs::write(root.join("file-history/s1/v1"), b"edit").expect("sidecar file");
+
+        let (transcripts, _) =
+            rescue_runtime(&root, &claude_home, crate::sessions::SidecarSource::Shared);
+
+        assert_eq!((transcripts.moved, transcripts.left), (2, 0));
+        assert_eq!(
+            guest_tree_snapshot(&claude_home),
+            before,
+            "the rescue wrote and appended nothing into ~/.claude"
+        );
+        let store = guest_projects_store().expect("guest store");
+        assert_eq!(
+            fs::read(store.join("-ws/new-session.jsonl")).expect("rescued"),
+            b"{}\n"
+        );
+        assert_eq!(
+            fs::read(store.join("-ws/old-session.jsonl")).expect("rescued"),
+            b"{\"old\":1}\n{\"tail\":2}\n"
+        );
+        assert_eq!(
+            fs::read(
+                guest_claude_root()
+                    .expect("guest root")
+                    .join("file-history/s1/v1")
+            )
+            .expect("rescued sidecar"),
+            b"edit",
+            "the sidecar tree lands in the guest store"
+        );
+    });
+}
+
+/// C-G2 (ledger): in guest mode a dead tree's rescue tombstone, collected by
+/// the profile walk a delete runs (`rescue_profile_trees` → `gc_profile_trees`
+/// → `rescue_claimed_tombstone`), lands its transcript and sidecar in the
+/// guest store and writes nothing under `~/.claude`.
+#[cfg(unix)]
+#[test]
+fn a_guest_tombstone_rescue_writes_nothing_under_claude() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = stage_guest_claude_home(tmp.path());
+        let before = guest_tree_snapshot(&claude_home);
+        let profile = tmp.path().join(".tollgate/profiles/gtomb");
+        let tomb = profile.join("runtime-isolated-4250-0.rescuing");
+        fs::create_dir_all(tomb.join("projects/-ws")).expect("mkdir tomb projects");
+        fs::write(tomb.join("projects/-ws/tomb-session.jsonl"), b"{\"t\":1}\n")
+            .expect("transcript");
+        fs::create_dir_all(tomb.join("todos")).expect("mkdir tomb todos");
+        fs::write(tomb.join("todos/t.json"), b"[]").expect("todo");
+
+        assert_eq!(
+            rescue_profile_trees(&profile),
+            None,
+            "nothing is left unrescued"
+        );
+
+        assert_eq!(
+            guest_tree_snapshot(&claude_home),
+            before,
+            "the tombstone rescue wrote nothing into ~/.claude"
+        );
+        let root = guest_claude_root().expect("guest root");
+        assert_eq!(
+            fs::read(root.join("projects/-ws/tomb-session.jsonl")).expect("rescued"),
+            b"{\"t\":1}\n"
+        );
+        assert!(root.join("todos/t.json").exists(), "the sidecar rode along");
+    });
+}
+
+/// C-G11, C-G12 (ledger): a guest Shared tree built on a box whose `~/.claude`
+/// holds neither `jobs` nor `projects` creates neither there, and the tree's
+/// `jobs` and `projects` resolve into tollgate's guest store, never into
+/// `~/.claude`.
+#[cfg(unix)]
+#[test]
+fn a_guest_shared_tree_links_its_stores_into_the_guest_store_and_creates_none_in_claude() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink runtime tree") {
+            return;
+        }
+        let claude_home = stage_guest_claude_home(tmp.path());
+        fs::remove_dir_all(claude_home.join("projects")).expect("drop the operator's projects");
+        assert!(!claude_home.join("jobs").exists());
+
+        let profile = configured_profile("guest");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+
+        assert!(!claude_home.join("jobs").exists(), "no ~/.claude/jobs");
+        assert!(
+            !claude_home.join("projects").exists(),
+            "no ~/.claude/projects"
+        );
+        let claude = crate::canonical::identity(&claude_home).expect("claude resolves");
+        let guest_root = crate::canonical::identity(guest_claude_root().expect("guest root"))
+            .expect("guest root resolves");
+        let tree = crate::canonical::identity(&runtime).expect("runtime resolves");
+        // `jobs` may be a link into the guest store or a tree-local dir; it
+        // never reaches `~/.claude`.
+        if let Ok(jobs) = crate::canonical::identity(runtime.join("jobs")) {
+            assert!(
+                !jobs.starts_with(&claude)
+                    && (jobs.starts_with(&guest_root) || jobs.starts_with(&tree)),
+                "jobs resolves into the guest store or the tree: {}",
+                jobs.display()
+            );
+        }
+        assert_eq!(
+            crate::canonical::identity(runtime.join("projects")).expect("projects resolves"),
+            crate::canonical::identity(guest_projects_store().expect("store"))
+                .expect("store resolves"),
+            "projects resolves into the guest transcript store"
+        );
+        drop(rt);
+    });
+}
+
+/// N1 (ledger port note): in guest mode a shared tree's `jobs` links into
+/// tollgate's guest store, so a live guest background job is recorded under
+/// `~/.tollgate/guest-claude/jobs`. The job reader takes that store as a
+/// second global one, so the job names its tree and keeps it from GC.
+#[test]
+fn guest_mode_reads_the_guest_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let runtime = tmp.path().join(".tollgate/profiles/guestbg/runtime-888-1");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let job = write_claude_job(tmp.path(), "4c1d9e2a", &runtime);
+        let guest_jobs = guest_claude_root().expect("guest root").join("jobs");
+        fs::create_dir_all(&guest_jobs).expect("mkdir guest jobs");
+        fs::rename(&job, guest_jobs.join("4c1d9e2a")).expect("move the job into the guest store");
+        assert!(
+            !crate::claude_jobs::job_trees().names(&runtime),
+            "outside guest mode the guest store is not read"
+        );
+
+        fs::create_dir_all(tmp.path().join(crate::identity::UPSTREAM_DATA_DIR_NAME))
+            .expect("stage the upstream data dir");
+        assert!(crate::identity::upstream_active());
+        assert!(
+            crate::claude_jobs::job_trees().names(&runtime),
+            "the guest job names its tree"
+        );
     });
 }
 
@@ -12577,8 +19822,14 @@ fn a_guest_plugin_copy_that_fails_part_way_starts_the_session_with_no_plugins() 
         let before = guest_tree_snapshot(&op_plugins);
 
         let profile = configured_profile("guest");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
-            .expect("the session still starts");
+        let rt = ProfileRuntime::acquire(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            crate::live_sessions::Launcher::Own,
+        )
+        .expect("the session still starts");
         let own = rt.config_dir().join("plugins");
         assert!(own.is_dir() && !own.is_symlink());
         assert_eq!(guest_tree_snapshot(&own), Vec::new());
@@ -12646,6 +19897,7 @@ fn b_member(name: &str) -> Profile {
 /// The launch info `tollgate start` passes.
 fn start_launch() -> LaunchInfo {
     LaunchInfo {
+        launcher: crate::live_sessions::Launcher::Own,
         hot_swap: crate::hot_swap::HotSwapPolicy::Allowed,
         spawn_cwd: None,
         relaunch_capable: true,
@@ -12655,13 +19907,15 @@ fn start_launch() -> LaunchInfo {
 
 /// A full B acquire with the gate forced open (watchdog included).
 fn acquire_b(profile: &Profile) -> ProfileRuntime {
-    ProfileRuntime::acquire_inner(
+    ProfileRuntime::acquire_tree(
         &profile.name,
         Isolation::Shared,
         &[],
         false,
         &start_launch(),
         Some(&crate::hot_swap::GateStatus::Open),
+        SessionTree::PerSession,
+        None,
         (|| {}, |_: &SessionPaths, _: &SessionId| {}, || {}),
     )
     .expect("acquire a B session")
@@ -12701,6 +19955,8 @@ fn lone_b_session(launch: &Profile) -> (std::sync::Arc<SessionSwap>, SwappedMark
         crate::harness::Harness::Claude,
         false,
         false,
+        crate::live_sessions::Launcher::Own,
+        None,
         None,
     )
     .with_executor(crate::hot_swap::Executor::ApiKey, class.clone())
@@ -12712,6 +19968,7 @@ fn lone_b_session(launch: &Profile) -> (std::sync::Arc<SessionSwap>, SwappedMark
             session,
             Isolation::Shared,
             LinkMode::Real,
+            SessionTree::PerSession,
             launch,
             canonical,
             &paths,
@@ -12802,7 +20059,14 @@ fn an_oauth_start_writes_byte_identical_settings_and_executor_oauth() {
     assert_eq!(row.key_generation, None);
     assert_eq!(row.launch_class, None);
     drop(started);
-    let plain = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+    let plain = ProfileRuntime::acquire(
+        &profile,
+        Isolation::Shared,
+        &[],
+        false,
+        crate::live_sessions::Launcher::Own,
+    )
+    .expect("acquire");
     let plain_bytes = fs::read(plain.config_dir().join("settings.json")).expect("settings");
     assert_eq!(
         start_bytes, plain_bytes,
@@ -13978,7 +21242,8 @@ fn a_session_start_lands_a_live_stage_before_its_tree_reads_the_store() {
         fake_claude_home(tmp.path());
         let profile = staged_profile("chain-start");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         assert_eq!(stored_refresh_of("chain-start").as_deref(), Some("rt-mid"));
         let seen: crate::profile::ClaudeCredentials =
@@ -14006,7 +21271,7 @@ fn a_session_start_refuses_while_a_live_stage_cannot_land() {
         fs::remove_file(profile_dir.join("auth.spent.json")).expect("drop the record");
         fs::create_dir(profile_dir.join("auth.spent.json")).expect("block the record");
 
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a failed land refuses the start");
 
@@ -14138,4 +21403,943 @@ fn an_unreadable_outgoing_record_is_announced_against_the_session_member() {
             ]
         );
     });
+}
+
+/// T33b1 check 7: the account's background pair `runtime-bg` + `sessions-bg`
+/// is a shape every runtime-dir parser knows (GC pairs and collects it, both
+/// config reconcilers walk it as a shared tree, the codex scrub sees a tollgate
+/// tree), and nothing reads a sid off it, so `tps` and the hook note skip it.
+/// Its neighbours stay outside: an isolated background tree is refused at
+/// launch, and a suffix past `bg` is no tollgate name.
+#[test]
+fn the_background_pair_is_a_runtime_dir_shape_with_no_sid() {
+    // tollgate anchors the path predicate to its own profiles root
+    // (`session_home_predicates_are_anchored_to_tollgates_root`), so the
+    // shape is checked under the sandbox's root.
+    let sandbox = HomeSandbox::new();
+    assert!(is_runtime_dir_name("runtime-bg"));
+    assert!(is_sessions_dir_name("sessions-bg"));
+    assert!(is_shared_runtime_dir_name("runtime-bg"));
+    assert_eq!(
+        paired_sessions_name("runtime-bg").as_deref(),
+        Some("sessions-bg")
+    );
+    assert_eq!(
+        paired_runtime_name("sessions-bg").as_deref(),
+        Some("runtime-bg")
+    );
+    assert_eq!(sid_of_runtime_dir_name("runtime-bg"), None);
+    assert!(is_tollgate_runtime_path(
+        &sandbox.home().join(".tollgate/profiles/wired/runtime-bg")
+    ));
+    for name in [
+        "runtime-bgx",
+        "runtime-xbg",
+        "runtime-isolated-bg",
+        "runtime-bg-4242-0",
+        "runtime-bg-",
+    ] {
+        assert!(!is_runtime_dir_name(name), "{name} is no tollgate tree");
+    }
+    for name in ["sessions-bgx", "sessions-isolated-bg"] {
+        assert!(
+            !is_sessions_dir_name(name),
+            "{name} is no tollgate marker dir"
+        );
+    }
+}
+
+/// A background row is live through its `sessions-bg/<sid>` marker: neither
+/// per-session marker dir holds anything for it, so the row sweep and the tally
+/// would reap the daemon's row without the background candidate.
+#[test]
+fn a_background_row_is_live_through_its_sessions_bg_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bglive");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&sessions).expect("mkdir sessions-bg");
+        assert!(!session_row_is_live(&name, false, "7100-0"));
+        let marker = open_pid_file(&sessions.join("7100-0")).expect("marker");
+        marker.lock().expect("hold marker");
+        assert!(
+            session_row_is_live(&name, false, "7100-0"),
+            "the background marker is what makes the row live"
+        );
+        drop(marker);
+        assert!(!session_row_is_live(&name, false, "7100-0"));
+    });
+}
+
+/// T33b1 check 8, the marker half: the daemon's own background hold is exempt
+/// from the macOS rotation gate's marker term, while a launcher's marker in the
+/// same `sessions-bg/` is not. The two cases differ only in the row's
+/// `background_hold` bit, and no job store exists, so the job term is empty and
+/// the marker term alone decides.
+#[test]
+fn only_a_launchers_background_marker_blocks_a_macos_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bgrot");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&sessions).expect("mkdir sessions-bg");
+        let store = profile.join("credentials.json");
+        write_creds(&store, Some("rt-bg"));
+
+        for (sid, hold, want) in [
+            (
+                "7001-0",
+                false,
+                Some(crate::runtime::RotationBlock::LiveSession),
+            ),
+            ("7002-0", true, None),
+        ] {
+            let marker = open_pid_file(&sessions.join(sid)).expect("marker");
+            marker.lock().expect("hold marker");
+            let mut row = crate::testutil::live_row(sid, name.as_str());
+            row.background = true;
+            row.background_hold = hold;
+            row.launch_store = Some(store.clone());
+            crate::live_sessions::register(&row).expect("register");
+            assert_eq!(rotation_block_on(&name, true), want, "{sid}");
+            drop(marker);
+            crate::live_sessions::unregister(sid).expect("unregister");
+        }
+    });
+}
+
+/// T33b1 check 6, the un-Dropped half: a daemon killed by SIGTERM never runs
+/// its runtime's teardown, so its marker file, row and tree stay behind with
+/// no flock. The sweep spares the background pair while a job names the tree
+/// or any marker in `sessions-bg/` is held, and collects it once neither does.
+#[test]
+fn gc_collects_the_background_pair_once_no_marker_is_held_and_no_job_names_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile = tmp.path().join(".tollgate").join("profiles").join("bgp");
+        let runtime = profile.join("runtime-bg");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        drop(open_pid_file(&sessions.join("4242-0")).expect("dead marker"));
+
+        let job = write_claude_job(tmp.path(), "b6a1c0de", &runtime);
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a job naming the tree spares it"
+        );
+
+        fs::remove_dir_all(&job).expect("claude rm");
+        let held = open_pid_file(&sessions.join("4243-0")).expect("live marker");
+        held.lock().expect("hold");
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a held marker spares the tree"
+        );
+
+        drop(held);
+        gc_stale_runtimes();
+        assert!(!runtime.exists(), "the idle background tree is collected");
+        assert!(!sessions.exists(), "its marker dir goes with it");
+    });
+}
+
+/// F3: a background launcher's spawn-settings file is spared by a job on
+/// `runtime-bg` whose flags tollgate cannot read. `spares_settings`' fallback is
+/// the only rule that can spare it, and it must be handed the tree the launcher
+/// actually occupied.
+#[test]
+fn gc_spares_a_background_launchers_settings_file_behind_an_unreadable_flags_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bgsettings");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let tree = profile.join("runtime-bg");
+        fs::create_dir_all(profile.join("sessions-bg")).expect("mkdir sessions-bg");
+        fs::create_dir_all(&tree).expect("mkdir runtime-bg");
+        let settings = spawn_settings_file(&tree, "5858-0");
+        fs::write(&settings, b"{}").expect("launcher settings file");
+        // A list element that is not a string reads as unreadable flags, so the
+        // fail-closed tree fallback is the only rule that can spare the file.
+        crate::testutil::write_claude_job_flags(
+            tmp.path(),
+            "b6a1c0de",
+            &tree,
+            serde_json::json!([1]),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            settings.is_file(),
+            "a background launcher's settings file must survive a job whose flags \
+             tollgate cannot read"
+        );
+    });
+}
+
+/// N2: a background holder is fixed on its ACCOUNT, not frozen on its credential
+/// pair. Its own account's convergence runs like any session's — a hold adopted
+/// before the account was armed for rolling tokens must still move onto the
+/// sidecar, even while a cross-account intent stands on its row — while a move
+/// onto another account is refused, as `precondition` keeps enforcing for every
+/// caller.
+#[test]
+fn a_background_holder_converges_and_refuses_a_cross_account_swap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("fixed-a");
+        let store = member_store(&launch);
+        let session = SessionId::mint();
+        let sid = session.as_str().to_string();
+        let paths = SessionPaths::resolve_background(&launch.name, &session).expect("paths");
+        crate::profile::mkdir_700(&paths.runtime).expect("mkdir");
+        create_symlink(&store, &paths.runtime.join(".credentials.json")).expect("link creds");
+        // The launch marker this holder already owns, as `acquire` leaves it:
+        // publishing a convergence asserts it is still held.
+        let _launch_markers = stamp_swapped_markers(&paths)
+            .expect("stamp the launch marker")
+            .expect("the launch member's marker must be free in a fresh sandbox");
+        let mut row = crate::live_sessions::LiveSession::starting(
+            &session,
+            "fixed-a",
+            crate::harness::Harness::Claude,
+            false,
+            false,
+            Launcher::Own,
+            Some(store.to_path_buf()),
+            None,
+        );
+        // A standing cross-account intent (an older tollgate's `switch`, a hand
+        // edit): `poll` must refuse it and still converge the own account.
+        row.intended_member = Some("fixed-b".to_string());
+        crate::live_sessions::register(&row).expect("register row");
+        let swap = SessionSwap::new(
+            session,
+            Isolation::Shared,
+            LinkMode::Real,
+            SessionTree::Background(BackgroundHold::Daemon),
+            &launch,
+            store,
+            &paths,
+        );
+
+        // Arm the account for rolling tokens under the hold.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("fixed-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(paths.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "a background holder's converge runs onto its own account's sidecar"
+        );
+        assert_eq!(swap.canonical(), sidecar, "the cell follows the link");
+        assert_eq!(swap.member(), "fixed-a", "the account does not change");
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(
+            row.launch_store.as_deref(),
+            Some(sidecar.as_path()),
+            "the row's launch_store names the sidecar, so the rotation refusal lifts"
+        );
+
+        assert_eq!(
+            swap.precondition("fixed-b").map(|plan| plan.member),
+            Err(SwapRefused::FixedAccount),
+            "a background holder never moves onto another account"
+        );
+        assert_eq!(swap.member(), "fixed-a", "the refusal moved nothing");
+    });
+}
+
+/// A fresh session's seed copies home's bytes into a new runtime tree while a
+/// sibling runtime copy holds a newer Claude Code write no pass has propagated
+/// yet: the seed's copy is stamped at the floor, so it cannot outrank that
+/// write, and the next pass keeps it and the new copy converges on it.
+#[test]
+fn a_fresh_seed_never_outranks_a_siblings_unpropagated_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2dir = seed_test_runtime(&h, "p2", "runtime-4242-1");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r2dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    write(
+        &global,
+        serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
+    );
+    write(
+        &r1,
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+    );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    set_mtime(&r1, t(20));
+
+    seed_claude_json(&r2dir, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let read = |p: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(p).expect("read")).expect("parse")
+    };
+    assert_eq!(
+        read(&r1),
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+        "the sibling keeps its Claude Code write"
+    );
+    let r2 = read(&r2dir.join(".claude.json"));
+    assert_eq!(
+        r2["numStartups"],
+        serde_json::json!(3),
+        "the seed converges on it"
+    );
+    assert_eq!(
+        r2["ccR1"],
+        serde_json::json!(true),
+        "the seed converges on it"
+    );
+    assert_eq!(
+        read(&global)["ccR1"],
+        serde_json::json!(true),
+        "home converges on it"
+    );
+}
+
+fn seed_test_runtime(home: &std::path::Path, profile: &str, runtime: &str) -> std::path::PathBuf {
+    home.join(".tollgate")
+        .join("profiles")
+        .join(profile)
+        .join(runtime)
+}
+
+fn seed_test_doc(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
+}
+
+/// Home made into tollgate's echo of a runtime write at t10 (the first pass), and
+/// a sibling holding a newer unpropagated Claude Code write at t20. Returns
+/// `(global, r1, r2, r3dir)`; `r3dir` is the tree the seed under test fills.
+fn seed_from_echo_home(
+    h: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(h, "p2", "runtime-4242-1").join(".claude.json");
+    let r3dir = seed_test_runtime(h, "p3", "runtime-4242-2");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(r2.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2, "ccR1": true}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("first pass makes home an echo");
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    set_mtime(&r2, t(20));
+    (global, r1, r2, r3dir)
+}
+
+fn assert_every_copy_keeps_the_siblings_write(copies: &[(&str, &std::path::Path)]) {
+    for (name, path) in copies {
+        let doc = seed_test_doc(path);
+        assert_eq!(
+            doc["ccR2"],
+            serde_json::json!(true),
+            "{name} keeps the sibling's Claude Code write"
+        );
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(3),
+            "{name} keeps the sibling's Claude Code write"
+        );
+    }
+}
+
+/// Home is tollgate's own echo (a fresh mtime carrying a t10 write) when a new
+/// tree is seeded: the seed carries home's rank of t10, never home's fresh
+/// mtime, so a sibling's unpropagated t20 write still wins the next pass.
+#[test]
+fn a_seed_from_an_echo_home_never_outranks_a_siblings_newer_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+struct SeedPreLockHookGuard;
+
+impl Drop for SeedPreLockHookGuard {
+    fn drop(&mut self) {
+        crate::runtime::set_seed_pre_lock_hook(None);
+    }
+}
+
+/// A merge that rewrites home just before the seed takes the sync lock is the
+/// home the seed copies: the seed reads home's bytes and rank under the lock,
+/// so the seeded copy never carries a rank newer than the write its bytes hold.
+#[test]
+fn a_seed_waiting_on_a_merge_reads_home_after_it() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+
+    crate::runtime::set_seed_pre_lock_hook(Some(Box::new(|| {
+        let paths = crate::claude_json::known_paths().expect("paths");
+        crate::claude_json::merge_paths(&paths).expect("a merge right before the seed's lock");
+    })));
+    let guard = SeedPreLockHookGuard;
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    drop(guard);
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+/// A tree path spelled with a doubled separator names the same copy the sync
+/// lists: the seed's record entry still matches it, so the next pass reads the
+/// copy as the echo of home's carried rank, never as a file of its own.
+#[test]
+fn a_seed_into_a_differently_spelled_path_still_matches_its_record() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+    let sep = std::path::MAIN_SEPARATOR;
+    let doubled = std::path::PathBuf::from(format!(
+        "{}{sep}{sep}{}",
+        r3dir.parent().expect("has parent").display(),
+        r3dir.file_name().expect("has name").to_string_lossy()
+    ));
+    assert_eq!(doubled, r3dir, "the two spellings name one path");
+
+    seed_claude_json(&doubled, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+/// A seed holding the sync lock records the copy it wrote: one entry naming the
+/// seeded copy (a doubled-separator spelling of its tree included) at the copy's
+/// own mtime and size, carrying the rank of the t10 Claude Code write home
+/// echoes, so the next merge reads the copy as an echo of that write.
+#[test]
+fn a_seed_records_its_copy_at_homes_carried_rank() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+    let sep = std::path::MAIN_SEPARATOR;
+    let doubled = std::path::PathBuf::from(format!(
+        "{}{sep}{sep}{}",
+        r3dir.parent().expect("has parent").display(),
+        r3dir.file_name().expect("has name").to_string_lossy()
+    ));
+
+    seed_claude_json(&doubled, &h.join(".claude")).expect("seed");
+
+    let r3 = r3dir.join(".claude.json");
+    let meta = fs::metadata(&r3).expect("the seeded copy");
+    let since = meta
+        .modified()
+        .expect("mtime")
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch");
+    let record = crate::claude_json::written_record_path().expect("record path");
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&record).expect("read the record"))
+            .expect("parse the record");
+    let named: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| {
+            e["path"]
+                .as_str()
+                .is_some_and(|p| std::path::Path::new(p) == r3)
+        })
+        .collect();
+    assert_eq!(named.len(), 1, "one record entry names the seeded copy");
+    let entry = named[0];
+    assert_eq!(entry["size"], serde_json::json!(meta.len()), "its size");
+    assert_eq!(
+        entry["mtime_secs"],
+        serde_json::json!(since.as_secs()),
+        "its mtime"
+    );
+    assert_eq!(
+        entry["mtime_nanos"],
+        serde_json::json!(since.subsec_nanos()),
+        "its mtime"
+    );
+    assert_eq!(
+        entry["rank_secs"],
+        serde_json::json!(1_700_000_010_i64),
+        "the rank of the write home echoes"
+    );
+    assert_eq!(entry["rank_nanos"], serde_json::json!(0), "that rank");
+}
+
+/// Every seed stamps its copy at 1980-01-02T00:00:00Z, recorded or not: below
+/// every Claude Code write, and inside the date range FAT and exFAT store.
+#[test]
+fn every_seed_stamps_its_copy_at_the_fat_floor() {
+    // 3653 days from 1970-01-01 to 1980-01-02 (two leap days, 1972 and 1976).
+    let floor = SystemTime::UNIX_EPOCH + Duration::from_secs(3_653 * 86_400);
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("recorded seed");
+    let recorded = fs::metadata(r3dir.join(".claude.json"))
+        .expect("the recorded seed's copy")
+        .modified()
+        .expect("mtime");
+    assert_eq!(recorded, floor, "the recorded seed's stamp");
+
+    let r4dir = seed_test_runtime(&h, "p4", "runtime-4242-3");
+    fs::create_dir_all(&r4dir).expect("mkdir");
+    let lock = h.join(".tollgate").join(".claude-json-sync.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+    seed_claude_json(&r4dir, &h.join(".claude")).expect("unrecorded seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+    let unrecorded = fs::metadata(r4dir.join(".claude.json"))
+        .expect("the unrecorded seed's copy")
+        .modified()
+        .expect("mtime");
+    assert_eq!(unrecorded, floor, "the unrecorded seed's stamp");
+}
+
+/// Holds the [`crate::testutil::UnwritableDir`] the seed's pre-lock seam arms,
+/// so the seam (a `Fn`, not `FnOnce`) can arm it and the test can restore it
+/// after the acquire fails.
+static SEED_FAIL_GUARD: std::sync::Mutex<Option<crate::testutil::UnwritableDir>> =
+    std::sync::Mutex::new(None);
+
+/// An unrecorded seed (the sync lock could not be opened) writes only home's
+/// bytes and stamps its copy at the floor, so a sibling's newer unpropagated
+/// write wins the next pass instead of being overwritten by the seed.
+#[test]
+fn an_unrecorded_seed_never_outranks_a_siblings_newer_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2dir = seed_test_runtime(&h, "p2", "runtime-4242-1");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r2dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    write(
+        &global,
+        serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
+    );
+    write(
+        &r1,
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+    );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    set_mtime(&r1, t(20));
+    // A directory where the sync-lock file goes makes the seed's lock open fail,
+    // so the seed runs unrecorded — the path the unrecorded-seed mtime covers.
+    let lock = h.join(".tollgate").join(".claude-json-sync.lock");
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+
+    seed_claude_json(&r2dir, &h.join(".claude")).expect("seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let read = |p: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(p).expect("read")).expect("parse")
+    };
+    assert_eq!(
+        read(&r1),
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+        "the sibling keeps its Claude Code write"
+    );
+    for (name, path) in [
+        ("home", &global),
+        ("the seeded copy", &r2dir.join(".claude.json")),
+    ] {
+        let doc = read(path);
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(3),
+            "{name} converges on the sibling's write"
+        );
+        assert_eq!(
+            doc["ccR1"],
+            serde_json::json!(true),
+            "{name} converges on the sibling's write"
+        );
+    }
+}
+
+/// A failed seed (the runtime dir refuses the seed's write) fails the start and
+/// leaves no live row and no marker: the start's own registration is released,
+/// not left half-done. Forced Fake transport so the runtime path is the fixed
+/// bare stem the seed's pre-lock seam can make unwritable.
+#[test]
+fn a_failed_seed_fails_the_start_without_a_live_row_or_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            fs::write(tmp.path().join(".claude.json"), b"{\"numStartups\": 2}")
+                .expect("write global .claude.json");
+            let profile = configured_profile("seedfail");
+            let runtime = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("seedfail")
+                .join("runtime");
+
+            *SEED_FAIL_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            crate::runtime::set_seed_pre_lock_hook(Some(Box::new(move || {
+                *SEED_FAIL_GUARD
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(crate::testutil::UnwritableDir::new(&runtime));
+            })));
+            let _hook_guard = SeedPreLockHookGuard;
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("a failed seed must fail the start");
+            *SEED_FAIL_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            drop(_hook_guard);
+
+            assert!(
+                format!("{err:#}").contains("failed to seed"),
+                "the start names the seed failure, got: {err:#}"
+            );
+            assert!(
+                crate::live_sessions::list().is_empty(),
+                "a failed seed leaves no live row"
+            );
+            let profile_root = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("seedfail");
+            let markers: usize = std::fs::read_dir(&profile_root)
+                .expect("read profile root")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n == "sessions" || n.starts_with("sessions-"))
+                })
+                .map(|e| std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0))
+                .sum();
+            assert_eq!(markers, 0, "a failed seed leaves no marker");
+        });
+    });
+}
+
+/// A seed whose back-date stamp the filesystem refuses (the seam forces it)
+/// fails the start exactly as any failed seed: no live row, no marker, and no
+/// staged temp beside the copy. A refused stamp is a failed write, never a
+/// clamp to a fresh mtime that would outrank a sibling's newer Claude Code
+/// write.
+#[test]
+fn a_seed_whose_stamp_fails_fails_the_start_without_a_live_row_or_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            fs::write(tmp.path().join(".claude.json"), b"{\"numStartups\": 2}")
+                .expect("write global .claude.json");
+            let profile = configured_profile("seedstampfail");
+
+            crate::jsonsync::set_stamp_error_hook(true);
+            let _hook_guard = crate::testutil::StampErrorHookGuard;
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("a seed whose stamp fails must fail the start");
+            drop(_hook_guard);
+
+            let profile_root = tmp
+                .path()
+                .join(".tollgate")
+                .join("profiles")
+                .join("seedstampfail");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "failed to seed {}: test-forced stamp failure",
+                    profile_root.join("runtime").join(".claude.json").display()
+                ),
+                "the start names only the failed seed"
+            );
+            assert!(
+                crate::live_sessions::list().is_empty(),
+                "a failed seed leaves no live row"
+            );
+            let markers: usize = std::fs::read_dir(&profile_root)
+                .expect("read profile root")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n == "sessions" || n.starts_with("sessions-"))
+                })
+                .map(|e| std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0))
+                .sum();
+            assert_eq!(markers, 0, "a failed seed leaves no marker");
+            let runtime_dir = profile_root.join("runtime");
+            let temps = std::fs::read_dir(&runtime_dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.contains(".claude.json.tmp."))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(temps, 0, "a failed seed stamp leaves no staged temp");
+        });
+    });
+}
+
+/// An unrecorded seed that lands while a merge has rewritten home but not yet
+/// persisted its record never outranks a sibling's newer Claude Code write:
+/// the seeded copy only holds home's bytes, so it never needs to win a pass.
+#[test]
+fn an_unrecorded_seed_during_a_merge_never_outranks_a_siblings_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(&h, "p2", "runtime-4242-1").join(".claude.json");
+    let r4 = seed_test_runtime(&h, "p4", "runtime-4242-3").join(".claude.json");
+    let r3dir = seed_test_runtime(&h, "p3", "runtime-4242-2");
+    for p in [&r1, &r2, &r4] {
+        fs::create_dir_all(p.parent().expect("has parent")).expect("mkdir");
+    }
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2}));
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    write(&r4, serde_json::json!({"numStartups": 1}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    set_mtime(&r2, t(20));
+    set_mtime(&r4, t(3));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("a merge makes home an echo of r2");
+
+    write(
+        &r4,
+        serde_json::json!({"numStartups": 9, "ccR2": true, "ccR4": true}),
+    );
+    set_mtime(&r4, t(30));
+
+    // Mid-merge: home already rewritten, the record not yet persisted, and the
+    // seed's lock unavailable, so it seeds unrecorded.
+    let record = crate::claude_json::written_record_path().expect("record path");
+    let parked = h.join("record-parked");
+    fs::rename(&record, &parked).expect("park the record");
+    let lock = h.join(".tollgate").join(".claude-json-sync.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+    fs::rename(&parked, &record).expect("the merge persists its record");
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    for (name, path) in [
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("r4", &r4),
+        ("the seeded copy", &r3),
+    ] {
+        let doc = seed_test_doc(path);
+        assert_eq!(
+            doc["ccR4"],
+            serde_json::json!(true),
+            "{name} keeps the sibling's Claude Code write"
+        );
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(9),
+            "{name} keeps the sibling's Claude Code write"
+        );
+    }
+}
+
+/// A seed that takes the lock but cannot persist its record never outranks a
+/// sibling's newer Claude Code write: the seeded copy holds only home's bytes,
+/// so it never needs to win a pass, recorded or not.
+#[test]
+fn a_seed_whose_record_write_fails_never_outranks_a_siblings_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(&h, "p2", "runtime-4242-1").join(".claude.json");
+    let r3dir = seed_test_runtime(&h, "p3", "runtime-4242-2");
+    for p in [&r1, &r2] {
+        fs::create_dir_all(p.parent().expect("has parent")).expect("mkdir");
+    }
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("a pass creates the lock and the record");
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    set_mtime(&r2, t(20));
+
+    {
+        // The lock file exists, so the seed still takes the lock; the record's
+        // temp file cannot be created, so its record write fails.
+        let _tollgate = crate::testutil::UnwritableDir::new(&h.join(".tollgate"));
+        seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    }
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+/// An adoption re-reads the member inside the state flock and refuses when it
+/// moved off the account the rotation guard was taken for, rather than holding
+/// the session under the wrong member's lock.
+#[test]
+fn an_adoption_bails_when_the_member_moves_while_the_rotation_lock_waits() {
+    let sb = HomeSandbox::new();
+    std::fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let sid = "4242-0";
+    let mut row = crate::testutil::live_row(sid, "wfl");
+    row.current_member = Some("wfl".to_string());
+    crate::live_sessions::register(&row).expect("register the handed-off row");
+    crate::runtime::set_adopt_reread_hook(Some(Box::new(move || {
+        crate::live_sessions::update_as_session(sid, |fields| fields.set_current_member("wfs"))
+            .expect("flip the member");
+    })));
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(sid, &[]);
+    crate::runtime::set_adopt_reread_hook(None);
+
+    let err = refused
+        .err()
+        .expect("the member moved during the wait, so the adoption must refuse");
+    assert_eq!(
+        err.to_string(),
+        "the session moved accounts while the adoption waited; retrying"
+    );
+}
+
+/// A GC pass re-reads the job store before reaping a dead chain row, so a job
+/// record landing after the pass-start snapshot keeps the hand-off record.
+#[test]
+fn a_gc_pass_spares_a_chain_row_whose_job_lands_after_its_snapshot() {
+    let sb = HomeSandbox::new();
+    let home = sb.home().to_path_buf();
+    let wfl = crate::profile::ProfileName::from("wfl");
+    let profile = crate::profile::profile_dir(&wfl).expect("profile dir");
+    let sid = "4242-0";
+    let tree = profile.join(format!("runtime-{sid}"));
+    std::fs::create_dir_all(&tree).expect("tree");
+    std::fs::create_dir_all(profile.join(format!("sessions-{sid}"))).expect("sessions dir");
+    crate::live_sessions::register(&crate::testutil::live_row(sid, "wfl")).expect("register");
+    let tree_for_job = tree.clone();
+    crate::runtime::set_gc_rows_reread_hook(Some(Box::new(move || {
+        crate::testutil::write_claude_job_in(&home, "b6a1c0d6", &tree_for_job, "working", None);
+    })));
+
+    crate::runtime::gc_live_session_rows();
+    crate::runtime::set_gc_rows_reread_hook(None);
+
+    assert!(
+        crate::live_sessions::get(sid).is_some(),
+        "the job re-read spares the handed-off row"
+    );
 }

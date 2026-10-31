@@ -1,10 +1,14 @@
 mod actions;
 mod alibaba_login;
 mod bell;
+mod canonical;
+mod cc_exempt;
 mod claude;
+mod claude_jobs;
 mod claude_json;
 mod cli;
 mod codex_auth;
+mod codex_daemon;
 mod codex_login;
 mod codex_profiles;
 mod completions;
@@ -50,9 +54,11 @@ mod profile_cache;
 mod profile_json;
 mod profile_notes;
 mod providers;
+mod push;
 mod relaunch;
 mod runtime;
 mod secrets;
+mod session_record;
 mod sessions;
 mod sessions_cli;
 mod settings_sync;
@@ -62,6 +68,7 @@ mod status;
 mod throughput;
 mod token_ledger;
 mod tokens;
+mod tps;
 mod tui;
 mod update;
 mod usage;
@@ -76,7 +83,7 @@ use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::out::{errln, out, outln};
-use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
+use crate::profile::{AppConfig, Profile, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
 /// The not-found refusal for the commands that try the codex roster before
@@ -124,7 +131,7 @@ fn claude_roster_part(config: &AppConfig) -> Vec<String> {
 fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
     usage_error(format!(
         "profile '{name}' not found\navailable: {}",
-        parts.join(" · ")
+        parts.join(", ")
     ))
 }
 
@@ -156,6 +163,7 @@ fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<Profile
 }
 
 fn main() {
+    crate::plugin_host::record_self_exe_at_start();
     // `Error::exit` prints help/version to stdout and exits 0, and any real
     // parse error to stderr and exits 2 — which is already the usage-error half
     // of the exit contract [`exit_code`] owns for the rest.
@@ -262,6 +270,9 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
                 errln!("{refusal}");
                 return 1;
             }
+            if e.downcast_ref::<FailureReported>().is_some() {
+                return 1;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -350,6 +361,31 @@ fn interrupted_check_allowed() -> bool {
     }
 }
 
+/// Whether the torn-store notice may print for this command: the user-facing
+/// commands only. The bare TUI/help path returns before this is reached; the
+/// daemon's stderr is `daemon.log`, `tollgate mcp`'s is Claude Code's, a hook's
+/// is its caller's, `__complete`'s is the shell's prompt, and every hidden
+/// `__*`/helper command is a machine channel — none of them should print a
+/// notice onto the stderr their caller already owns.
+fn torn_store_notice_applies(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Mcp
+            | Command::McpAwaitJob
+            | Command::HookProfileChangedNote
+            | Command::HookReadExempt
+            | Command::SelfHeal
+            | Command::Complete { .. }
+            | Command::ApiKey { .. }
+            | Command::OauthToken { .. }
+            | Command::Run { .. }
+            | Command::Herdr {
+                cmd: cli::HerdrCommand::Config { .. }
+            }
+    )
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
     secrets::configure_prefer_store(cli.prefer_store);
     // `--theme` is a root-level global, so it parses ahead of any subcommand
@@ -395,6 +431,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         return cmd_bare_help();
     };
 
+    if torn_store_notice_applies(&command) {
+        crate::profile::enable_torn_store_notice();
+    }
+
     match command {
         Command::Secret { cmd } => secrets::dispatch(cmd),
         Command::Start(a) => cmd_start(
@@ -429,7 +469,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Jobs { json } => jobs_cli::run(json),
-        Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
+        Command::Sessions { json, tokens, live } => sessions_cli::run_sessions(json, tokens, live),
         // One positional is the bare-word act under its own verb: the exact
         // function `Command::External`'s single-word arm calls, so the exits
         // and copy are identical.
@@ -509,6 +549,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
+        Command::HookReadExempt => {
+            cc_exempt::run_read_hook();
+            Ok(())
+        }
         // The dispatch itself is one line and deliberately unpinned: a test
         // that ran it would run the real lifecycle leg. The name is pinned by
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
@@ -518,7 +562,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             codex,
             hermes,
             live_sessions,
-        } => cmd_complete(codex, hermes, live_sessions),
+            resumable,
+        } => cmd_complete(codex, hermes, live_sessions, resumable),
         Command::ApiKey { profile, session } => match (profile, session) {
             (_, Some(sid)) => hot_swap::run_session_helper(&sid, &mut std::io::stdout().lock()),
             (Some(profile), None) => cmd_api_key(&profile),
@@ -530,6 +575,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Hermes { cmd } => cmd_hermes(cmd),
         Command::Import { cmd } => cmd_import(cmd),
         Command::Plugin { cmd } => cmd_plugin(cmd),
+        Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -599,13 +645,15 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete(codex: bool, hermes: bool, live_sessions: bool) -> Result<()> {
+fn cmd_complete(codex: bool, hermes: bool, live_sessions: bool, resumable: bool) -> Result<()> {
     if codex {
         completions::print_codex_profile_names();
     } else if hermes {
         completions::print_hermes_profile_names();
     } else if live_sessions {
         completions::print_session_stems();
+    } else if resumable {
+        completions::print_resume_targets();
     } else {
         completions::print_profile_names();
     }
@@ -660,6 +708,228 @@ fn cmd_run() -> Result<()> {
     )
 }
 
+// ── `tollgate presets rebind` ───────────────────────────────────────────────────
+
+/// The "nothing to move" line; exits 0.
+const REBIND_NOTHING: &str = "every account already uses the built-in preset models.";
+
+/// The aligned account-row-old→new body, one line per row, no summary.
+fn rebind_list_body(selected: &[crate::presets::AccountOffers]) -> String {
+    let acc_w = selected.iter().map(|o| o.account.len()).max().unwrap_or(0);
+    let row_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.row.len())
+        .max()
+        .unwrap_or(0);
+    let old_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.old_display().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for offer in selected {
+        for m in &offer.rows {
+            out.push_str(&format!(
+                "{:<acc_w$}  {:<row_w$}  {:<old_w$}  → {}\n",
+                offer.account,
+                m.row,
+                m.old_display(),
+                m.new_display(),
+            ));
+        }
+    }
+    out
+}
+
+/// The list mode's trailing hint; with names, it repeats them in the command.
+fn rebind_summary_line(rows: usize, accounts: usize, names: &[String]) -> String {
+    let suffix = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", names.join(" "))
+    };
+    format!(
+        "{}. run `tollgate presets rebind{suffix} --yes` to apply.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// The `--yes` success line.
+fn rebind_applied_line(rows: usize, accounts: usize) -> String {
+    format!(
+        "moved {} onto the built-in preset models.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// Resolve the named accounts against the roster and the offer list, in the
+/// order given, de-duplicated. Every name is validated before any write: an
+/// unknown name, a codex name, or one with nothing to move, bails by name.
+fn select_offers(
+    config: &AppConfig,
+    offers: Vec<crate::presets::AccountOffers>,
+    names: &[String],
+) -> Result<Vec<crate::presets::AccountOffers>> {
+    if names.is_empty() {
+        return Ok(offers);
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in names {
+        let canonical = match config.canonical_name(raw) {
+            Some(canonical) => canonical,
+            None => {
+                if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    anyhow::bail!("'{codex}' is a codex profile; presets rebind is claude-only");
+                }
+                anyhow::bail!("no account named '{raw}'");
+            }
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let offer = offers
+            .iter()
+            .find(|o| o.account == canonical)
+            .ok_or_else(|| anyhow::anyhow!("'{canonical}' has no model rows to move"))?
+            .clone();
+        out.push(offer);
+    }
+    Ok(out)
+}
+
+/// A `--yes` run with at least one failed account: the ruled moved line for the
+/// rows that wrote (empty when none), plus one failure per failed account in
+/// listed order (roster order on a bare run, argument order with names).
+/// [`cmd_presets`] prints the moved line to stdout, each failure
+/// to stderr, then exits 1.
+#[derive(Debug)]
+struct RebindPartial {
+    moved: String,
+    failures: Vec<String>,
+}
+
+impl std::fmt::Display for RebindPartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failures.join("\n"))
+    }
+}
+
+impl std::error::Error for RebindPartial {}
+
+/// The failure's lines were already printed to stderr (a re-bind's, one per
+/// failed account; a refused bare-item settle's `tollgate:` line);
+/// [`exit_code`] maps this to exit 1 with no `Error:` line, the way
+/// [`HelpRendered`] maps to 2 after help already printed.
+#[derive(Debug)]
+pub(crate) struct FailureReported;
+
+impl std::fmt::Display for FailureReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failure reported on stderr")
+    }
+}
+
+impl std::error::Error for FailureReported {}
+
+/// The whole output of one `presets rebind` run, after any `--yes` writes have
+/// landed: the exact stdout bytes as a `String`. Split out so a test drives the
+/// real command under a `HomeSandbox` and pins the bytes without capturing the
+/// process. Name validation happens before any write, so an error leaves the
+/// configs untouched. A `--yes` failure returns the ruled moved line plus one
+/// failure line per failed account inside a [`RebindPartial`]: the loop keeps
+/// going past a failed account, and rows saved before a live-settings failure
+/// still count as moved. A run that moved nothing prints the quiet line.
+fn run_presets_rebind(config: &mut AppConfig, accounts: &[String], yes: bool) -> Result<String> {
+    let offers = crate::presets::rebind_offers(config);
+    let selected = select_offers(config, offers, accounts)?;
+    if selected.is_empty() {
+        return Ok(format!("{REBIND_NOTHING}\n"));
+    }
+    if yes {
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for offer in &selected {
+            let name = ProfileName::from(offer.account.clone());
+            match crate::actions::apply_rebind_account(config, &name, &offer.rows) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(error) => {
+                    let (applied, error) =
+                        match error.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(error) => (0, error),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failures.push(format!("re-bind failed for '{}': {error:#}", offer.account));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let moved = if rows > 0 {
+                format!("{}\n", rebind_applied_line(rows, moved_accounts))
+            } else {
+                String::new()
+            };
+            return Err(anyhow::Error::new(RebindPartial { moved, failures }));
+        }
+        if rows == 0 {
+            return Ok(format!("{REBIND_NOTHING}\n"));
+        }
+        Ok(format!("{}\n", rebind_applied_line(rows, moved_accounts)))
+    } else {
+        let rows = selected.iter().map(|o| o.rows.len()).sum::<usize>();
+        // Names appear in the hint only when the user named accounts;
+        // the bare invocation names none.
+        let hint_names: Vec<String> = if accounts.is_empty() {
+            Vec::new()
+        } else {
+            selected.iter().map(|o| o.account.clone()).collect()
+        };
+        Ok(format!(
+            "{}{}\n",
+            rebind_list_body(&selected),
+            rebind_summary_line(rows, selected.len(), &hint_names)
+        ))
+    }
+}
+
+fn cmd_presets(cmd: cli::PresetsCommand) -> Result<()> {
+    match cmd {
+        cli::PresetsCommand::Rebind(args) => {
+            let mut config = load_config()?;
+            match run_presets_rebind(&mut config, &args.accounts, args.yes) {
+                Ok(stdout) => {
+                    out!("{stdout}");
+                    Ok(())
+                }
+                Err(e) => match e.downcast::<RebindPartial>() {
+                    Ok(partial) => {
+                        if !partial.moved.is_empty() {
+                            out!("{}", partial.moved);
+                        }
+                        for line in &partial.failures {
+                            errln!("{line}");
+                        }
+                        Err(anyhow::Error::new(FailureReported))
+                    }
+                    Err(e) => Err(e),
+                },
+            }
+        }
+    }
+}
+
 // A bare word is a profile name. More than one word is nothing tollgate
 // knows: a usage error rather than the old help-and-exit-0, so a typo
 // is distinguishable from success to a calling script.
@@ -711,7 +981,7 @@ fn cmd_start(
                         anyhow::bail!(
                             "--with-fallback is not available on a codex profile: codex reads \
                              auth.json once at start, so a chain lands at the NEXT start, not \
-                             mid-session — start without the flag"
+                             mid-session. Start without the flag"
                         );
                     }
                     // Before `--explain` too, for the reason the claude arm runs
@@ -739,26 +1009,20 @@ fn cmd_start(
             };
             (ProfileName::from(canonical), Vec::new(), None, Vec::new())
         }
-        cli::StartTarget::Auto => {
-            anyhow::ensure!(
-                !config.state.fallback_chain.is_empty(),
-                "--auto picks from the fallback chain and it is empty; add accounts on the \
-                 fallback tab, or name one"
-            );
-            let demand = fallback::demand_from(start::launch_models(rest));
-            let families = (!demand.is_empty()).then_some(demand.as_slice());
-            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
-            let Some(pick) = pick else {
-                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
-            };
-            (rows[pick].name.clone(), rows, Some(pick), demand)
-        }
+        cli::StartTarget::Auto => fallback::start_pick(
+            &config,
+            isolation,
+            rest,
+            start::process_model_env(),
+            follows_chain,
+            std::env::current_dir().ok().as_deref(),
+        )?,
     };
 
     if explain_only {
         // Run the same refusals a real launch runs, so `--explain` answers what
         // a start would do rather than naming a target it would then reject.
-        start::admit(&config, &name, isolation, follows_chain)?;
+        start::admit(&config, &name, isolation, follows_chain, rest)?;
         outln!("{}", format::start_pick_line(name.as_str(), &demand));
         if !rows.is_empty() {
             outln!("{}", format::render_start_walk(&rows, pick));
@@ -821,33 +1085,138 @@ fn reauth_confirmed(input: &str) -> bool {
 
 /// Prompt `[y/N]` before a reauth overwrites a profile's stored credentials.
 /// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
-/// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
-/// What the reauth confirm says it REPLACES. Split out so the survivor clause
-/// is unit-pinned: it is the only affirmative promise the prompt makes, and it
-/// is true only where the preserve arm actually fires
-/// (`actions::overwrite_captured_profile`) — an api-mode login replaces the
-/// endpoint set outright, and a profile with nothing to preserve must not be
-/// told something survives.
-fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
-    match (is_api, keeps_endpoint) {
-        (true, _) => "endpoint + API key",
-        (false, true) => "stored subscription login, keeping its endpoint and api key",
-        (false, false) => "stored credentials",
-    }
-}
-
-fn confirm_reauth(target: &str, is_api: bool, keeps_endpoint: bool) -> Result<bool> {
+/// OAuth reauth contract.
+fn confirm_reauth(prompt: &str) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
-    let object = reauth_confirm_object(is_api, keeps_endpoint);
-    out!(
-        "tollgate: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
-    );
+    out!("{prompt}");
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(reauth_confirmed(&answer))
+}
+
+/// The whole `[y/N]` line [`confirm_reauth`] prints. What the overwrite keeps or
+/// strikes is read through the predicate the overwrite itself calls
+/// ([`claude::has_own_inference_endpoint`]), and "has a login" through
+/// `usage_poll_pair`, so the clause and the poller agree on it. The sidecar
+/// fact is a disk read, so this fn makes it itself; every
+/// managed fact comes off `profile`. `is_api` tailors the copy (endpoint + key
+/// vs tokens).
+///
+/// The setup-token-only shape (#110) is the one the Fallback card sends people
+/// here with, and it stores no OAuth pair at all, so "replaces its stored
+/// credentials" would name nothing that exists and contradict the wiki, which
+/// calls this login an add beside the long-lived token. "Long-lived" and not
+/// "setup" in the copy: [`claude::has_session_token`] is true for a rolling
+/// sidecar too, which is no `claude setup-token` mint, and the NOTE after the
+/// login already uses that umbrella.
+///
+/// Storing no login is not enough for "adds", because the login can still
+/// STRIKE something. `actions::overwrite_captured_profile` keeps a profile's
+/// endpoint and key only as a pair and only behind
+/// [`claude::has_own_inference_endpoint`], which refuses an endpoint with
+/// nothing to authenticate it — so on an endpoint SHELL (a `base_url` with
+/// neither key nor pair, what logging an api account out leaves behind) an
+/// OAuth reauth writes `base_url = None`. Such a profile stores no login, so
+/// "adds" would announce an add while the login deletes the account's routing.
+/// `drops_endpoint_fields` is that fact, and it is read from the MANAGED fields
+/// alone: the overwrite writes those two and never touches the profile's
+/// `[env]`, so an endpoint carried by `ANTHROPIC_BASE_URL` survives and is
+/// correctly not named here.
+///
+/// The survivor clause names only what the preserve arm keeps: it is the
+/// prompt's one affirmative promise, so a profile with nothing to preserve is
+/// not told something survives. An api-mode login writes the endpoint and the
+/// key outright, so it always replaces them.
+///
+/// The session-token sentence splits on `rolling_token`, and the two answers
+/// are opposites. A plain `claude setup-token` mint is untouched: the relink
+/// keeps resolving [`claude::install_source_path`] to `session-token.json`
+/// while [`claude::has_session_token`] holds, so the fresh pair reaches usage
+/// polling and nothing else. CLA-ROLL: with `rolling_token` armed, every
+/// rotation re-stamps that sidecar FROM the stored pair (`oauth`'s
+/// `stamp_sidecar`, which reads the flag off disk and skips only a mis-fill),
+/// so the halves swap roles — the login being confirmed here is what the
+/// sessions end up on at the next rotation, and it is another account's
+/// whenever that is what was logged in as. Nothing on the profile ties the mint
+/// to an account, so tollgate cannot check that for the operator; the sentence
+/// says it instead. [`login_note`] splits on the same facts, so the prompt
+/// before the login and the NOTE after it cannot say different things.
+fn reauth_prompt(target: &ProfileName, profile: Option<&Profile>, is_api: bool) -> String {
+    let keeps_session_token = !is_api && claude::has_session_token(target);
+    let rolling = profile.is_some_and(|p| p.rolling_token);
+    let action = if is_api {
+        "replaces its endpoint + API key".to_string()
+    } else {
+        let keeps_endpoint = profile.is_some_and(claude::has_own_inference_endpoint);
+        let stores_a_login = profile.is_some_and(|p| crate::usage::usage_poll_pair(p).is_some());
+        let drops_endpoint_fields =
+            !keeps_endpoint && profile.is_some_and(|p| p.base_url.is_some() || p.api_key.is_some());
+        if !stores_a_login && !drops_endpoint_fields {
+            match (keeps_session_token, keeps_endpoint) {
+                (true, true) => {
+                    "adds an OAuth login beside its long-lived token, keeping its endpoint and \
+                     api key"
+                }
+                (true, false) => "adds an OAuth login beside its long-lived token",
+                (false, true) => "adds an OAuth login, keeping its endpoint and api key",
+                (false, false) => "adds an OAuth login",
+            }
+            .to_string()
+        } else if keeps_endpoint {
+            "replaces its stored subscription login, keeping its endpoint and api key".to_string()
+        } else {
+            "replaces its stored credentials".to_string()
+        }
+    };
+    let note = match (keeps_session_token, rolling) {
+        (false, _) => "",
+        (true, false) => {
+            " Sessions keep running on its long-lived token. This login only feeds usage polling."
+        }
+        (true, true) => {
+            " Its rolling token re-stamps from the stored login, so its sessions move onto this \
+             login at the next rotation, even if it is another account."
+        }
+    };
+    format!(
+        "tollgate: profile '{target}' already exists. Re-authenticating {action}.{note} Continue? [y/N] "
+    )
+}
+
+/// The NOTE `cmd_login` prints after a login onto a profile that keeps a
+/// long-lived sidecar: the same split [`reauth_prompt`] makes, said once more
+/// where the operator can act on it. Silence here reads as "the re-login took",
+/// which is what sends an operator round the loop of re-authenticating an
+/// account that keeps running on its year-old mint.
+///
+/// `None` when the login is an api one (it touches no sidecar) or the profile
+/// holds no sidecar. On a rolling profile the re-login is not inert: it is what
+/// the sessions move onto at the next rotation, so "only feeds usage polling"
+/// would be the wrong half of the truth at the moment the rotation proves it.
+/// Pass the profile as it stands after the overwrite: `rolling_token` is left
+/// untouched there, so the NOTE describes the same login the prompt did.
+fn login_note(target: &ProfileName, profile: Option<&Profile>, is_api: bool) -> Option<String> {
+    if is_api || !claude::has_session_token(target) {
+        return None;
+    }
+    let rolling = profile.is_some_and(|p| p.rolling_token);
+    Some(if rolling {
+        format!(
+            "tollgate: NOTE '{target}' holds a rolling token, and that is what switches install. \
+             It re-stamps from the stored login, so its sessions move onto this login at the \
+             next rotation, even if it is another account. Drop it with:  tollgate static-token \
+             {target} --clear"
+        )
+    } else {
+        format!(
+            "tollgate: NOTE '{target}' still holds a long-lived token, and that is what switches \
+             install. This login only feeds usage polling. Drop it with:  tollgate static-token \
+             {target} --clear"
+        )
+    })
 }
 
 /// Collect the base_url + api_key pair for API-key mode. Each value comes from
@@ -935,33 +1304,14 @@ fn resolve_reauth_base_url(
     }
 }
 
-/// The reauth snapshot for api mode. Carries the STORED OAuth chain when the
-/// profile has one: `overwrite_captured_profile` replaces credentials with
-/// exactly what the snapshot holds, so a credentials-less snapshot here would
-/// silently drop the chain `rolling-token` and usage polling roll from (owner
-/// ruling). Keyed on api-mode reauth alone — every other credentials-less
-/// snapshot keeps replacing (a third-party recapture is a deliberate
-/// sign-out). The anchor action is `Unchanged`: an api-key login proves no
-/// Anthropic identity of its own, and the carried chain did not move, so the
-/// re-key must leave the OAuth account's anchor untouched rather than clearing
-/// it as if a new login had landed.
-fn api_reauth_snapshot(
-    base_url: Option<String>,
-    api_key: Option<String>,
-    stored: Option<&crate::profile::Profile>,
-) -> actions::CaptureSnapshot {
-    actions::CaptureSnapshot {
-        credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
-        base_url,
-        api_key,
-        anchor: actions::AnchorAction::Unchanged,
-    }
-}
-
 /// The is_api reauth arm in one call: resolve the endpoint
 /// ([`resolve_reauth_base_url`]), run the same validate/trim
 /// [`collect_api_endpoint`] every api capture takes (called, never re-spelled),
-/// then build the chain-carrying snapshot ([`api_reauth_snapshot`]). The
+/// then build the snapshot: the endpoint and key alone. Its anchor action is
+/// `Unchanged`, which `overwrite_captured_profile` reads as "keep the stored
+/// OAuth chain" (the one `rolling-token` and usage polling roll from), read
+/// from the store as the write lands, and as "leave the anchor
+/// untouched": an api-key login proves no Anthropic identity of its own. The
 /// composition lives here so the arm itself holds no wiring a bad edit could
 /// silently miscompose. Interactivity is this helper's own `tty` param, passed
 /// through to `collect_api_endpoint`, so the pins drive the `interactive =
@@ -976,7 +1326,25 @@ fn collect_api_reauth_snapshot(
 ) -> Result<actions::CaptureSnapshot> {
     let base_url = resolve_reauth_base_url(flag, stored, tty);
     let (base_url, api_key) = collect_api_endpoint(base_url.as_deref(), key_flag, tty)?;
-    Ok(api_reauth_snapshot(base_url, api_key, stored))
+    Ok(actions::CaptureSnapshot {
+        credentials: None,
+        base_url,
+        api_key,
+        anchor: actions::AnchorAction::Unchanged,
+        plan: None,
+    })
+}
+
+/// The reauth confirm, asked of the account the login claimed. An api re-key
+/// over a stored login that cannot be read refuses before the `[y/N]`: asking
+/// consent for a write the landing refuses anyway (`overwrite_captured_profile`
+/// keeps the stored chain and cannot keep one it cannot read) is a broken
+/// order.
+fn confirm_claimed_reauth(target: &ProfileName, claimed: &Profile, is_api: bool) -> Result<bool> {
+    if is_api && let Some(refusal) = crate::profile::unreadable_store_refusal(claimed) {
+        anyhow::bail!("{refusal}");
+    }
+    confirm_reauth(&reauth_prompt(target, Some(claimed), is_api))
 }
 
 /// One line of pasted `code#state` from a non-TTY stdin, for a driver that
@@ -1170,9 +1538,9 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     // failing on a 400 is the case that ruling exists for.
     let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
     if reauth {
-        outln!("tollgate: re-authenticating existing profile '{target}', opening a browser…");
+        outln!("tollgate: re-authenticating existing profile '{target}', opening a browser...");
     } else {
-        outln!("tollgate: opening a browser to log in to a new account for '{target}'…");
+        outln!("tollgate: opening a browser to log in to a new account for '{target}'...");
     }
     let pending = oauth_login::begin_login().map_err(cli_err)?;
     let links = pending.links().clone();
@@ -1215,7 +1583,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
             .as_deref()
             .or(identity.organization_uuid.as_deref());
         match org {
-            Some(org) => outln!("signed in as {email} · {org}"),
+            Some(org) => outln!("signed in as {email} ({org})"),
             None => outln!("signed in as {email}"),
         }
     }
@@ -1223,16 +1591,33 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     // whichever action commits it, which is what anchors the profile — so
     // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
     // SAME account even after the stored token dies. Seeding it here instead
-    // would anchor an account whose commit may still fail.
-    Ok(actions::CaptureSnapshot {
-        credentials: Some(outcome.credentials),
-        base_url: None,
-        api_key: None,
-        anchor: outcome
-            .identity
-            .map(actions::AnchorAction::Proven)
-            .unwrap_or(actions::AnchorAction::Unproven),
-    })
+    // would anchor an account whose commit may still fail. The probe body's
+    // plan rides the same snapshot for the commit's `usage_cache.json` seed.
+    Ok(actions::capture_snapshot_from_outcome(outcome))
+}
+
+/// macOS, CLI: when the command `writes` the bare Keychain item, settle it
+/// first ([`claude::settle_bare_keychain_item`]) and resolve the outcome
+/// through [`actions::bare_item_placement_for_cli`]; hold the placement
+/// until the write is done.
+#[cfg(target_os = "macos")]
+fn settle_bare_item_for_cli(
+    config: &mut AppConfig,
+    writes: bool,
+    writer: claude::BareItemWriter,
+) -> Result<Option<claude::BareItemPlacement>> {
+    if !writes {
+        return Ok(None);
+    }
+    // Guest mode: the settle reads no item, and the placement refuses every
+    // writer of it. A sign-out (`delete <active>`) settles nothing, since
+    // guest mode skips its unwire of the live slot.
+    if writer == claude::BareItemWriter::SignOut && crate::identity::upstream_active() {
+        return Ok(None);
+    }
+    let settle =
+        claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
+    actions::bare_item_placement_for_cli(config, writer, settle).map(Some)
 }
 
 /// `tollgate login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
@@ -1256,10 +1641,11 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
 /// or not tollgate recognises the provider (see
 /// [`actions::overwrite_captured_profile`]), and an api-mode reauth keeps the
 /// stored OAuth chain (the credential usage polling and `rolling-token` roll
-/// from) by carrying it in the snapshot, which
-/// [`actions::overwrite_captured_profile`] then writes back unchanged. Neither
-/// path switches to the profile (`tollgate <name>` does that). `--model` is
-/// persisted onto the profile after capture.
+/// from): [`actions::overwrite_captured_profile`] re-reads it from the store as
+/// the write lands. Neither path switches to the profile (`tollgate <name>` does
+/// that). `--model` is persisted onto the account the login claimed, after the
+/// capture. Once the login claims its account, everything it reuses or writes
+/// reads that account fresh; the config read on entry only routes.
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -1296,13 +1682,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // env, chain slot, and model settings all survive, so it needs none of
     // the reauth/overwrite machinery below.
     if args.setup_token {
-        return cmd_login_setup_token(
-            &mut config,
-            &target,
-            reauth,
-            args.model.as_deref(),
-            args.yes,
-        );
+        return cmd_login_setup_token(&target, reauth, args.model.as_deref(), args.yes);
     }
 
     // An Alibaba Model Studio profile's usage credential is a console session,
@@ -1316,40 +1696,57 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
     if !is_api && is_alibaba {
-        return cmd_login_console(&mut config, &target, args.model.as_deref());
-    }
-
-    // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
-    // declined overwrite must not open a browser or read a secret.
-    // The preserve arm's own predicate, called rather than re-spelled: only a
-    // profile that has an endpoint AND something to authenticate with keeps
-    // them through a browser reauth, so only that one is told so.
-    let keeps_endpoint = config
-        .find(&target)
-        .is_some_and(claude::has_own_inference_endpoint);
-    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint)? {
-        outln!("tollgate: aborted. '{target}' left unchanged.");
-        return Ok(());
+        return cmd_login_console(&target, args.model.as_deref());
     }
 
     if reauth {
-        let snapshot = if is_api {
-            use std::io::IsTerminal as _;
-            collect_api_reauth_snapshot(
-                args.base_url.as_deref(),
-                args.api_key.as_deref(),
-                config.find(&target),
-                std::io::stdin().is_terminal(),
-            )?
-        } else {
-            run_oauth(true, &target)?
+        // The overwrite relinks the live slot when `target` is or becomes
+        // the active profile. Settled once the overwrite is confirmed and
+        // before the login it collects, so a refused or cancelled settle
+        // never discards a finished browser login; the writer guard still
+        // catches an item that changes during it. The placement lives until
+        // the overwrite has landed.
+        #[cfg(target_os = "macos")]
+        let mut _placed = None;
+        // Confirm BEFORE collecting anything (browser or key prompt): a
+        // declined overwrite must not open a browser or read a secret. Both
+        // read the account the login claimed, as it is now. On a reauth
+        // `--model` is an explicit override; without it the profile's existing
+        // model settings survive.
+        let landed = reauth_profile(
+            &target,
+            args.model.as_deref(),
+            |claimed| confirm_claimed_reauth(&target, claimed, is_api),
+            |claimed| {
+                #[cfg(target_os = "macos")]
+                {
+                    // Read after the confirm: the entry's config predates it.
+                    let mut fresh = load_config()?;
+                    let writes = fresh.is_active(&target) || fresh.state.active_profile.is_none();
+                    _placed = settle_bare_item_for_cli(
+                        &mut fresh,
+                        writes,
+                        claude::BareItemWriter::Switch,
+                    )?;
+                }
+                if is_api {
+                    use std::io::IsTerminal as _;
+                    collect_api_reauth_snapshot(
+                        args.base_url.as_deref(),
+                        args.api_key.as_deref(),
+                        Some(claimed),
+                        std::io::stdin().is_terminal(),
+                    )
+                } else {
+                    run_oauth(true, &target)
+                }
+            },
+        )?;
+        let Some(landed) = landed else {
+            outln!("tollgate: aborted. '{target}' left unchanged.");
+            return Ok(());
         };
-        actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
-        // On a reauth `--model` is an explicit override; without it the
-        // profile's existing model settings survive.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        config = landed;
         let what = if is_api { "endpoint + key" } else { "tokens" };
         outln!("tollgate: re-authenticated '{target}'. Fresh {what} are in place.");
     } else if is_api {
@@ -1371,6 +1768,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             args.api_key.as_deref(),
             std::io::stdin().is_terminal(),
         )?;
+        config = load_config()?;
         actions::create_blank_profile(
             &mut config,
             target.to_string(),
@@ -1380,28 +1778,32 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("tollgate: captured into profile '{target}'. Switch to it with:  tollgate {target}");
     } else {
-        let snapshot = run_oauth(false, &target)?;
+        // A first account becomes the active one, linking the live slot.
+        // Settled before the browser login, as the reauth arm is.
+        #[cfg(target_os = "macos")]
+        let _placed = {
+            let writes = config.state.active_profile.is_none();
+            settle_bare_item_for_cli(&mut config, writes, claude::BareItemWriter::Switch)?
+        };
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
-        actions::capture_into_profile(
-            &mut config,
-            target.to_string(),
-            args.model.clone(),
-            snapshot,
+        config = capture_new_profile(
+            &target,
+            profile::ModelSettings {
+                default: args.model.clone(),
+                ..Default::default()
+            },
+            || run_oauth(false, &target),
         )?;
         outln!("tollgate: captured into profile '{target}'. Switch to it with:  tollgate {target}");
     }
-    // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
-    // fresh OAuth login reaches usage polling and NOTHING ELSE while it exists.
-    // Silence here reads as "the re-login took", which is what sent an operator
-    // round the loop of re-authenticating an account that kept running on its
-    // year-old mint.
-    if !is_api && claude::has_session_token(&target) {
-        outln!(
-            "tollgate: NOTE '{target}' still holds a long-lived token, and that is what switches \
-             install. This login only feeds usage polling. Drop it with:  tollgate static-token \
-             {target} --clear"
-        );
+    // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch. What
+    // that costs depends on the kind, so the copy lives in one place with the
+    // prompt's half ([`login_note`]). Read the post-login profile: the
+    // overwrite leaves `rolling_token` untouched, so this is the same fact the
+    // prompt was built from.
+    if let Some(note) = login_note(&target, config.find(&target), is_api) {
+        outln!("{note}");
     }
     Ok(())
 }
@@ -1443,27 +1845,79 @@ fn cmd_capture(profile: &str) -> Result<()> {
 /// and region come from the profile's own `base_url`, so nothing is prompted
 /// for. The profile's api key is left alone — the callback's is workspace-scoped
 /// and belongs to a different product (see `actions::store_console_login`).
-fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) -> Result<()> {
-    let target = ProfileName::from(target);
-    let base_url = config
-        .find(&target)
-        .and_then(|p| p.base_url.clone())
-        .unwrap_or_default();
-    let (site, region) = providers::alibaba::site_and_region(&base_url)
-        .context("this profile's endpoint is not an Alibaba Model Studio one")?;
-    outln!(
-        "tollgate: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
-    );
-    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
-    actions::store_console_login(config, &target, outcome.console.clone())?;
-    if let Some(model) = model {
-        actions::set_profile_default_model(config, &target, model)?;
-    }
+fn cmd_login_console(target: &ProfileName, model: Option<&str>) -> Result<()> {
+    let outcome = console_login_into(target, model, |site, region| {
+        outln!(
+            "tollgate: opening the Alibaba Model Studio console to capture a usage session for '{target}'..."
+        );
+        alibaba_login::login_with(site, region, print_browser_fallback)
+    })?;
     outln!(
         "tollgate: console session captured for '{target}'.\n{}",
         alibaba_login::login_summary(&outcome)
     );
     Ok(())
+}
+
+/// The console login's round trip and landing: `trip` opens the console front
+/// and region the claimed account's endpoint names, and the session, then
+/// `model`, land only on the account `target` named when the trip started.
+fn console_login_into(
+    target: &ProfileName,
+    model: Option<&str>,
+    trip: impl FnOnce(profile::ConsoleSite, &'static str) -> Result<alibaba_login::ConsoleLoginOutcome>,
+) -> Result<alibaba_login::ConsoleLoginOutcome> {
+    let account = profile::claim_profile_id(target)?;
+    let base_url = profile::read_claimed_profile(target, &account)?
+        .base_url
+        .unwrap_or_default();
+    let (site, region) = providers::alibaba::site_and_region(&base_url)
+        .context("this profile's endpoint is not an Alibaba Model Studio one")?;
+    let outcome = trip(site, region)?;
+    let mut config = load_config()?;
+    actions::store_console_login(&mut config, target, &account, outcome.console.clone())?;
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, target, &account, model)?;
+    }
+    Ok(outcome)
+}
+
+/// The reauth arm's landing: the login claims `target`'s account as it
+/// starts; `confirm` asks (`false` = declined, no credential lands), then
+/// `collect` runs the browser trip or the key prompt. Each reads the claimed
+/// account fresh as it runs. The snapshot, then `model`, land only on the
+/// account claimed at the start, in config read after the trip.
+fn reauth_profile(
+    target: &ProfileName,
+    model: Option<&str>,
+    confirm: impl FnOnce(&Profile) -> Result<bool>,
+    collect: impl FnOnce(&Profile) -> Result<actions::CaptureSnapshot>,
+) -> Result<Option<AppConfig>> {
+    let account = profile::claim_profile_id(target)?;
+    if !confirm(&profile::read_claimed_profile(target, &account)?)? {
+        return Ok(None);
+    }
+    let snapshot = collect(&profile::read_claimed_profile(target, &account)?)?;
+    let mut config = load_config()?;
+    actions::overwrite_captured_profile(&mut config, target, &account, snapshot)?;
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, target, &account, model)?;
+    }
+    Ok(Some(config))
+}
+
+/// The new-profile arm's landing: `collect` runs the browser trip, and the
+/// capture creates `target` in config read after it, refusing a name another
+/// account took meanwhile.
+fn capture_new_profile(
+    target: &ProfileName,
+    models: profile::ModelSettings,
+    collect: impl FnOnce() -> Result<actions::CaptureSnapshot>,
+) -> Result<AppConfig> {
+    let snapshot = collect()?;
+    let mut config = load_config()?;
+    actions::capture_into_profile(&mut config, target.to_string(), models, snapshot)?;
+    Ok(config)
 }
 
 /// `tollgate login <name> --setup-token [--yes] [--model <id>]` — capture a
@@ -1480,90 +1934,137 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
 /// OAuth pair, and `try_adopt_live_rotation` short-circuits for a session-token
 /// profile, so there is nothing for the anchor to guard. A later
 /// `tollgate login <name>` that adds an OAuth pair seeds it then.
-fn cmd_login_setup_token(
-    config: &mut profile::AppConfig,
-    target: &str,
-    exists: bool,
-    model: Option<&str>,
-    yes: bool,
-) -> Result<()> {
+fn cmd_login_setup_token(target: &str, exists: bool, model: Option<&str>, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal();
     let target = ProfileName::from(target);
 
-    // Replacing an existing sidecar re-points every future switch at the new
-    // token — confirm like the other in-place replacements. A fresh capture
-    // (no sidecar yet) is additive and needs no ceremony.
-    if claude::session_token_status(&target).is_some() && !yes {
-        if !interactive {
-            anyhow::bail!(
-                "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
-            );
-        }
-        out!("Replace the stored long-lived token for '{target}'? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("tollgate: aborted. '{target}' left unchanged.");
-            return Ok(());
-        }
-    }
-
-    let raw = if interactive {
-        outln!("tollgate: capturing a long-lived token for '{target}'.");
-        outln!("  1. in another terminal, run:  claude setup-token");
-        outln!("  2. complete the browser flow it opens");
-        outln!("  3. paste the minted token below (input stays hidden)");
-        rpassword::prompt_password("Setup token: ")
-            .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
-    } else {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        line
+    let landed = setup_token_into(
+        &target,
+        exists,
+        model,
+        || {
+            // Replacing an existing sidecar re-points every future switch at
+            // the new token — confirm like the other in-place replacements. A
+            // fresh capture (no sidecar yet) is additive and needs no ceremony.
+            if claude::session_token_status(&target).is_none() || yes {
+                return Ok(true);
+            }
+            if !interactive {
+                anyhow::bail!(
+                    "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
+                );
+            }
+            out!("Replace the stored long-lived token for '{target}'? [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(reauth_confirmed(&answer))
+        },
+        || {
+            let raw = if interactive {
+                outln!("tollgate: capturing a long-lived token for '{target}'.");
+                outln!("  1. in another terminal, run:  claude setup-token");
+                outln!("  2. complete the browser flow it opens");
+                outln!("  3. paste the minted token below (input stays hidden)");
+                rpassword::prompt_password("Setup token: ")
+                    .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
+            } else {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line
+            };
+            claude::validate_setup_token(&raw)
+        },
+    )?;
+    let Some(expires_at) = landed else {
+        outln!("tollgate: aborted. '{target}' left unchanged.");
+        return Ok(());
     };
-    let token = claude::validate_setup_token(&raw)?;
+    let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
+    outln!(
+        "tollgate: long-lived token installed for '{target}'. It is assumed to expire in ~{days}d \
+         (`claude setup-token` mints last about a year)."
+    );
+    // A setup token alone gives `/usage` nothing to read: a new profile gets the
+    // fix the member card and the daemon line give, and a reader at the CLI is
+    // told where the probe's switch lives, since no command turns it on.
+    outln!(
+        "tollgate: it takes effect on the next switch:  tollgate {target}{}",
+        if exists {
+            String::new()
+        } else {
+            format!(
+                "\ntollgate: {} (the probe is the Setup tab's `usage probe` row, or \
+                 `usage_probe = true` in the account's config.toml)",
+                crate::fallback::no_usage_fix(&[target.as_str()])
+            )
+        }
+    );
+    Ok(())
+}
 
-    // A brand-new name gets a blank profile first (no credentials — the
-    // sidecar IS its login; a usage OAuth pair can be added later with a
-    // normal `tollgate login`).
-    if !exists {
+/// The setup-token capture's landing: an existing `target`'s account is
+/// claimed as the capture starts, then `confirm` asks (`false` = declined, no
+/// token lands) and `collect` reads the pasted token. The token lands only on
+/// the account claimed at the start; a new name is created after the paste,
+/// refused when another account took it meanwhile. Config is read after the
+/// paste. Returns the stamped expiry.
+fn setup_token_into(
+    target: &ProfileName,
+    exists: bool,
+    model: Option<&str>,
+    confirm: impl FnOnce() -> Result<bool>,
+    collect: impl FnOnce() -> Result<String>,
+) -> Result<Option<i64>> {
+    let claimed = if exists {
+        Some(profile::claim_profile_id(target)?)
+    } else {
+        None
+    };
+    if !confirm()? {
+        return Ok(None);
+    }
+    let token = collect()?;
+    let mut config = load_config()?;
+    if claimed.is_none() {
+        // A brand-new name gets a blank profile first (no credentials — the
+        // sidecar IS its login; a usage OAuth pair can be added later with a
+        // normal `tollgate login`).
         actions::create_blank_profile(
-            config,
+            &mut config,
             target.to_string(),
             None,
             None,
             model.map(str::to_string),
         )?;
-    } else if let Some(model) = model {
-        actions::set_profile_default_model(config, &target, model)?;
     }
-
     // CLA-ROLL: on a rolling-token profile the next rotation overwrites this
     // mint with a rolling value — capture the mint into the sidecar AND the
     // degrade backup atomically (one flock section, same bytes; a two-step
     // write-then-copy can snapshot a concurrent rotation's rolling token as "the
-    // mint").
-    let rolling_on = config.find(&target).is_some_and(|p| p.rolling_token);
+    // mint"). The flag is read off the account as the write lands.
     let now = crate::usage::now_ms() as i64;
-    let expires_at = if rolling_on {
-        claude::write_session_token_with_backup(&target, &token, now)?
-    } else {
-        claude::write_session_token(&target, &token, now)?
-    };
-    let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
-    outln!(
-        "tollgate: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
-         (`claude setup-token` mints last about a year)."
-    );
-    outln!(
-        "tollgate: it takes effect on the next switch:  tollgate {target}{}",
-        if exists {
-            ""
+    let write = || -> Result<i64> {
+        if profile::read_profile(target)?.rolling_token {
+            claude::write_session_token_with_backup(target, &token, now)
         } else {
-            "\ntollgate: for usage polling, also add an OAuth pair later:  tollgate login <name>"
+            claude::write_session_token(target, &token, now)
         }
-    );
-    Ok(())
+    };
+    let expires_at = match &claimed {
+        // The writers take the flock again inside this hold, so the id check
+        // and the write it guards are one section.
+        Some(account) => crate::lock::with_state_lock(|held| {
+            profile::require_profile_id(target, account, held)?;
+            write()
+        })?,
+        // Created just above, with no wait since.
+        None => write()?,
+    };
+    if let (Some(account), Some(model)) = (&claimed, model) {
+        actions::set_profile_default_model(&mut config, target, account, model)?;
+    }
+    Ok(Some(expires_at))
 }
 
 /// `tollgate static-token <name> --clear [--yes]` — the exit from the long-lived
@@ -1653,12 +2154,12 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         if active {
             if claude::has_stored_oauth_login(target) {
                 outln!(
-                    "tollgate: '{target}' is active — clearing relinks the live credentials onto \
+                    "tollgate: '{target}' is active. Clearing relinks the live credentials onto \
                      its stored OAuth login, and running sessions follow."
                 );
             } else {
                 outln!(
-                    "tollgate: '{target}' is active and stores no OAuth login — clearing signs \
+                    "tollgate: '{target}' is active and stores no OAuth login. Clearing signs \
                      Claude Code out, leaving '{target}' on its api key, and running sessions \
                      follow."
                 );
@@ -1679,6 +2180,13 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         }
     }
 
+    // An active target is relinked below; the settle takes no lock of ours.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let mut fresh = load_config()?;
+        let writes = fresh.is_active(target);
+        settle_bare_item_for_cli(&mut fresh, writes, claude::BareItemWriter::Switch)?
+    };
     // Serialized on the rotation guard for the same reason the bare restore is:
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
@@ -1746,7 +2254,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             // does not hold would be this line's own lie.
             outln!(
                 "tollgate: cleared the long-lived token for '{target}' and signed Claude Code \
-                 out: it stores no login at all now — run `tollgate login {target}` before \
+                 out: it stores no login at all now. Run `tollgate login {target}` before \
                  switching to it."
             );
         }
@@ -1763,7 +2271,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     } else {
         outln!(
             "tollgate: cleared the long-lived token for '{target}'. It stores no login at all \
-             now — run `tollgate login {target}` before switching to it."
+             now. Run `tollgate login {target}` before switching to it."
         );
     }
     // The backup goes LAST, after the relink: failing between the sidecar
@@ -1774,7 +2282,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let backup_removed = claude::clear_static_backup(target).with_context(|| {
         format!(
             "the long-lived token for '{target}' is cleared, but the preserved mint at \
-             session-token.static.json remains — remove it by hand, or re-run"
+             session-token.static.json remains. Remove it by hand, or re-run"
         )
     })?;
     for line in clear_postscripts(target, rolling_armed, backup_removed) {
@@ -1804,7 +2312,7 @@ fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) ->
 /// print orphans the fn into a dead-code error under `-D warnings`.
 fn clear_disarm_note(target: &str) -> String {
     format!(
-        "tollgate: '{target}' is on the rolling token — clearing also turns its re-stamping off."
+        "tollgate: '{target}' is on the rolling token. Clearing also turns its re-stamping off."
     )
 }
 
@@ -1814,7 +2322,7 @@ fn clear_disarm_note(target: &str) -> String {
 /// [`scope_widening_disclosure`].
 fn clear_backup_note(target: &str) -> String {
     format!(
-        "tollgate: the preserved mint at session-token.static.json goes with it — \
+        "tollgate: the preserved mint at session-token.static.json goes with it. \
          `tollgate static-token {target}` will have nothing to restore."
     )
 }
@@ -1823,7 +2331,7 @@ fn clear_backup_note(target: &str) -> String {
 /// disarm half of the report, and the only confirmation the flag actually
 /// moved.
 fn clear_disarmed_postscript(target: &str) -> String {
-    format!("tollgate: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.")
+    format!("tollgate: rolling-token is off. Nothing re-stamps a sidecar for '{target}' now.")
 }
 
 /// The post-clear statement that the preserved mint is destroyed. UNCONDITIONAL
@@ -1834,7 +2342,7 @@ fn clear_disarmed_postscript(target: &str) -> String {
 /// refuses for the flag.
 fn clear_backup_postscript(target: &str) -> String {
     format!(
-        "tollgate: the preserved mint at session-token.static.json is gone · \
+        "tollgate: the preserved mint at session-token.static.json is gone. \
          `tollgate static-token {target}` has nothing to restore now."
     )
 }
@@ -1972,6 +2480,19 @@ fn cmd_delete_hermes(canonical: &str, yes: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The both-rosters note `cmd_delete` and `cmd_switch` print when a name
+/// resolves in the claude roster and the codex roster: claude-first is the
+/// pinned precedence, said out loud rather than resolved silently.
+fn codex_collision_note(canonical: &ProfileName, verb: &str) -> String {
+    format!("tollgate: note: '{canonical}' also names a codex profile. This {verb} the CLAUDE one")
+}
+
+/// The same note for a name the Hermes roster also claims: claude-first is
+/// the pinned precedence there too.
+fn hermes_collision_note(canonical: &ProfileName, verb: &str) -> String {
+    format!("tollgate: note: '{canonical}' also names a Hermes profile. This {verb} the CLAUDE one")
+}
+
 /// `tollgate delete <name> [--yes] [--force]` — remove a profile and all its
 /// credentials (the whole on-disk profile dir + state + caches), OAuth or
 /// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
@@ -1992,19 +2513,19 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     // Same collision note as `cmd_switch`, and it matters more here: the verb
     // is destructive, and silence would read as "the only 'foo' is gone".
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!(
-            "tollgate: note — '{canonical}' also names a codex profile; deleting the CLAUDE one"
-        );
+        outln!("{}", codex_collision_note(&canonical, "deletes"));
     }
     if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!(
-            "tollgate: note — '{canonical}' also names a Hermes profile; deleting the CLAUDE one"
-        );
+        outln!("{}", hermes_collision_note(&canonical, "deletes"));
     }
     if !confirm_profile_delete(&canonical, yes)? {
         return Ok(());
     }
     let was_active = config.is_active(&canonical);
+    // Deleting the active profile signs the live slot out.
+    #[cfg(target_os = "macos")]
+    let _placed =
+        settle_bare_item_for_cli(&mut config, was_active, claude::BareItemWriter::SignOut)?;
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
     actions::delete_profile(&mut config, &canonical, force, &rotation)?;
     if was_active {
@@ -2038,6 +2559,22 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// The CLI's `--force` tail on the codex live-session refusal: the typed
+/// refusal plus the escape hatch, as one leaf sentence. The wrapped refusal
+/// itself has no chain (its `Display` is the whole sentence), so this wrapper
+/// carries no `source()` — a chain would print the refusal twice under
+/// `{e:?}` (`Caused by:` repeating the base sentence the tail already holds).
+#[derive(Debug)]
+struct CodexLiveSessionTail(actions::CodexLiveSession);
+
+impl std::fmt::Display for CodexLiveSessionTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, pass --force to remove it anyway", self.0)
+    }
+}
+
+impl std::error::Error for CodexLiveSessionTail {}
+
 /// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
 /// same confirm gate, the same rotation guard, and the codex delete. The
 /// postscript names what a codex profile installs globally — the operator's
@@ -2055,7 +2592,18 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
         return Ok(());
     }
     let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
-    let detached = actions::delete_codex_profile(&canonical, force, &rotation)?;
+    // The shared refusal sentence names no CLI flag; this caller's escape hatch
+    // is `--force`, appended only to the TYPED live-session refusal (never a
+    // second `has_live_session` read, which would tag an unrelated failure with
+    // a flag that cannot fix it).
+    let detached = actions::delete_codex_profile(&canonical, force, &rotation).map_err(|e| {
+        match e.downcast::<actions::CodexLiveSession>() {
+            // Raised only when `force` is false (`delete_codex_profile`'s
+            // guard), so an `Ok` here is always the tail-bearing refusal.
+            Ok(session) => anyhow::Error::new(CodexLiveSessionTail(session)),
+            Err(e) => e,
+        }
+    })?;
     outln!("tollgate: removed codex profile '{canonical}'.");
     if let Some(slot) = detached {
         outln!(
@@ -2153,6 +2701,11 @@ fn cmd_switch(name: &str) -> Result<()> {
             outln!("tollgate: switched codex to '{canonical}'");
             if let Some(slot) = repointed {
                 outln!("tollgate: {} now follows '{canonical}'", slot.display());
+                // Only a moved link can leave codex's daemon behind: an
+                // operator's own login file is not ours to call stale.
+                if let Some(note) = slot.parent().and_then(crate::codex_daemon::switch_note) {
+                    outln!("{note}");
+                }
             }
             return Ok(());
         }
@@ -2162,18 +2715,12 @@ fn cmd_switch(name: &str) -> Result<()> {
         return Err(unknown_profile_error(&config, name));
     };
     let canonical = ProfileName::from(canonical);
-    // One namespace is enforced at creation, not against hand-edited state:
-    // when both files claim the name, claude-first is the pinned precedence —
-    // said out loud rather than resolved silently.
+    // One namespace is enforced at creation, not against hand-edited state.
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!(
-            "tollgate: note — '{canonical}' also names a codex profile; switching the CLAUDE one"
-        );
+        outln!("{}", codex_collision_note(&canonical, "switches"));
     }
     if hermes::profiles::HermesState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!(
-            "tollgate: note — '{canonical}' also names a Hermes profile; switching the CLAUDE one"
-        );
+        outln!("{}", hermes_collision_note(&canonical, "switches"));
     }
     refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
@@ -2235,7 +2782,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             anyhow::bail!("{sentence}");
         }
         anyhow::bail!(
-            "'{canonical}' usage chain is dead · run `tollgate login {canonical}` first, \
+            "'{canonical}' usage chain is dead. Run `tollgate login {canonical}` first, \
              then re-run"
         );
     }
@@ -2250,7 +2797,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     if !plan_capable {
         outln!(
             "tollgate: warning: the usage chain for '{canonical}' is missing the user:profile \
-             scope or a subscriptionType stamp · rolling tokens may not unlock plan-gated \
+             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
              models. A fresh `tollgate login {canonical}` browser sign-in fixes that."
         );
     }
@@ -2264,6 +2811,24 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     }
     let is_active = config.is_active(&canonical);
     let was_rolling = profile.rolling_token;
+    // Above the arm, whose gate refreshes the chain an unsaved bare-item
+    // login may have succeeded, and before the flag below is set, so a
+    // refused settle leaves nothing to roll back.
+    #[cfg(target_os = "macos")]
+    let mut config = config;
+    #[cfg(target_os = "macos")]
+    let _placed = if is_active {
+        let writer = claude::BareItemWriter::Switch;
+        let settle =
+            claude::settle_bare_keychain_item(writer).map_err(actions::report_failed_cli_settle)?;
+        Some(actions::bare_item_placement_for_cli(
+            &mut config,
+            writer,
+            settle,
+        )?)
+    } else {
+        None
+    };
     let handle: profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
@@ -2327,7 +2892,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
 fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
     format!(
         "tollgate: warning: could not roll the rolling-token flag back for \
-         '{canonical}' ({save_err:#}) · once ~/.tollgate is writable, run \
+         '{canonical}' ({save_err:#}). Once ~/.tollgate is writable, run \
          `tollgate static-token {canonical}` to clear it"
     )
 }
@@ -2343,11 +2908,11 @@ fn restamp_promise(health: crate::daemon::DaemonHealth) -> &'static str {
         // Best-effort probe: an error reads Absent by design, so the
         // claim is hedged rather than absolute.
         crate::daemon::DaemonHealth::Absent => {
-            "No daemon appears to be running · nothing re-stamps it until \
+            "No daemon appears to be running. Nothing re-stamps it until \
              `tollgate daemon` starts."
         }
         crate::daemon::DaemonHealth::Stale => {
-            "A daemon is present but its feed looks stale · check \
+            "A daemon is present but its feed looks stale. Check \
              `tollgate daemon --status` or re-stamps may not land."
         }
         crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
@@ -2390,7 +2955,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
         // function's contract forbids.
         anyhow::bail!(
             "arming reported success but '{canonical}' has no readable sidecar to verify, \
-             so nothing was confirmed · check permissions on ~/.tollgate and re-run"
+             so nothing was confirmed. Check permissions on ~/.tollgate and re-run"
         );
     };
     match kind {
@@ -2408,7 +2973,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
         claude::SidecarKind::Mint => {
             outln!(
                 "tollgate: '{canonical}' usage chain could not be read just now, so sessions \
-                 stay on the static mint. The flag is set · the daemon re-stamps on its next \
+                 stay on the static mint. The flag is set. The daemon re-stamps on its next \
                  rotation."
             );
         }
@@ -2417,7 +2982,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
             // writer raced a fresh rotating pair back into the sidecar.
             anyhow::bail!(
                 "'{canonical}' sidecar was re-filled with a rotating pair while arming, so \
-                 the split is disengaged and nothing was armed · re-run, and if it repeats \
+                 the split is disengaged and nothing was armed. Re-run, and if it repeats \
                  find what is writing session-token.json"
             );
         }
@@ -2455,8 +3020,18 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
 /// gated on the profile being enabled — walking a disabled profile back to a
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
-    let config = load_config()?;
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(unused_mut, reason = "the macOS settle saves into it")
+    )]
+    let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name, "static-token")?;
+    // An active profile is relinked below; the settle takes no lock of ours.
+    #[cfg(target_os = "macos")]
+    let _placed = {
+        let writes = config.is_active(&canonical);
+        settle_bare_item_for_cli(&mut config, writes, claude::BareItemWriter::Switch)?
+    };
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag
@@ -2499,7 +3074,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
     let restored = claude::restore_static_mint(&canonical).with_context(|| {
         format!(
             "'{canonical}' is off the rolling token now, but its preserved mint could not \
-             be restored · fix the file problem, then re-run `tollgate static-token {canonical}`"
+             be restored. Fix the file problem, then re-run `tollgate static-token {canonical}`"
         )
     })?;
     if restored {
@@ -2546,7 +3121,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
                 )
             }
             outln!(
-                "tollgate: '{canonical}' is already on its static long-lived mint · the \
+                "tollgate: '{canonical}' is already on its static long-lived mint. The \
                  rolling token is off. Nothing to restore."
             );
             Ok(())
@@ -2555,7 +3130,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
             anyhow::bail!(
                 "'{canonical}' is off the rolling token now, but there was no live static \
                  mint to restore.{backup_note} The last rolling bearer serves until it \
-                 expires, and this command is what stopped its re-stamping · capture a \
+                 expires, and this command is what stopped its re-stamping. Capture a \
                  fresh long-lived login with `tollgate login {canonical} --setup-token`."
             )
         }
@@ -2568,8 +3143,8 @@ fn cmd_static_token(name: &str) -> Result<()> {
         }
         None => {
             anyhow::bail!(
-                "'{canonical}' has no session-token sidecar and no live preserved mint · \
-                 sessions run on the rotating pair.{backup_note} Capture a long-lived login \
+                "'{canonical}' has no session-token sidecar and no live preserved mint. \
+                 Sessions run on the rotating pair.{backup_note} Capture a long-lived login \
                  with `tollgate login {canonical} --setup-token`."
             )
         }
@@ -2629,20 +3204,16 @@ fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str, what: &str) -> Re
 /// a credential that is whitespace-only is not a credential.
 fn api_key_for_profile(name: &str) -> Result<Option<String>> {
     let name = ProfileName::from(name);
-    // `load_profile` is permissive — a missing `config.toml` reads as the
-    // default profile, so a helper pointing at a typo'd or deleted name would
-    // otherwise return `Ok(None)` indistinguishable from a real no-key
-    // profile. The dir-existence check fails closed with a clearer message
-    // instead; both cases still surface as exit 1 via `cmd_api_key`.
+    // `profile::read_api_key` reads a missing `config.toml` as `Ok(None)`, so
+    // a helper pointing at a typo'd or deleted name would otherwise be
+    // indistinguishable from a real no-key profile. The dir-existence check
+    // fails closed with a clearer message instead; both cases still surface
+    // as exit 1 via `cmd_api_key`.
     if !profile::profile_dir(&name)?.exists() {
         anyhow::bail!("profile '{name}' not found");
     }
-    let profile = profile::load_profile(&name)?;
-    let key = profile
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let stored = profile::read_api_key(&name)?;
+    let key = stored.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // Fail closed on a hand-edited config that poisoned the key with control
     // chars: emitting it verbatim would inject a header, so refuse to print.
     if let Some(k) = key {
@@ -2776,6 +3347,7 @@ fn oauth_token_for_profile(
             &canonical,
             refresher,
             OAUTH_TOKEN_HORIZON_MS,
+            None,
         ) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => {
@@ -2786,6 +3358,10 @@ fn oauth_token_for_profile(
                     "{}",
                     format::refresh_transient_oauth_token(&canonical, &e).line()
                 )
+            }
+            // Unreachable: this caller passes `None` as the spend marker.
+            oauth::AuthGate::Stopping => {
+                anyhow::bail!("{}", format::DAEMON_STOPPING)
             }
         }
         claude::install_source_path(&canonical)?

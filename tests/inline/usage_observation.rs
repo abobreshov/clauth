@@ -154,7 +154,14 @@ fn sanitize_message_redacts_credentials_and_bounds_length() {
     let long = "word ".repeat(100);
     let cut = sanitize_message(&long);
     assert_eq!(cut.chars().count(), 160);
-    assert!(cut.ends_with('…'));
+    // JSON output included, cut text ends in ASCII `...` (upstream 8dd3c65b).
+    assert!(cut.ends_with("..."), "{cut}");
+    assert!(cut.is_ascii(), "never a `…`: {cut}");
+    assert_eq!(
+        &cut[..157],
+        &long[..157],
+        "the kept text is the message's own head"
+    );
     assert!(
         Failure::new(FailureKind::AuthRequired, "Bearer x")
             .message

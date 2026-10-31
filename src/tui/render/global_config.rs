@@ -17,7 +17,7 @@
 //! global.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
 use crate::format::format_threshold_tokens;
@@ -34,9 +34,11 @@ use super::super::app::{
     parse_weekly_pct,
 };
 use super::super::theme::{self, Tier};
+use super::format::truncate;
 use super::panes::{
-    cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
+    MIN_VALUE_W, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, place_caret, section_box,
+    toggle_value, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -47,7 +49,7 @@ const KEY_W: usize = 17;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let block = section_box("settings", true, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -87,9 +89,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
-    let editing = app.refresh_interval_draft.as_ref();
-    let weekly_editing = app.weekly_threshold_draft.as_ref();
-    let context_nudge_editing = app.context_nudge_draft.as_ref();
+    let editing = app.refresh_interval_draft.as_ref().map(|d| &d.input);
+    let weekly_editing = app.weekly_threshold_draft.as_ref().map(|d| &d.input);
+    let context_nudge_editing = app.context_nudge_draft.as_ref().map(|d| &d.input);
 
     let focused_band = GLOBAL_CONFIG_ROWS[cursor].band();
 
@@ -151,14 +153,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let tip_len = tip_lines.len();
         match row_editing {
             Some(input) => {
-                // The native terminal cursor owns the caret; the row renders plain
-                // (no highlight) with the edit gutter + sunken field, like the chain
-                // threshold editor. x = "✎ " (2) + key block + pre-caret cols.
-                let cx = inner
-                    .x
-                    .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
+                // The native terminal cursor owns the caret; the row keeps the
+                // selected row's tint. x = the row's gutter and key cell as
+                // rendered ([`edit_lead`] narrows the key on a narrow pane) +
+                // the caret's cell in the value window.
+                let lead: usize = row_lines
+                    .first()
+                    .map_or(0, |line| line.spans.iter().take(2).map(Span::width).sum());
+                let cx = inner.x.saturating_add((lead + head_cols(input)) as u16);
                 caret = Some((cx, lines.len()));
-                lines.extend(row_lines);
+                for line in row_lines {
+                    lines.push(if selected {
+                        highlight_row(line, inner.width as usize)
+                    } else {
+                        line
+                    });
+                }
                 lines.extend(tip_lines);
             }
             None => {
@@ -198,16 +208,23 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(cx, inner.y.saturating_add(visible as u16)),
+        );
     }
 }
 
-/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at all
-/// times (a fixed label treatment, not a focus cue), gaining an underline while
-/// the cursor sits on one of its rows — the contract's section-header form.
+/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at
+/// rest, `TEXT + bold` while the cursor sits on one of its rows — the
+/// contract's section-header form.
 fn band_header(label: &str, focused: bool) -> Line<'static> {
-    let style = theme::label();
-    let style = if focused { style.underlined() } else { style };
+    let style = if focused {
+        theme::label_active()
+    } else {
+        theme::label()
+    };
     Line::from(Span::styled(label.to_uppercase(), style))
 }
 
@@ -439,15 +456,15 @@ fn detail_row(
             cycle_row(arrow, "home tab", &options, selected, width)
         }
         GlobalConfigRow::RefreshInterval => match editing {
-            Some(input) => vec![refresh_edit_line(arrow, input)],
+            Some(input) => vec![refresh_edit_line(arrow, input, width)],
             None => refresh_cycle_lines(arrow, refresh_interval_ms, selected, width),
         },
         GlobalConfigRow::ContextNudge => match editing {
-            Some(input) => vec![context_nudge_edit_line(arrow, input)],
+            Some(input) => vec![context_nudge_edit_line(arrow, input, width)],
             None => context_nudge_cycle_lines(arrow, context_nudge_tokens, selected, width),
         },
         GlobalConfigRow::WeeklyThreshold => match editing {
-            Some(input) => vec![weekly_edit_line(arrow, input)],
+            Some(input) => vec![weekly_edit_line(arrow, input, width)],
             None => weekly_cycle_lines(arrow, weekly_pct, selected, width),
         },
         GlobalConfigRow::DivergenceDefault => cycle_row(
@@ -626,13 +643,10 @@ fn refresh_cycle_lines(
 /// The `refresh` row mid-edit: edit gutter + `refresh` key block + the typed
 /// buffer (DANGER when out of range) + ` s` unit. The terminal cursor owns the
 /// caret, so the buffer renders with uniform styling — no simulated block cursor.
-fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn refresh_edit_line(arrow: Span<'static>, input: &InputState, width: usize) -> Line<'static> {
     let invalid = parse_refresh_secs(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(key_cell("refresh", KEY_W, KEY_GUTTER), label_style(true)),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "refresh", width, " s");
+    spans.extend(value_caret(input, invalid, room));
     let unit_style = if invalid {
         theme::danger()
     } else {
@@ -705,16 +719,14 @@ fn context_nudge_cycle_lines(
 /// a trailing `k` lives inside the buffer — so no unit span rides the field.
 /// The terminal cursor owns the caret, so the buffer renders with uniform
 /// styling — no simulated block cursor.
-fn context_nudge_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn context_nudge_edit_line(
+    arrow: Span<'static>,
+    input: &InputState,
+    width: usize,
+) -> Line<'static> {
     let invalid = parse_context_nudge_tokens(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell("context nudge", KEY_W, KEY_GUTTER),
-            label_style(true),
-        ),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "context nudge", width, "");
+    spans.extend(value_caret(input, invalid, room));
     Line::from(spans)
 }
 
@@ -767,16 +779,10 @@ fn weekly_cycle_lines(
 
 /// The `weekly limit` row mid-edit: edit gutter + key block + typed buffer
 /// (DANGER when out of range) + ` %` unit. Mirrors `refresh_edit_line`.
-fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn weekly_edit_line(arrow: Span<'static>, input: &InputState, width: usize) -> Line<'static> {
     let invalid = parse_weekly_pct(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell("weekly limit", KEY_W, KEY_GUTTER),
-            label_style(true),
-        ),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "weekly limit", width, " %");
+    spans.extend(value_caret(input, invalid, room));
     let unit_style = if invalid {
         theme::danger()
     } else {
@@ -784,6 +790,28 @@ fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     };
     spans.push(Span::styled(" %", unit_style));
     Line::from(spans)
+}
+
+/// A mid-edit row's edit gutter and key cell, and the cells left for its typed
+/// buffer before the trailing `unit`. On a narrow pane the key column narrows
+/// and the label truncates (`…`, the Setup `field_key_cell` clamp's shape), so
+/// the buffer keeps [`MIN_VALUE_W`] cells and the caret stays inside.
+fn edit_lead(
+    arrow: Span<'static>,
+    key: &str,
+    width: usize,
+    unit: &str,
+) -> (Vec<Span<'static>>, usize) {
+    let key_w = KEY_W.min(width.saturating_sub(2 + KEY_GUTTER + MIN_VALUE_W + unit.len()));
+    let room = width.saturating_sub(2 + key_w + KEY_GUTTER + unit.len());
+    let lead = vec![
+        arrow,
+        Span::styled(
+            key_cell(&truncate(key, key_w), key_w, KEY_GUTTER),
+            label_style(true),
+        ),
+    ];
+    (lead, room)
 }
 
 /// Sub-line under the weekly field while typing: the valid range, in DANGER
@@ -965,18 +993,15 @@ fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
 
 /// A toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
 /// toggle, not a 2-option cycle — `on`/`off` labels in brackets read as a cycle,
-/// not a switch. Knob `ACCENT` when on, `TEXT_FAINT` off.
+/// not a switch. The value is [`toggle_value`], which splits the glyph's parts
+/// per the contract.
 fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> Line<'static> {
-    let (glyph, style) = if on {
-        (theme::toggle_on(), theme::accent())
-    } else {
-        (theme::toggle_off(), theme::faint())
-    };
-    Line::from(vec![
+    let mut spans = vec![
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(row_selected)),
-        Span::styled(glyph, style),
-    ])
+    ];
+    spans.extend(toggle_value(on, false));
+    Line::from(spans)
 }
 
 #[cfg(test)]

@@ -22,13 +22,22 @@ fn cached_plan(name: &ProfileName) -> Option<PlanInfo> {
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
 }
 
-/// Cancellation for a surface holding a `load_config` profile. Deliberately NOT
-/// [`crate::fallback::is_canceled`], which reads the in-memory `Profile::usage`
-/// that only the TUI ever fills — outside it that predicate answers `false` for
-/// every account, canceled or not. This reads the disk instead, so a CLI
-/// surface gets the same answer the TUI does.
+/// Cancellation for a surface holding a `load_config` profile but no store or
+/// snapshot: reads the on-disk plan, the one the OAuth store is seeded from.
 pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())
+}
+
+/// An organization's refusal, read off the same on-disk plan as
+/// [`is_canceled_cached`], so a surface names which of the two it is.
+pub(crate) fn is_org_refused_cached(name: &ProfileName) -> bool {
+    cached_plan(name).is_some_and(|p| p.is_org_refused())
+}
+
+/// [`crate::fallback::refuses_service_from_info`] off the on-disk plan: the
+/// account cannot serve, canceled or refused by its organization.
+pub(crate) fn refuses_service_cached(name: &ProfileName) -> bool {
+    is_canceled_cached(name) || is_org_refused_cached(name)
 }
 
 /// Display provider for a profile, one of three cases: a recognised
@@ -398,8 +407,30 @@ pub(crate) fn usage_bar_is_live(b: &crate::providers::UsageBar) -> bool {
         .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
 }
 
-/// The [`Window`] rows of a usage read — 5h, 7d, then one entry per weekly
-/// model window (`7d <model>`). Serves both cache shapes: an OAuth read
+/// The figure bar a reader acts on for `label`: the FIRST bar under the label
+/// that is live, and for the `30d` monthly quota also provider-marked — the
+/// same "first live bar under the label" base `c6be6ecb` applied to `5h`/`7d`,
+/// with the mark as the extra admission for `30d`. Liveness applies AT THE BAR,
+/// never after the presence choice, so a duplicate label — the generic scanner
+/// emits one bar per element under a window-literal key — resolves to its live
+/// bar, never the first (possibly lapsed) one. Which label the long column
+/// means stays with [`crate::usage::UsageInfo::long_window`]; this is only the
+/// figure lookup, shared by the list and the MCP roster rank so one label never
+/// picks two different bars.
+pub(crate) fn live_bar<'a>(
+    stats: &'a crate::providers::ThirdPartyStats,
+    label: &str,
+) -> Option<&'a crate::providers::UsageBar> {
+    stats.bars.iter().find(|b| {
+        b.label == label
+            && (label != crate::usage::LABEL_30D || b.inference_quota)
+            && usage_bar_is_live(b)
+    })
+}
+
+/// The [`Window`] rows of a usage read — 5h, 7d, the provider-marked monthly
+/// inference quota (`30d`) when present, then one entry per weekly model
+/// window (`7d <model>`). Serves both cache shapes: an OAuth read
 /// directly, and a third-party read through the derivation
 /// [`published_windows`] maps it with. A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last
@@ -424,14 +455,18 @@ pub(crate) fn usage_windows(usage: &UsageInfo) -> Vec<Window> {
 /// strings `tollgate list`'s 5h/7d columns render: the provider's own usage bars
 /// under those exact labels first (a LIVE bar's figures; a lapsed one is the
 /// previous window's last reading and drops, the same call [`usage_windows`]
-/// makes), falling back to the first FUNDED wallet's balance — the same
-/// fall-through the MCP roster's rank uses, so a bar the roster ranks the
-/// account on cannot render as dashes here and vice versa. A live bar under a
-/// NON-canonical label (the generic scanner's provider-authored labels) is no
-/// match: it neither fills a column nor suppresses the wallet fallback. The
-/// OAuth figure gate stays OAuth-only (owner ruling 2026-09-09): a `Window`
-/// newtype would let a wallet masquerade as a window, so the plain pair keeps
-/// the two figure families from meeting.
+/// makes). The long column is the account's LONG window — its 7d bar when it
+/// has one, else its provider-marked monthly inference quota, whose cell is
+/// prefixed `30d ` because the header stays `7D USED`. Failing both, it falls
+/// back to the first FUNDED wallet's balance — the same long-window-then-wallet
+/// fall-through the MCP roster's rank uses (its 5h-first rung is this table's
+/// own 5H column), so a long window the roster ranks the account on renders
+/// here and vice versa. A live bar under a NON-canonical label (the
+/// generic scanner's provider-authored labels) is no match: it neither fills a
+/// column nor suppresses the wallet fallback. The OAuth figure gate stays
+/// OAuth-only (owner ruling 2026-09-09): a `Window` newtype would let a wallet
+/// masquerade as a window, so the plain pair keeps the two figure families from
+/// meeting.
 ///
 /// `(None, None)` when the account has neither — the columns stay dashes, the
 /// missing-data call every other surface makes.
@@ -439,33 +474,50 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
     let Some(stats) = load_profile_cache::<ThirdPartyStats>(&p.name, THIRD_PARTY_CACHE_FILE) else {
         return (None, None);
     };
-    let bar = |label: &str| {
-        stats
-            .bars
-            .iter()
-            .find(|b| b.label == label && usage_bar_is_live(b))
-            .map(|b| match (b.used, b.total) {
-                // The account's own reported amounts outrank the derived
-                // percentage the same bar carries.
-                (Some(used), Some(total)) => format!(
-                    "{} / {}",
-                    crate::format::format_amount(used),
-                    crate::format::format_amount(total)
-                ),
-                _ => crate::format::format_pct(b.pct),
-            })
+    let figure = |b: &crate::providers::UsageBar| match (b.used, b.total) {
+        // The account's own reported amounts outrank the derived percentage the
+        // same bar carries.
+        (Some(used), Some(total)) => format!(
+            "{} / {}",
+            crate::format::format_amount(used),
+            crate::format::format_amount(total)
+        ),
+        _ => crate::format::format_pct(b.pct),
     };
-    match (bar(crate::usage::LABEL_5H), bar(crate::usage::LABEL_7D)) {
-        (None, None) => {
-            // No label-matched live bar: the wallet row is the headroom a
-            // scalar provider (or a non-canonically-labeled one) publishes.
-            let wallet = crate::providers::funded_wallets(&stats.rows)
-                .into_iter()
-                .next()
-                .map(|w| w.value);
-            (wallet, None)
-        }
-        columns => columns,
+    let five = live_bar(&stats, crate::usage::LABEL_5H).map(figure);
+    // The long column: the account's LONG window, read through the same
+    // accessor the chain, overview and MCP roster rank use, so none picks by a
+    // different rule — the 7d bar when present, else the marked monthly bar
+    // (whose cell is prefixed `30d ` because the header cannot say it).
+    // Presence names the label; the figure then comes from the first LIVE bar
+    // under that label (the shared `live_bar`), so a lapsed 7d bar means the 7d
+    // presence wins and the column dashes — the same wall-clock call the chain
+    // makes — while a duplicate label resolves to its live bar, never the
+    // first lapsed one. The mark, never the label alone, is what admits the
+    // monthly bar.
+    let long = stats
+        .windows_info()
+        .as_ref()
+        .and_then(|u| u.long_window())
+        .map(|(label, _)| label)
+        .and_then(|label| live_bar(&stats, label))
+        .map(|b| {
+            if b.label == crate::usage::LABEL_30D {
+                format!("{} {}", crate::usage::LABEL_30D, figure(b))
+            } else {
+                figure(b)
+            }
+        });
+    if five.is_none() && long.is_none() {
+        // No label-matched live bar: the wallet row is the headroom a scalar
+        // provider (or a non-canonically-labeled one) publishes.
+        let wallet = crate::providers::funded_wallets(&stats.rows)
+            .into_iter()
+            .next()
+            .map(|w| w.value);
+        (wallet, None)
+    } else {
+        (five, long)
     }
 }
 
@@ -484,18 +536,33 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
 /// is what makes publishing the third-party figures safe rather than a second
 /// way to render that same leftover.
 pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
+    published_windows_with_label(name).0
+}
+
+/// The profile's published `windows` rows AND the label of its LONG window,
+/// read in ONE cache load so the daemon's per-tick status build and its push
+/// sender derive both from the same read (never two reads a fetch landing
+/// between them could pair as one cache's label with the other's rows). The
+/// label is `7d` when the account has a 7d window, else `30d` for a
+/// provider-marked monthly quota — decided by PRESENCE off the account's own
+/// cache (the accessor's rule), never by which row survived the published
+/// liveness filter. Codex accounts have no monthly window and read their 7d
+/// separately.
+pub(crate) fn published_windows_with_label(
+    name: &ProfileName,
+) -> (Vec<Window>, Option<&'static str>) {
     if crate::profile::stored_usage_cache_is_third_party(name) {
-        return load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+        let info = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
             .as_ref()
-            .and_then(ThirdPartyStats::to_usage_info)
-            .as_ref()
-            .map(usage_windows)
-            .unwrap_or_default();
+            .and_then(ThirdPartyStats::to_usage_info);
+        let windows = info.as_ref().map(usage_windows).unwrap_or_default();
+        let label = info.as_ref().and_then(|u| u.long_window()).map(|(l, _)| l);
+        return (windows, label);
     }
-    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-        .as_ref()
-        .map(usage_windows)
-        .unwrap_or_default()
+    let info = load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE);
+    let windows = info.as_ref().map(usage_windows).unwrap_or_default();
+    let label = info.as_ref().and_then(|u| u.long_window()).map(|(l, _)| l);
+    (windows, label)
 }
 
 #[cfg(test)]

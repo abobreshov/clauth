@@ -719,7 +719,8 @@ fn which_and_sessions_take_only_json() {
         command(&["sessions", "--json"]),
         Command::Sessions {
             json: true,
-            tokens: false
+            tokens: false,
+            live: false
         }
     ));
     // The costly annotation is opt-in and independent of the output format.
@@ -727,7 +728,8 @@ fn which_and_sessions_take_only_json() {
         command(&["sessions", "--tokens"]),
         Command::Sessions {
             json: false,
-            tokens: true
+            tokens: true,
+            live: false
         }
     ));
     assert_eq!(parse_exit_code(&["which", "extra"]), 2);
@@ -1193,6 +1195,34 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
+/// Every machine channel keeps the torn-store notice off, arm by arm, and a
+/// user-facing command arms it. The exclusions match `torn_store_notice_applies`
+/// one-for-one, so dropping one arm reds here. `torn_store_notice_applies` is a
+/// deny-list: a machine-channel command added later arms by default, so this
+/// list must grow with it.
+#[test]
+fn machine_channels_never_arm_the_torn_store_notice() {
+    for argv in [
+        &["daemon"][..],
+        &["mcp"],
+        &["mcp-await-job"],
+        &["hook-profile-changed-note"],
+        &["hook-read-exempt"],
+        &["self-heal"],
+        &["__complete"],
+        &[crate::identity::API_KEY_HELPER_SUBCMD, "p"],
+        &["__oauth-token", "p"],
+        &["run", "x"],
+        &["herdr", "config", "get", "pane_tag"],
+    ] {
+        assert!(
+            !crate::torn_store_notice_applies(&command(argv)),
+            "{argv:?} is a machine channel"
+        );
+    }
+    assert!(crate::torn_store_notice_applies(&command(&["list"])));
+}
+
 #[test]
 fn status_requires_json_and_treats_disabled_as_an_alias_for_all() {
     let Command::Status {
@@ -1307,7 +1337,8 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::Complete {
             codex: false,
             hermes: false,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
@@ -1315,7 +1346,8 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::Complete {
             codex: false,
             hermes: true,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
@@ -1323,7 +1355,8 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::Complete {
             codex: true,
             hermes: false,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
@@ -1331,7 +1364,17 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::Complete {
             codex: false,
             hermes: false,
-            live_sessions: true
+            live_sessions: true,
+            resumable: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--resumable"]),
+        Command::Complete {
+            codex: false,
+            hermes: false,
+            live_sessions: false,
+            resumable: true
         }
     ));
     assert!(matches!(command(&["mcp-await-job"]), Command::McpAwaitJob));
@@ -1340,6 +1383,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::HookProfileChangedNote
     ));
     assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
+    assert!(matches!(
+        command(&[crate::cc_exempt::READ_HOOK_SUBCOMMAND]),
+        Command::HookReadExempt
+    ));
     match command(&["__tollgate-api-key", "acme"]) {
         Command::ApiKey { profile, .. } => assert_eq!(profile.as_deref(), Some("acme")),
         other => panic!("__tollgate-api-key must parse, got {other:?}"),
@@ -1359,6 +1406,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
+        crate::cc_exempt::READ_HOOK_SUBCOMMAND,
     ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),
@@ -1369,6 +1417,25 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         !help.contains("\n  run "),
         "the `run` redirect must stay out of the command table"
     );
+}
+
+/// `__complete` prints one list per call: two mode flags at once are a usage
+/// error, never a silent pick of one of the lists.
+#[test]
+fn the_complete_mode_flags_refuse_each_other() {
+    for pair in [
+        ["--codex", "--live-sessions"],
+        ["--codex", "--resumable"],
+        ["--live-sessions", "--resumable"],
+    ] {
+        let args = ["__complete", pair[0], pair[1]];
+        let err = parse(&args).expect_err("two `__complete` modes must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{args:?}"
+        );
+    }
 }
 
 /// The bundled plugin manifest spells tollgate subcommands as strings, and a
@@ -1526,10 +1593,41 @@ fn the_isolated_help_says_the_session_outlives_the_runtime() {
     }
 }
 
+/// `--auto`'s help names the walk, not a fixed first: under a ranked
+/// `walk_order` the pick is not the chain's first member, so the copy must say
+/// "taken in your `walk_order`" and spell the two ranked modes. Matched over
+/// whitespace-normalized output, because clap rewraps the paragraph to the
+/// terminal it renders for — and without the final period, which clap strips
+/// off an arg's last sentence. The first needle doubles as the negative pin:
+/// "the first fallback-chain member" fails it, so a revert to the chain-order
+/// wording reds.
+#[test]
+fn the_auto_help_names_the_configured_walk_order() {
+    let mut start = Cli::command();
+    let help = start
+        .find_subcommand_mut("start")
+        .expect("start subcommand")
+        .render_long_help()
+        .to_string();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in [
+        "the fallback-chain member with headroom",
+        "taken in your `walk_order`",
+        "chain position by default, else the soonest weekly reset or the most weekly headroom",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "--auto's help must describe the pick by the configured walk order \
+             ({phrase:?}): {flat}"
+        );
+    }
+}
+
 /// A multi-word unrecognized invocation is a usage error (exit 2), not the old
 /// help-plus-exit-0 that a calling script could not tell from success.
 #[test]
 fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
+    let _home = crate::testutil::HomeSandbox::new();
     let Command::External(words) = command(&["strat", "acme"]) else {
         panic!("an unknown multi-word invocation lands on the external arm");
     };
@@ -1607,6 +1705,27 @@ fn completions_rejects_a_second_value_after_a_shell_name() {
     );
 }
 
+// ── cmd_delete / cmd_switch name the claude half of a both-rosters name ─────
+
+/// The both-rosters collision note, pinned by equality so the `. This` joint
+/// cannot drift back to a semicolon: `delete` and `switch` each name their own
+/// verb, and both name the claude half.
+#[test]
+fn the_delete_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "deletes"),
+        "tollgate: note: 'work' also names a codex profile. This deletes the CLAUDE one"
+    );
+}
+
+#[test]
+fn the_switch_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "switches"),
+        "tollgate: note: 'work' also names a codex profile. This switches the CLAUDE one"
+    );
+}
+
 // ── cmd_switch / cmd_start refuse a disabled target ─────────────────────────
 
 mod disabled_target_refusal {
@@ -1618,8 +1737,7 @@ mod disabled_target_refusal {
             state: crate::profile::AppState::default(),
             profiles: Vec::new(),
         };
-        crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
-            .expect("create profile");
+        seed_blank_profile(&mut config, name);
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
             .expect("disable profile");
     }
@@ -1801,7 +1919,7 @@ fn collect_api_endpoint_rejects_control_chars_in_key() {
 
 // ── api-mode reauth arm: pure routing pins ──────────────────────────────────
 // The arm's two decisions are extracted pure (`resolve_reauth_base_url`,
-// `api_reauth_snapshot`) so the routing is pinned without touching stdin: a
+// `collect_api_reauth_snapshot`) so the routing is pinned without touching stdin: a
 // test whose outcome depended on the runner's terminal red under a pty
 // (the confirm prompt eats libtest's capture and declines) and hung on a
 // developer terminal.
@@ -1877,89 +1995,97 @@ fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
     );
 }
 
+/// An api re-key keeps the stored OAuth chain, so its anchor action is
+/// `Unchanged` — never a read-back of the anchor, and never `Unproven`, either
+/// of which could clear a correct anchor. The anchor is simply not spelled,
+/// and the chain is the landing's to keep, so the snapshot carries none.
 #[test]
-fn api_reauth_snapshot_carries_the_stored_chain_through() {
-    // The snapshot now reads the stored chain's anchor off the home-derived
-    // profile dir, so the whole test holds a sandbox fence.
+fn an_api_reauth_snapshot_leaves_the_anchor_and_the_chain_to_the_landing() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
+    let snap = collect_api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-new"),
         Some(&acme),
-    );
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("the stored chain rides the snapshot");
-    assert_eq!(carried.access_token(), Some("stored-access"));
-    assert_eq!(carried.refresh_token(), Some("stored-refresh"));
-    assert_eq!(
-        carried.access_token(),
-        acme.access_token(),
-        "the carried chain is the stored profile's own, not a restated constant"
-    );
-    assert_eq!(
-        snap.base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic")
-    );
-    assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
-    assert_eq!(snap.anchor, crate::actions::AnchorAction::Unchanged);
-}
-
-/// An api re-key carries the stored (stored, unchanged) OAuth chain, so its
-/// anchor action is `Unchanged` — never a read-back of the anchor, and never
-/// `Unproven`, either of which could clear a correct anchor. The anchor is
-/// simply not spelled.
-#[test]
-fn api_reauth_snapshot_leaves_the_anchor_untouched() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["acme"]);
-    let acme = acme_with_chain();
-    crate::usage::seed_login_anchor(
-        &crate::profile::ProfileName::from("acme"),
-        Some(&crate::profile::AccountId::from("uuid-stored".to_string())),
-    );
-
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
-        Some(&acme),
-    );
-
+        false,
+    )
+    .expect("a headless re-key with both flags never prompts");
     assert_eq!(
         snap.anchor,
         crate::actions::AnchorAction::Unchanged,
         "an api re-key leaves the stored chain's anchor untouched"
     );
+    assert!(snap.credentials.is_none());
 }
 
+/// The confirm an api re-key asks refuses an unreadable store before any
+/// `[y/N]`: consent is never asked for a write the landing refuses anyway.
 #[test]
-fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
-    let bare = crate::profile::Profile::new(
-        "acme".to_string(),
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-old".to_string()),
+fn the_api_rekey_confirm_refuses_an_unreadable_store_before_asking() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    std::fs::write(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+    let claimed = crate::profile::load_profile(&name).expect("a torn store loads");
+
+    let err = confirm_claimed_reauth(&name, &claimed, true)
+        .expect_err("an api re-key over an unreadable chain refuses before asking");
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `tollgate login p1` first, or the re-key would drop it"
     );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            Some(&bare)
-        )
-        .credentials
-        .is_none(),
-        "a profile with no chain contributes none"
+}
+
+/// An api re-key keeps the stored chain. When that chain cannot be read the
+/// landing cannot keep it, so the re-key refuses before anything is written,
+/// naming the account, the file and the way out, and the unreadable store
+/// stays on disk.
+#[test]
+fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    crate::testutil::register_names(&["p1"]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    std::fs::write(&store, torn).expect("write torn credentials.json");
+
+    let err = reauth_profile(
+        &name,
+        None,
+        |_| Ok(true),
+        |claimed| {
+            collect_api_reauth_snapshot(
+                Some("https://api.deepseek.com/anthropic"),
+                Some("sk-new"),
+                Some(claimed),
+                false,
+            )
+        },
+    )
+    .err()
+    .expect("a re-key over an unreadable chain refuses");
+
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `tollgate login p1` first, or the re-key would drop it"
     );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            None
-        )
-        .credentials
-        .is_none(),
-        "a vanished profile reads the same"
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read store"),
+        torn,
+        "the refusal leaves the unreadable store as it was"
     );
 }
 
@@ -1972,9 +2098,7 @@ fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
 // only — driving them here would hang the suite.
 
 #[test]
-fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
-    // Same fence as the snapshot-level pin: the composed helper reaches the
-    // anchor read too.
+fn collect_api_reauth_snapshot_headless_reuses_endpoint_and_key() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
     let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
@@ -1985,11 +2109,6 @@ fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
         "the snapshot carries the STORED endpoint"
     );
     assert_eq!(snap.api_key.as_deref(), Some("sk-new"), "and the fresh key");
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("and the stored chain rides through the composition");
-    assert_eq!(carried.access_token(), acme.access_token());
 }
 
 #[test]
@@ -2103,7 +2222,7 @@ mod api_key_helper_tests {
     use crate::testutil::HomeSandbox;
 
     /// Write a profile to the sandboxed home with the given api_key (or none),
-    /// then save it so `load_profile` can read it back the way the helper does.
+    /// then save it so the helper's reader finds it.
     fn save_profile_with_key(name: &str, api_key: Option<&str>) {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
         profile.api_key = api_key.map(str::to_string);
@@ -2119,12 +2238,12 @@ mod api_key_helper_tests {
     }
 
     /// `api_key_for_profile` returns the stored key verbatim for a profile that
-    /// has one — the load path CC's helper relies on each request.
+    /// has one — the read CC's `apiKeyHelper` relies on.
     #[test]
     fn api_key_for_profile_returns_stored_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let key = api_key_for_profile("acme").expect("load_profile");
+        let key = api_key_for_profile("acme").expect("read key");
         assert_eq!(key.as_deref(), Some("sk-test-12345"));
     }
 
@@ -2137,7 +2256,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_is_static_across_calls() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let first = api_key_for_profile("acme").expect("load_profile");
+        let first = api_key_for_profile("acme").expect("read key");
         let second = api_key_for_profile("acme").expect("reload");
         assert_eq!(
             first, second,
@@ -2153,7 +2272,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_none_when_profile_has_no_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("oauth-profile", None);
-        let key = api_key_for_profile("oauth-profile").expect("load_profile");
+        let key = api_key_for_profile("oauth-profile").expect("read key");
         assert!(
             key.is_none(),
             "a profile with no api_key must yield Ok(None), not a blank Some"
@@ -2182,8 +2301,205 @@ mod api_key_helper_tests {
     fn api_key_for_profile_treats_blank_key_as_absent() {
         let _home = HomeSandbox::new();
         save_profile_with_key("blank", Some("   "));
-        let key = api_key_for_profile("blank").expect("load_profile");
+        let key = api_key_for_profile("blank").expect("read key");
         assert!(key.is_none(), "a whitespace-only key must read as None");
+    }
+
+    /// The key lives in `config.toml` alone, so a torn `credentials.json`
+    /// beside it must not cost the account its key: the helper is the only
+    /// way Claude Code gets one.
+    #[test]
+    fn api_key_for_profile_reads_the_key_beside_a_torn_credentials_file() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("credentials.json"),
+            "{\"claudeAiOauth\": {\"accessToken\": ",
+        )
+        .expect("write torn credentials");
+        let key =
+            api_key_for_profile("acme").expect("a torn credentials.json is not the key's store");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        dispatch_api_key("acme").expect("the helper exits 0 beside a torn credentials.json");
+    }
+
+    /// The store the key lives in failing to parse still fails closed: the
+    /// helper prints nothing and names that file.
+    #[test]
+    fn api_key_for_profile_err_for_an_unparseable_config() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test-12345\"\nbase_url = [",
+        )
+        .expect("write torn config");
+        let err = api_key_for_profile("acme").expect_err("a torn config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to parse acme/config.toml at line 2, column 13",
+            "the error names config.toml and the position"
+        );
+    }
+
+    /// A `config.toml` the helper cannot open fails closed naming it.
+    #[test]
+    fn api_key_for_profile_err_for_an_unreadable_config() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        if std::fs::metadata(&config).expect("stat").uid() == 0 {
+            eprintln!("SKIPPING: running as root, which can read any file");
+            return;
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let result = api_key_for_profile("acme");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod back");
+        let err = result.expect_err("an unreadable config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to read acme/config.toml: Permission denied (os error 13)"
+        );
+    }
+
+    /// A key carrying a control char would reach Claude Code as a header
+    /// value: the helper refuses it instead of printing it.
+    #[test]
+    fn api_key_for_profile_refuses_a_key_with_control_chars() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test\\r\\nX-Injected: y\"\n",
+        )
+        .expect("write poisoned config");
+        let err = api_key_for_profile("acme").expect_err("a poisoned key is refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "api key contains whitespace or control characters, likely a bad paste or an \
+             edited config"
+        );
+    }
+
+    /// A legacy `credentials.json.pending` that a full profile load would land
+    /// as `credentials.json` stays where it is: the helper writes no
+    /// credential store. `load_profile`'s other write, the `config.toml`
+    /// rewrite, and the state flock both take are pinned by
+    /// `api_key_for_profile_never_rewrites_config_toml` and
+    /// `api_key_for_profile_never_waits_on_the_state_flock`.
+    #[test]
+    fn api_key_for_profile_lands_no_pending_credentials() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let pending = dir.join("credentials.json.pending");
+        let staged = "{\"claudeAiOauth\": {\"accessToken\": \"at-pending\", \
+                      \"refreshToken\": \"rt-pending\", \"expiresAt\": 4102444800000}}";
+        std::fs::write(&pending, staged).expect("write legacy pending");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper lands no pending credentials"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("pending kept"),
+            staged,
+            "the legacy sidecar keeps its bytes"
+        );
+    }
+
+    /// The helper never rewrites `config.toml`, and never lands a legacy
+    /// `.pending` sidecar: it reads the config alone. Residual: no valid
+    /// `config.toml` makes a full load rewrite it anymore (the render
+    /// round-trips), so the closing `load_profile` control observes the sidecar
+    /// write-through a full load still does, never a config rewrite.
+    #[test]
+    fn api_key_for_profile_never_rewrites_config_toml() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let config = dir.join("config.toml");
+        let raw = "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n";
+        std::fs::write(&config, raw).expect("write config");
+        // An adoptable legacy `.pending` sidecar (no `credentials.json` to be
+        // newer than): a full load takes the state flock and writes it through.
+        let pending = dir.join("credentials.json.pending");
+        let pending_json =
+            "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}";
+        std::fs::write(&pending, pending_json).expect("write the legacy sidecar");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("re-read config"),
+            raw,
+            "the helper never rewrites config.toml"
+        );
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper never lands the sidecar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("re-read the sidecar"),
+            pending_json,
+            "the helper leaves the sidecar"
+        );
+        let _ = crate::profile::load_profile(&crate::profile::ProfileName::from("acme"));
+        assert!(
+            dir.join("credentials.json").exists(),
+            "control: a full profile load still lands the sidecar"
+        );
+    }
+
+    /// The helper never waits on the state flock: with a peer holding it, a
+    /// read still answers at once rather than after the lock's timeout.
+    #[test]
+    fn api_key_for_profile_never_waits_on_the_state_flock() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        std::fs::write(
+            &config,
+            "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n",
+        )
+        .expect("write config");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(
+                crate::profile::tollgate_dir()
+                    .expect("tollgate dir")
+                    .join(".lock"),
+            )
+            .expect("open the state lock");
+        lock.try_lock().expect("take the state flock");
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(10)));
+        let started = std::time::Instant::now();
+        let key = api_key_for_profile("acme");
+        let waited = started.elapsed();
+        crate::lock::set_state_lock_timeout_override(None);
+        assert_eq!(key.expect("read key").as_deref(), Some("sk-test-12345"));
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the helper waited {waited:?} on a held state flock"
+        );
     }
 
     /// End-to-end through `dispatch`: the helper dispatch arm reaches
@@ -2315,6 +2631,7 @@ mod oauth_token_helper_tests {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {
@@ -2329,6 +2646,7 @@ mod oauth_token_helper_tests {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login");
@@ -2587,7 +2905,7 @@ mod oauth_token_helper_tests {
             oauth_token_for_profile("acme", refresher).expect_err("a login change defers the read");
         assert_eq!(
             err.to_string(),
-            "'acme' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'acme' login changed during its refresh and the new login expires soon. Retry in a moment"
         );
     }
 
@@ -2890,23 +3208,199 @@ mod static_token_verdicts {
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
-    /// The reauth confirm's survivor clause is the prompt's only affirmative
-    /// promise, and it is destructive to get wrong in either direction: a
-    /// profile told its endpoint survives when the arm will not fire, or one
-    /// told nothing survives while it silently keeps a key. It tracks the
-    /// preserve arm's own predicate, so an OAuth profile — which has neither
-    /// field — is never promised one.
+    fn reauth_profile(name: &str) -> crate::profile::Profile {
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
+    }
+
+    fn with_pair(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("at-{}", p.name),
+                refresh_token: Some(format!("rt-{}", p.name)),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    }
+
+    /// A long-lived sidecar on disk, the fact the prompt reads for itself.
+    fn with_mint(p: crate::profile::Profile) -> crate::profile::Profile {
+        std::fs::create_dir_all(crate::profile::profile_dir(&p.name).expect("profile dir"))
+            .expect("mkdir profile");
+        crate::claude::write_session_token(
+            &p.name,
+            "sk-ant-oat01-reauth-copy-mint-000",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        p
+    }
+
+    fn rolling(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.rolling_token = true;
+        p
+    }
+
+    fn with_endpoint(mut p: crate::profile::Profile, key: bool) -> crate::profile::Profile {
+        p.base_url = Some("https://proxy.example/v1".to_string());
+        if key {
+            p.api_key = Some("sk-proxy-reauth-copy".to_string());
+        }
+        p
+    }
+
+    fn prompt(p: &crate::profile::Profile, is_api: bool) -> String {
+        reauth_prompt(&p.name, Some(p), is_api)
+    }
+
+    /// The whole `[y/N]` line `tollgate login <existing>` prints, read off real
+    /// profiles and the sidecar on disk, so every fact the wording keys on is
+    /// read where `cmd_login` reads it. Each shape is pinned by equality: the
+    /// verb, the object, the survivor clause and the session-token sentence are
+    /// separate claims, and a dropped or swapped fact changes exactly one.
     #[test]
-    fn the_reauth_confirm_promises_a_survivor_only_where_one_survives() {
+    fn the_reauth_prompt_says_what_the_login_does_to_each_profile_shape() {
+        let _home = HomeSandbox::new();
+
+        // The setup-token-only shape the Fallback card sends people here with:
+        // no pair to replace, so the login adds one.
         assert_eq!(
-            reauth_confirm_object(false, true),
-            "stored subscription login, keeping its endpoint and api key"
+            prompt(&with_mint(reauth_profile("st-plain")), false),
+            "tollgate: profile 'st-plain' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Sessions keep running on its long-lived token. This \
+             login only feeds usage polling. Continue? [y/N] "
         );
-        assert_eq!(reauth_confirm_object(false, false), "stored credentials");
-        // An api-mode login carries both fields and replaces them, so the
-        // preserve never applies whatever the profile holds.
-        assert_eq!(reauth_confirm_object(true, true), "endpoint + API key");
-        assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
+        // With `rolling_token` on, the sessions move onto this login at the
+        // next rotation, the opposite of the plain promise.
+        assert_eq!(
+            prompt(&with_mint(rolling(reauth_profile("st-roll"))), false),
+            "tollgate: profile 'st-roll' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Its rolling token re-stamps from the stored login, so \
+             its sessions move onto this login at the next rotation, even if it is another \
+             account. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_mint(with_pair(reauth_profile("pair-plain"))), false),
+            "tollgate: profile 'pair-plain' already exists. Re-authenticating replaces its stored \
+             credentials. Sessions keep running on its long-lived token. This login only feeds \
+             usage polling. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_mint(rolling(with_pair(reauth_profile("pair-roll")))),
+                false
+            ),
+            "tollgate: profile 'pair-roll' already exists. Re-authenticating replaces its stored \
+             credentials. Its rolling token re-stamps from the stored login, so its sessions \
+             move onto this login at the next rotation, even if it is another account. \
+             Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_pair(reauth_profile("pair-only")), false),
+            "tollgate: profile 'pair-only' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&reauth_profile("bare"), false),
+            "tollgate: profile 'bare' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
+        );
+        // The flag alone promises nothing: with no sidecar there is nothing to
+        // re-stamp.
+        assert_eq!(
+            prompt(&rolling(reauth_profile("bare-roll")), false),
+            "tollgate: profile 'bare-roll' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
+        );
+    }
+
+    /// The survivor clause is the prompt's only promise that something is KEPT,
+    /// and it is destructive to get wrong in either direction. It follows the
+    /// overwrite's preserve arm: an endpoint with a key behind it survives an
+    /// OAuth reauth, pair or no pair; an endpoint SHELL (a `base_url` with
+    /// neither key nor pair, what logging an api account out leaves behind)
+    /// loses its `base_url`, so it is told the login replaces rather than adds;
+    /// an api-mode login writes the endpoint and key outright.
+    #[test]
+    fn the_reauth_prompt_promises_a_survivor_only_where_one_survives() {
+        let _home = HomeSandbox::new();
+
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("ep-keyed"), true), false),
+            "tollgate: profile 'ep-keyed' already exists. Re-authenticating adds an OAuth login, \
+             keeping its endpoint and api key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_mint(with_endpoint(reauth_profile("ep-mint"), true)),
+                false
+            ),
+            "tollgate: profile 'ep-mint' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token, keeping its endpoint and api key. Sessions keep \
+             running on its long-lived token. This login only feeds usage polling. Continue? \
+             [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_pair(with_endpoint(reauth_profile("ep-paired"), true)),
+                false
+            ),
+            "tollgate: profile 'ep-paired' already exists. Re-authenticating replaces its stored \
+             subscription login, keeping its endpoint and api key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("ep-shell"), false), false),
+            "tollgate: profile 'ep-shell' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        // api mode: the endpoint set is replaced whatever the profile holds,
+        // and a sidecar beside it is no part of what this login touches.
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("api-keyed"), true), true),
+            "tollgate: profile 'api-keyed' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_mint(reauth_profile("api-mint")), true),
+            "tollgate: profile 'api-mint' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
+        );
+    }
+
+    /// The NOTE after the login splits on the same facts as the prompt before
+    /// it, read the same way, so the operator is never told one thing while
+    /// answering and the other once it landed.
+    #[test]
+    fn the_login_note_says_what_the_sidecar_does_to_the_sessions() {
+        let _home = HomeSandbox::new();
+        let note = |p: &crate::profile::Profile, is_api: bool| login_note(&p.name, Some(p), is_api);
+
+        assert_eq!(
+            note(&with_mint(reauth_profile("note-plain")), false).as_deref(),
+            Some(
+                "tollgate: NOTE 'note-plain' still holds a long-lived token, and that is what \
+                 switches install. This login only feeds usage polling. Drop it with:  tollgate \
+                 static-token note-plain --clear"
+            )
+        );
+        assert_eq!(
+            note(&with_mint(rolling(reauth_profile("note-roll"))), false).as_deref(),
+            Some(
+                "tollgate: NOTE 'note-roll' holds a rolling token, and that is what switches \
+                 install. It re-stamps from the stored login, so its sessions move onto this \
+                 login at the next rotation, even if it is another account. Drop it with:  \
+                 tollgate static-token note-roll --clear"
+            )
+        );
+        assert_eq!(note(&with_pair(reauth_profile("note-none")), false), None);
+        assert_eq!(note(&rolling(reauth_profile("note-flag")), false), None);
+        assert_eq!(note(&with_mint(reauth_profile("note-api")), true), None);
     }
 
     /// "Name the split state" (owner ruling, 2026-08-30): a quarantined
@@ -3271,7 +3765,7 @@ mod armed_report_copy {
     fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {
         let disarm = clear_disarm_note("acme");
         assert!(
-            disarm.contains("clearing also turns its re-stamping off"),
+            disarm.contains("Clearing also turns its re-stamping off"),
             "{disarm}"
         );
         let backup = clear_backup_note("acme");
@@ -3286,7 +3780,7 @@ mod armed_report_copy {
         let disarmed = clear_disarmed_postscript("acme");
         assert!(disarmed.contains("rolling-token is off"), "{disarmed}");
         assert!(
-            disarmed.contains("nothing re-stamps a sidecar for 'acme' now"),
+            disarmed.contains("Nothing re-stamps a sidecar for 'acme' now"),
             "{disarmed}"
         );
         let swept = clear_backup_postscript("acme");
@@ -3882,6 +4376,78 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// The CLI codex delete under a live session appends its `--force` tail only to
+/// the typed live-session refusal, pinned by equality (N9).
+#[test]
+fn cli_codex_delete_live_session_names_only_the_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["tollgate", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    assert_eq!(
+        outcome
+            .expect_err("a live session refuses the codex delete")
+            .to_string(),
+        "'cx' has a live session, pass --force to remove it anyway"
+    );
+}
+
+/// What `exit_code` prints on the refusal (`Error: {e:?}`) is the one tail
+/// sentence: the tail-bearing message and its cause never both print (M5).
+#[test]
+fn cli_codex_delete_live_session_prints_one_line_under_debug() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let err = dispatch(
+        Cli::try_parse_from(["tollgate", "delete", "cx", "--yes"]).expect("delete must parse"),
+    )
+    .expect_err("refused");
+    assert_eq!(
+        format!("{err:?}"),
+        "'cx' has a live session, pass --force to remove it anyway",
+        "the printed error repeats the refusal under Caused by"
+    );
+}
+
+/// The `--force` tail rides the TYPED live-session refusal alone: a delete that
+/// fails for another reason (a state-flock timeout) under a live session gets
+/// no tail naming a flag that cannot fix it (N9).
+#[test]
+fn cli_codex_delete_lock_failure_under_a_live_session_gets_no_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+    let dir = crate::profile::tollgate_dir().expect("tollgate dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["tollgate", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    let err = outcome
+        .expect_err("the state-flock timeout fails the delete")
+        .to_string();
+    assert!(
+        err.contains("state lock"),
+        "the lock error reached the CLI: {err}"
+    );
+    assert!(
+        !err.contains("pass --force"),
+        "a lock error got the --force tail: {err}"
+    );
+}
+
 /// A quarantined codex profile refuses `tollgate start` by name — `--explain`
 /// included, the way the claude arm runs `admit` there — naming the fix,
 /// before any spawn. The explain leg runs first: it is the one that can red by
@@ -3905,7 +4471,9 @@ fn codex_start_refuses_a_quarantined_chain_by_name() {
             "cx",
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
-            &expired
+            &expired,
+            &crate::testutil::fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
     );
@@ -4113,6 +4681,11 @@ fn cmd_start_explain_launches_nothing() {
     })
     .unwrap();
     for name in ["a", "b"] {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        crate::profile::save_profile(&p).unwrap();
+    }
+    for name in ["a", "b"] {
         crate::profile_cache::write_profile_cache(
             &crate::profile::ProfileName::from(name),
             crate::profile_cache::USAGE_CACHE_FILE,
@@ -4171,6 +4744,9 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         ..crate::profile::AppState::default()
     })
     .unwrap();
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    p.credentials = Some(crate::testutil::oauth_pair("a"));
+    crate::profile::save_profile(&p).unwrap();
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("a"),
         crate::profile_cache::USAGE_CACHE_FILE,
@@ -4189,6 +4765,1304 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         err.to_string(),
         "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
     );
+}
+
+fn seed_blank_profile(config: &mut crate::profile::AppConfig, name: &str) {
+    crate::actions::create_blank_profile(config, name.to_string(), None, None, Default::default())
+        .expect("create profile");
+}
+
+/// `--explain` runs the same background refusals a real launch runs: an
+/// `--isolated` launch with `--bg`, and a copy host with `--bg`, both print the
+/// refusal rather than the pick line.
+#[test]
+fn cmd_start_explain_runs_the_isolated_background_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Isolated,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on --isolated");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot be combined with --isolated, since background \
+         sessions run in the account's shared background tree"
+    );
+}
+
+#[test]
+fn cmd_start_explain_refuses_a_background_start_on_a_copy_host() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on a copy host");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials tollgate rotates (on Windows, turn on Developer Mode)"
+    );
+}
+
+// ── `--auto` judges each member for the models ITS session will run ─────────
+//
+// A runtime's `settings.json` takes `model` from the member's own `[models]
+// default` and drops the global one when the member has none (the overlay in
+// `claude::build_claude_settings_json`; measured 2026-10-18: global `"opus"`,
+// cld's runtime copies `null`). The demand a start judges a member by follows
+// the same overlay, and reads a process-env model only where the session
+// keeps it (`runtime::scrub_profile_env` drops `CLAUDE_CODE_SUBAGENT_MODEL`).
+
+/// One chain member: its `[models] default`, its `[env]`, and the per-model
+/// week it has spent (99% against the default 98 scoped line).
+struct StartMember {
+    name: &'static str,
+    default: Option<&'static str>,
+    env: &'static [(&'static str, &'static str)],
+    spent: &'static str,
+}
+
+/// The chain in order, each member's other windows clear, under a global
+/// `settings.json` holding `global`.
+fn seed_start_members(global: serde_json::Value, members: &[StartMember]) {
+    let names: Vec<crate::profile::ProfileName> = members.iter().map(|m| m.name.into()).collect();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    for m in members {
+        let name = crate::profile::ProfileName::from(m.name);
+        let mut profile = crate::testutil::blank_profile(&name);
+        profile.credentials = Some(crate::testutil::oauth_pair(m.name));
+        profile.models.default = m.default.map(str::to_owned);
+        for (k, v) in m.env {
+            profile.env.insert((*k).to_owned(), (*v).to_owned());
+        }
+        crate::profile::save_profile(&profile).unwrap();
+        let mut usage = cmd_start_usage();
+        usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+            label: m.spent.to_string(),
+            window: crate::usage::UsageWindow {
+                utilization: 99.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            },
+        }];
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &usage,
+        );
+    }
+    let claude = crate::profile::claude_dir().unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join("settings.json"),
+        serde_json::to_vec(&global).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One chain member `a` on `[models] default`, its Fable week spent, under a
+/// global `settings.json` naming `global_model`.
+fn seed_fable_spent_member(member_default: Option<&'static str>, global_model: &str) {
+    seed_start_members(
+        serde_json::json!({ "model": global_model }),
+        &[StartMember {
+            name: "a",
+            default: member_default,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+}
+
+/// The developer's shell may export either model variable; every `--auto`
+/// demand test pins both unset unless it sets one itself.
+fn no_model_env(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    )
+}
+
+fn cmd_start_auto(isolation: Isolation) -> anyhow::Result<()> {
+    cmd_start(&crate::cli::StartTarget::Auto, &[], isolation, false, true)
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_its_own_default_model_over_the_global_one() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_member_whose_own_default_skips_the_spent_family() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "fable");
+
+    cmd_start_auto(Isolation::Shared).expect("the member's session runs opus, which has headroom");
+}
+
+/// A chain whose every name resolves to no profile (a hand edit) has no
+/// member to judge for headroom: the refusal names the missing names, in
+/// chain order, and prints no explain rows.
+#[test]
+fn cmd_start_auto_names_a_chain_whose_every_member_is_missing() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![
+            crate::profile::ProfileName::from("alice"),
+            crate::profile::ProfileName::from("bob"),
+        ],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("no chain name resolves, so nothing can start");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member that exists (alice, bob)"
+    );
+}
+
+/// A chain holding a dangling name beside a real member still walks the real
+/// one: the dangling name is skipped, never a reason to refuse the start.
+#[test]
+fn cmd_start_auto_walks_the_real_member_of_a_partly_dangling_chain() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![crate::profile::ProfileName::from("alice"), kept.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("`kept` resolves, so the walk judges it");
+}
+
+// ── `--auto` and the usage-credit cap ───────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model (Fable, plus every family its
+// cached `tengu_calm_seal` flag lists) once the account's usage-credit cap is
+// spent, whatever its windows say; every other model still runs there.
+
+/// One chain member `a` on `[models] default`, every window clear, its
+/// usage-credit spend past its limit (`billing_on` names whether the spend
+/// block is enabled), its credit gate `check_credit_cap`.
+fn seed_credit_spend_member(
+    member_default: Option<&'static str>,
+    check_credit_cap: bool,
+    billing_on: bool,
+) {
+    let name = crate::profile::ProfileName::from("a");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        fallback_chain: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    profile.models.default = member_default.map(str::to_owned);
+    profile.check_credit_cap = check_credit_cap;
+    crate::profile::save_profile(&profile).unwrap();
+    let mut usage = cmd_start_usage();
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: billing_on,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        usage.credit_capped(),
+        billing_on,
+        "fixture control: the cap reads capped only while billing is on"
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_whose_session_runs_fable() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("Claude Code refuses fable on an account whose credit cap is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The demand decides by its own families whatever the gate says: a known
+/// credit-billed demand is refused with the gate off too.
+#[test]
+fn cmd_start_auto_refuses_a_known_credit_billed_demand_with_the_gate_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a fable session fails on a spent cap whatever the chain gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_whose_session_runs_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), true, true);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("opus bills the subscription, so a spent credit cap does not stop it");
+}
+
+/// An agent launch naming no model is judged on its union side, and the union
+/// family Claude Code bills against credits refuses first: fable is
+/// credit-billed, so the capped member's credit rung fires on the demand's own
+/// family and the row names it. The agent's own model never enters the judgment
+/// (tollgate reads no agent def), so this row is the credit cap, not an unknown
+/// model.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_whose_fallback_bills_a_spent_cap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback bills a spent credit cap");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A billing-off account carrying a stale full limit is never capped: the
+/// credit rung keys on `credit_capped()`, never a stale percent, so a fable
+/// demand still runs there.
+#[test]
+fn cmd_start_auto_takes_a_billing_off_account_with_a_stale_full_limit() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, false);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("a billing-off account is never capped, whatever its stale limit says");
+}
+
+/// A family the cached `tengu_calm_seal` flag adds is credit-billed too: the
+/// set comes from Claude Code's own flag, never a hardcoded list.
+#[test]
+fn cmd_start_auto_refuses_a_family_the_cached_flag_bills_against_credits() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("claude-mythos-1"), true, true);
+    std::fs::write(
+        sb.home().join(".claude.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos"]}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err =
+        cmd_start_auto(Isolation::Shared).expect_err("the flag bills mythos against usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for mythos\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// No `[models] default`: the session runs Claude Code's own default, which
+/// may bill credits, so a capped member is judged credit-billed whatever its
+/// credit gate says.
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_on() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed while the gate is on");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The gate steers the chain walk only: a launch whose model tollgate cannot
+/// know still refuses a capped member with its gate off.
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, false, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed whatever the gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An `--agent` launch naming no model runs whatever its def says, which
+/// tollgate never reads: a capped member refuses it with its gate off, even
+/// beside an opus default and an opus def file.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let agents = sb.home().join(".claude").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: test agent\nmodel: opus\n---\nYou review.\n",
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev"]).expect_err("the agent's model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides an agent launch alone.
+#[test]
+fn cmd_start_auto_takes_an_agent_launch_naming_a_subscription_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--agent", "rev", "--model", "opus"])
+        .expect("the launch names opus, which bills the subscription");
+}
+
+/// An unplaceable `--fallback-model` beside a placeable headline refuses a
+/// capped member: the demand reads as unknown, so the
+/// refusal names no family.
+#[test]
+fn cmd_start_auto_refuses_an_unplaceable_fallback_beside_a_known_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("glm-4.6 cannot be placed");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The unplaceable model makes only the CREDIT judgment unknown: the scoped
+/// rung keeps narrowing to the families the launch is known to run, so an
+/// uncapped member whose fable week is spent still refuses a fable launch by
+/// that week, naming fable.
+#[test]
+fn cmd_start_auto_an_unplaceable_fallback_leaves_the_scoped_rung_on_its_known_families() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A resumed session that was started as an agent runs that agent again
+/// (measured on Claude Code 2.1.309: the transcript's `agent-setting` record),
+/// so a `--resume` naming no model is an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_resumed_agent_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb.home().join(".claude/projects/-ws/sagent.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        [
+            serde_json::json!({"sessionId": "sagent", "cwd": ws, "message": {"role": "user", "content": "hi"}}).to_string(),
+            serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sagent"}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--resume", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// `--continue` names no transcript tollgate can pin (Claude Code picks the cwd's
+/// newest conversation, which tollgate never mirrors), so a launch naming no model
+/// fails closed as an agent launch naming no model: a capped member refuses with
+/// the unknown-demand rung.
+#[test]
+fn cmd_start_auto_refuses_an_unresolvable_continue_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--continue"])
+        .expect_err("an unresolvable --continue is an unknown demand");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A transcript `<home>/.claude/projects/-ws/<id>.jsonl` recorded in the
+/// workspace `<home>/ws` (created): one user line, `pad` filler user lines of
+/// ~1 KiB each, then one `agent-setting` record per name in `agents`.
+fn write_start_transcript(
+    sb: &crate::testutil::HomeSandbox,
+    id: &str,
+    pad: usize,
+    agents: &[&str],
+) {
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb
+        .home()
+        .join(".claude/projects/-ws")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut lines = vec![
+        serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for agent in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": agent, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(&transcript, lines.join("\n")).unwrap();
+}
+
+/// Every resume form whose transcript tollgate cannot pin by an exact id it
+/// finds is an unknown demand when no model is named:
+/// `--continue`/`-c` (Claude Code picks the newest conversation in the cwd),
+/// a bare `--resume` (the picker, a following flag is no value), a session
+/// name (`--resume`/`-r <name>`), an id tollgate finds no transcript for, and
+/// `--from-pr` with or without its value. The store's only session runs no
+/// agent, so a walk that resolves any of them to it admits the opus member.
+#[test]
+fn cmd_start_auto_refuses_every_resume_it_cannot_pin_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let forms: &[&[&str]] = &[
+        &["--continue"],
+        &["-c"],
+        &["--resume"],
+        &["--resume", "--verbose"],
+        &["--resume", "probename"],
+        &["-r", "probename"],
+        &["--resume", "0b6c3c55-0000-4000-8000-000000000000"],
+        &["--from-pr"],
+        &["--from-pr", "12"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `-r <id>` is the short spelling of an exact-id resume: the transcript's
+/// agent record makes it an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_short_flag_resume_of_an_agent_session() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let err = cmd_start_auto_with(&["-r", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The agent record can sit anywhere in the transcript (measured on Claude
+/// Code 2.1.309: a session that took its agent at a later resume wrote its only
+/// record at byte 275,031), so an exact-id resume scans the whole transcript.
+#[test]
+fn cmd_start_auto_refuses_a_resume_whose_agent_record_sits_deep_in_the_transcript() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sdeep", 300, &["pa"]);
+
+    let err = cmd_start_auto_with(&["--resume", "sdeep"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides a resume alone, whatever the transcript or the resume
+/// form: a capped member with its gate off takes each one naming opus.
+#[test]
+fn cmd_start_auto_a_named_model_decides_every_resume() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let forms: &[&[&str]] = &[
+        &["--resume", "sagent", "--model", "opus"],
+        &["-r", "sagent", "--model", "opus"],
+        &["--continue", "--model", "opus"],
+        &["-c", "--model", "opus"],
+        &["--resume", "--model", "opus"],
+        &["--resume", "probename", "--model", "opus"],
+        &["--from-pr", "--model", "opus"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        if let Err(e) = cmd_start_auto_with(form) {
+            wrong.push(format!("{form:?}: {e}"));
+        }
+    }
+    assert!(wrong.is_empty(), "named-model resumes refused: {wrong:#?}");
+}
+
+/// A resume value Claude Code never opens as a transcript is unpinnable
+/// (measured on 2.1.309: each opens the interactive picker): a nested
+/// subagent transcript's id (`agent-<hex>`, which CC answers no-match for), and
+/// `-r=<id>`, whose value CC receives as `=<id>`. Neither may resolve to a
+/// transcript tollgate then reads as running no agent.
+#[test]
+fn cmd_start_auto_refuses_a_resume_value_claude_code_never_opens() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+    let nested = sb
+        .home()
+        .join(".claude/projects/-ws/splain/subagents/agent-abc123.jsonl");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    std::fs::write(
+        &nested,
+        serde_json::json!({"sessionId": "splain", "cwd": sb.home().join("ws"), "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    )
+    .unwrap();
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--resume", "agent-abc123"][..],
+        &["-r", "agent-abc123"][..],
+        &["-r=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `--teleport [session]` resumes a session (Claude Code 2.1.309 `--help`)
+/// tollgate cannot pin: with no model named it is an unknown demand.
+#[test]
+fn cmd_start_auto_refuses_a_teleport_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--teleport"][..],
+        &["--teleport", "splain"][..],
+        &["--teleport=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--teleport", "--model", "opus"])
+        .expect("a named model decides a teleport alone");
+}
+
+/// `--cloud [description|session_id|url]` can attach to a cloud session tollgate
+/// cannot pin, so with no model named it is an unknown demand whatever its
+/// value. `attach` and `respawn` reopen a background session and stay fresh
+/// launches judged on the member's own model.
+#[test]
+fn cmd_start_auto_refuses_a_cloud_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--cloud"][..],
+        &["--cloud", "fix the build"][..],
+        &["--cloud", "https://claude.ai/code/abc"][..],
+        &["--cloud=abc"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--cloud", "abc", "--model", "opus"])
+        .expect("a named model decides a cloud session alone");
+    cmd_start_auto_with(&["attach", "3f2a"]).expect("attach is a fresh launch on opus");
+    cmd_start_auto_with(&["respawn", "3f2a"]).expect("respawn is a fresh launch on opus");
+}
+
+/// A capped member whose week also reads past its soft line: the row an
+/// unknown-headline launch shows does not depend on whether the launch also
+/// carries a known fallback. `--agent rev` alone and `--agent rev
+/// --fallback-model sonnet` render the same row.
+#[test]
+fn cmd_start_auto_an_unknown_headline_row_ignores_a_known_fallback() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut usage = cmd_start_usage();
+    if let Some(week) = usage.seven_day.as_mut() {
+        week.utilization = 99.5;
+    }
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    let alone = cmd_start_auto_with(&["--agent", "rev"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(
+        alone,
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+    let with_fallback = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(with_fallback, alone);
+    let continued = cmd_start_auto_with(&["--continue", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(continued, alone);
+}
+
+/// An agent launch naming no model keeps its known union side on the SCOPED
+/// rung: with the member's scoped gate off, its
+/// spent fable week still refuses the launch's `--fallback-model fable`, naming
+/// fable. Only the credit rung reads the agent's headline as unknown.
+#[test]
+fn cmd_start_auto_an_agent_launch_keeps_its_fallback_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "opus");
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback meets a spent fable week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// With the scoped gate on, an agent launch's unknown headline still meets the
+/// blanket judgment: a spent opus week refuses the launch even though its known
+/// side (a fable fallback) is clear, since the agent may run opus.
+#[test]
+fn cmd_start_auto_an_agent_launch_under_the_scoped_gate_meets_every_scoped_window() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the agent may run opus, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+fn cmd_start_auto_with(args: &[&str]) -> anyhow::Result<()> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &args,
+        Isolation::Shared,
+        false,
+        true,
+    )
+}
+
+/// A `--model` passthrough replaces the member's `[models] default` as the
+/// headline: Claude Code runs the flag over the settings `model`, so a fable
+/// default never runs (cloudy, 2026-10-22).
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_fable_default_member_when_the_launch_names_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--model", "opus"])
+        .expect("the launch runs opus, which bills the subscription");
+}
+
+/// A `[models]` alias remap is what the alias runs: `opus` remapped onto a
+/// fable id demands fable.
+#[test]
+fn cmd_start_auto_follows_a_models_alias_remap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.models.opus = Some("claude-fable-5".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err =
+        cmd_start_auto_with(&["--model", "opus"]).expect_err("opus is remapped onto a fable id");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its spent cap blocks no launch.
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_on_its_own_endpoint() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+    let profile = crate::profile::load_profile(&name).unwrap();
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "fixture control: the account serves from its own endpoint"
+    );
+
+    cmd_start_auto(Isolation::Shared).expect("its own endpoint serves fable");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(None, "opus");
+
+    // No `[models] default`: the runtime drops the global `model`, the session
+    // runs Claude Code's own default, and an unresolved demand keeps the blanket
+    // per-model judgment (`check_scoped`, on by default).
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A `default` entry with no member `[models] default` is judged like a
+/// no-model-named launch, never like an unplaceable model id beside a known
+/// family: the scoped rung keeps the blanket judgment, so a spent opus week
+/// refuses the launch even though its named headline (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_default_without_member_default_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--model", "haiku", "--fallback-model", "default"])
+        .expect_err("the unknown default is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A launch naming no model keeps its unknown-default demand when the fallback
+/// list is non-empty: the scoped rung stays blanket, so a spent opus week
+/// refuses the launch even though its fallback (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("the unknown headline is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A capped member refuses a no-model launch with a non-empty fallback list the
+/// same way it refuses one with an empty list: the unknown headline may bill
+/// credits whatever the fallback names.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_refuses_a_capped_member() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("an unknown headline may bill usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A demand tollgate cannot resolve keeps the narrowed judgment of its known
+/// families: with the member's scoped gate off, a spent week on the named
+/// headline still refuses the launch, naming it; with the gate on, the blanket
+/// judgment beside it names it too.
+#[test]
+fn cmd_start_auto_an_unresolved_default_keeps_its_known_headline_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d sonnet",
+        }],
+    );
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the launch runs sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    let err = cmd_start_auto_with(&["--fallback-model", "sonnet"])
+        .expect_err("the launch may fall back to sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    profile.check_scoped = true;
+    crate::profile::save_profile(&profile).unwrap();
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the blanket judgment beside it still names the spent family");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_subagent_model_the_session_scrubs() {
+    let sb = crate::testutil::HomeSandbox::new();
+    // The launching shell exports a subagent model; `start::run` removes it
+    // from the child, so the session never runs it.
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            (
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+                Some(std::ffi::OsStr::new("sonnet")),
+            ),
+        ],
+    );
+    seed_fable_spent_member(None, "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a scrubbed variable is no demand, so the blanket judgment holds");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_own_env_sets() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // `[env] ANTHROPIC_MODEL` lands in the runtime `settings.json` `env`, and
+    // Claude Code runs it.
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_refusal_names_no_family_when_the_members_demands_differ() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // a runs fable and spent its fable week; b runs opus and spent its opus
+    // week. No one family is what every member was refused for.
+    seed_start_members(
+        serde_json::json!({}),
+        &[
+            StartMember {
+                name: "a",
+                default: Some("fable"),
+                env: &[],
+                spent: "7d fable",
+            },
+            StartMember {
+                name: "b",
+                default: Some("opus"),
+                env: &[],
+                spent: "7d opus",
+            },
+        ],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("each member's own family is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago\n  b  7d opus 99%, other models ok    usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_passthrough_names() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // The member runs opus by default; `--model fable` replaces that default as
+    // the headline, and its fable week is spent.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &["--model".to_string(), "fable".to_string()],
+        Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("the passthrough model's week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// Makes `x` the active account, outside the chain, carrying `env`: the
+/// outgoing activation whose `[env]` keys `start::run` scrubs from the child.
+fn activate_outside_chain(env: &[(&str, &str)]) {
+    let x = crate::profile::ProfileName::from("x");
+    let mut profile = crate::testutil::blank_profile(&x);
+    for (k, v) in env {
+        profile.env.insert((*k).to_owned(), (*v).to_owned());
+    }
+    crate::profile::save_profile(&profile).unwrap();
+    let mut state = crate::profile::load_app_state().unwrap();
+    state.profiles.push(x.clone());
+    state.active_profile = Some(x);
+    crate::profile::save_app_state(&state).unwrap();
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_its_runtime_env_overrides() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", Some(std::ffi::OsStr::new("opus"))),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's `opus` survives the scrub (the active `x` sets no such key),
+    // but the member's runtime `settings.json` `env` sets its own, which
+    // Claude Code applies over the inherited one: the session runs fable.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d opus",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    cmd_start_auto(Isolation::Shared).expect("the session runs fable, whose week is clear");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_the_outgoing_profile_owned() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's model is one the active `x` owns in its `[env]`: `start::run`
+    // scrubs it from the child, so the session runs Claude Code's default.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[("ANTHROPIC_MODEL", "claude-opus-4-8")]);
+    // With the per-model gate off, an unresolved demand judges no week, so
+    // only a demand wrongly naming fable could refuse `a`.
+    let a = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&a).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("a scrubbed variable is no demand");
+}
+
+/// The positive side of the two pins above: a shell `ANTHROPIC_MODEL` the
+/// child keeps (no profile owns it, no runtime `env` overrides it) is the
+/// session's headline, so it is demand.
+#[test]
+fn cmd_start_auto_judges_a_member_by_an_inherited_model_the_child_keeps() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("the session runs the shell's fable");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_reads_the_global_fallback_model_only_where_the_runtime_keeps_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // A shared runtime builds on the global `settings.json` and keeps its
+    // `fallbackModel`; an isolated one builds on nothing.
+    seed_start_members(
+        serde_json::json!({ "model": "opus", "fallbackModel": ["fable"] }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the shared session may fall back to fable, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for opus + fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+    cmd_start_auto(Isolation::Isolated).expect("the isolated session runs opus alone");
 }
 
 // ── the claude-only verbs and a codex name ────────────────────────────────────
@@ -4232,7 +6106,7 @@ fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() 
 
     assert_eq!(
         unknown_profile_error(&config, "zz").to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx",
+        "profile 'zz' not found\navailable: cl1, codex: cx",
         "control: the two-roster listing `switch`/`delete`/`start` use is unchanged"
     );
 
@@ -4294,11 +6168,16 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let err = resolve_or_bail(&config, "cx", "disable").expect_err("the roster does not load");
     assert_eq!(
         err.to_string(),
-        format!("failed to parse {}", roster.display())
+        format!("failed to parse {} at line 1, column 21", roster.display())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        err.to_string(),
+        "no source chain carries the parser's message or the file bytes"
     );
     assert!(
-        err.root_cause().downcast_ref::<toml::de::Error>().is_some(),
-        "the parse error is the cause, never hidden: {err:?}"
+        err.source().is_none(),
+        "the parse error must not ride as a source carrying the file bytes: {err:?}"
     );
     assert!(
         err.downcast_ref::<UsageError>().is_none(),
@@ -4387,7 +6266,7 @@ fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
+        "profile 'zz' not found\navailable: cl1, codex: cx, cy"
     );
 
     let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
@@ -4456,7 +6335,7 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     })
     .expect("a declined prompt is a clean abort");
     assert!(
-        asked.contains("'cx'? Full reset · expires ") && asked.contains("1 of 2 available"),
+        asked.contains("'cx'? Full reset, expires ") && asked.contains("1 of 2 available"),
         "the prompt names the credit it will spend: {asked}"
     );
 
@@ -5025,7 +6904,7 @@ mod hermes_resolution {
 
 /// Review lens guest-ux #5. `switch --help` describes the session form as
 /// it behaves: OAuth intent at the next request, the api-key hot swap (a
-/// different key is what it swaps; swapping… until served) and `--relaunch`
+/// different key is what it swaps; swapping... until served) and `--relaunch`
 /// for anything else — never "a member whose key differs is refused".
 #[test]
 fn switch_help_describes_the_hot_swap_and_the_relaunch() {
@@ -5040,7 +6919,7 @@ fn switch_help_describes_the_hot_swap_and_the_relaunch() {
     for needle in [
         "hot-swaps its key",
         "same endpoint, model routing and custom env",
-        "swapping…",
+        "swapping...",
         "--relaunch",
         "next request",
     ] {
@@ -5121,5 +7000,1344 @@ mod static_token_landers {
 
         assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
         assert!(!dir.join("credentials.json.staged").exists());
+    }
+}
+
+// ── `tollgate presets rebind` ──────────────────────────────────────────────────
+
+#[test]
+fn presets_rebind_parses_with_accounts_and_yes() {
+    match command(&["presets", "rebind", "D1", "DS1", "--yes"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert_eq!(args.accounts, ["D1", "DS1"]);
+                assert!(args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+#[test]
+fn presets_rebind_parses_bare() {
+    match command(&["presets", "rebind"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert!(args.accounts.is_empty());
+                assert!(!args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+/// Seed two DeepSeek accounts — `D0` empty, `DS1` holding its former id on
+/// `default` — plus the state, so `run_presets_rebind` can be driven against
+/// real profile files.
+fn seed_rebind_profiles(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// Seed three DeepSeek accounts — `D0` and `D2` empty, `DS1` holding its
+/// former id on `default` — plus the state, so a mid-list failure still leaves
+/// a later account to move.
+fn seed_rebind_profiles_three(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    let d2 = Profile::new(
+        "D2".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1, &d2] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone(), d2.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// The bare list drives `run_presets_rebind` (what `cmd_presets` calls) and
+/// pins its whole stdout: the aligned body and the approved name-less hint.
+#[test]
+fn the_bare_rebind_list_pins_its_stdout_and_writes_nothing() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "D0   default  (unset)        → opus\n\
+         D0   opus     (unset)        → deepseek-v4-pro[1m]\n\
+         D0   sonnet   (unset)        → deepseek-flash[1m]\n\
+         D0   haiku    (unset)        → deepseek-flash[1m]\n\
+         D0   fable    (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  default  deepseek-chat  → opus\n\
+         DS1  opus     (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  sonnet   (unset)        → deepseek-flash[1m]\n\
+         DS1  haiku    (unset)        → deepseek-flash[1m]\n\
+         DS1  fable    (unset)        → deepseek-v4-pro[1m]\n\
+         10 rows on 2 accounts. run `tollgate presets rebind --yes` to apply.\n",
+    );
+
+    // A bare list must not write: the config files are untouched.
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert!(d0.models.default.is_none(), "bare list wrote nothing");
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "bare list left the former id",
+    );
+}
+
+/// A named-subset list repeats the names in the hint.
+#[test]
+fn a_named_rebind_list_repeats_only_the_names() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &["D0".to_string()], false).expect("run");
+    assert_eq!(
+        out,
+        "D0  default  (unset)  → opus\n\
+         D0  opus     (unset)  → deepseek-v4-pro[1m]\n\
+         D0  sonnet   (unset)  → deepseek-flash[1m]\n\
+         D0  haiku    (unset)  → deepseek-flash[1m]\n\
+         D0  fable    (unset)  → deepseek-v4-pro[1m]\n\
+         5 rows on 1 account. run `tollgate presets rebind D0 --yes` to apply.\n",
+    );
+}
+
+/// `--yes` writes the offered rows and pins the exact success line.
+#[test]
+fn the_yes_rebind_writes_and_pins_its_stdout() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out,
+        "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+    );
+
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(d0.models.default.as_deref(), Some("opus"));
+    assert_eq!(d0.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(ds1.models.default.as_deref(), Some("opus"));
+}
+
+/// The hint and apply lines, singular-aware, pinned by equality.
+#[test]
+fn the_rebind_summary_and_applied_lines_are_pinned() {
+    assert_eq!(
+        rebind_summary_line(61, 13, &[]),
+        "61 rows on 13 accounts. run `tollgate presets rebind --yes` to apply."
+    );
+    assert_eq!(
+        rebind_summary_line(3, 2, &["D1".to_string(), "DS1".to_string()]),
+        "3 rows on 2 accounts. run `tollgate presets rebind D1 DS1 --yes` to apply."
+    );
+    assert_eq!(
+        rebind_applied_line(1, 1),
+        "moved 1 row on 1 account onto the built-in preset models."
+    );
+    assert_eq!(
+        rebind_applied_line(61, 13),
+        "moved 61 rows on 13 accounts onto the built-in preset models."
+    );
+    assert_eq!(
+        REBIND_NOTHING,
+        "every account already uses the built-in preset models."
+    );
+}
+
+/// Unknown names, codex names, and names with nothing to move each bail by
+/// name, and every name is validated before any write.
+#[test]
+fn select_offers_errors_by_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::HomeSandbox;
+    // The codex check reads the codex roster, so the home must be sandboxed.
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    assert!(offers.is_empty(), "a has no endpoint, so nothing to move");
+
+    let err = select_offers(&config, offers.clone(), &["nope".to_string()]).expect_err("unknown");
+    assert_eq!(err.to_string(), "no account named 'nope'");
+
+    let err = select_offers(&config, offers, &["a".to_string()]).expect_err("nothing to move");
+    assert_eq!(err.to_string(), "'a' has no model rows to move");
+}
+
+/// A codex name is refused as what it is, not as missing, with exit 1.
+#[test]
+fn select_offers_refuses_a_codex_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::write_codex_roster;
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster(&["gpt1"]);
+
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    let err = select_offers(&config, offers, &["gpt1".to_string()]).expect_err("codex");
+    assert_eq!(
+        err.to_string(),
+        "'gpt1' is a codex profile; presets rebind is claude-only"
+    );
+}
+
+/// Nothing to do: the whole command prints the quiet line and exits 0.
+#[test]
+fn the_rebind_nothing_to_do_line_is_driven() {
+    use crate::profile::{AppState, Profile, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new("a".to_string(), None, None)).expect("save");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![crate::profile::ProfileName::from("a")],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "every account already uses the built-in preset models.\n"
+    );
+}
+
+/// `--yes` writes only the offered rows through the per-account model write
+/// path, leaving base_url, api key and env byte-identical.
+#[test]
+fn yes_writes_only_the_offered_rows_and_nothing_else() {
+    use crate::profile::{
+        AppState, ModelSettings, Profile, load_config, save_app_state, save_profile,
+    };
+    use crate::testutil::HomeSandbox;
+
+    let _home = HomeSandbox::new();
+    let mut d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    d0.models = ModelSettings::default();
+    d0.env.insert("KEEP".to_string(), "v".to_string());
+    save_profile(&d0).expect("save D0");
+    save_app_state(&AppState {
+        profiles: vec![d0.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("before");
+    let offers = crate::presets::rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    for offer in &offers {
+        let name = crate::profile::ProfileName::from(offer.account.clone());
+        crate::actions::apply_rebind_account(&mut config, &name, &offer.rows).expect("apply");
+    }
+
+    let after = load_config().expect("after");
+    let p = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(p.api_key.as_deref(), Some("sk-key"));
+    assert_eq!(p.env.get("KEEP").map(String::as_str), Some("v"));
+    assert_eq!(p.models.default.as_deref(), Some("opus"));
+    assert_eq!(p.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.sonnet.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.haiku.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.fable.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.subagent, None);
+}
+
+/// A `--yes` failure partway keeps going: the moved line counts every account
+/// that wrote (before and after the failure), then one failure line names the
+/// account. The fault drops `DS1` from the roster between the list and the
+/// apply, so `D0` (first) and `D2` (later) move and `DS1` fails on the fresh
+/// state read — no sleep, no seam.
+#[test]
+fn a_yes_failure_partway_reports_the_moved_rows_then_the_account() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles_three(&_home);
+
+    let mut config = load_config().expect("config");
+    // Drop DS1 from the on-disk roster after the offer list was computed from
+    // the in-memory config; apply re-reads the state, so D0 and D2 move while
+    // DS1 fails.
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("D2")],
+        ..AppState::default()
+    })
+    .expect("drop DS1");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("DS1 dropped mid-run");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        ["re-bind failed for 'DS1': profile not found"],
+        "the failure names the account",
+    );
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "the rows D0 and D2 moved are reported",
+    );
+    let after = load_config().expect("after");
+    assert_eq!(
+        after
+            .find(&ProfileName::from("D2"))
+            .expect("D2")
+            .models
+            .default
+            .as_deref(),
+        Some("opus"),
+        "D2 moved after the failure",
+    );
+}
+
+/// A `--yes` run where every account fails prints no moved line, and one
+/// failure line per failed account in roster order.
+#[test]
+fn a_yes_failure_on_the_first_account_prints_no_moved_line() {
+    use crate::profile::{AppState, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    save_app_state(&AppState::default()).expect("empty roster");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("all accounts dropped");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        [
+            "re-bind failed for 'D0': profile not found",
+            "re-bind failed for 'DS1': profile not found",
+        ],
+        "one failure line per failed account, in roster order",
+    );
+    assert_eq!(partial.moved, "", "no rows moved, so no moved line");
+}
+
+/// The CLI failure keeps the whole cause chain: a profile whose `config.toml`
+/// is a directory fails with the OS reason, not just the outer context. The
+/// later account still moves (keep-going).
+#[test]
+fn the_cli_failure_keeps_the_cause_chain() {
+    use crate::profile::{ProfileName, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    // Replace D0's config.toml with a directory: the fresh read in the apply
+    // fails with the platform's own reason for reading a directory.
+    let cfg_path = crate::profile::profile_dir(&ProfileName::from("D0"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::remove_file(&cfg_path).expect("remove config.toml");
+    std::fs::create_dir(&cfg_path).expect("directory at config.toml");
+    let os_cause = crate::testutil::directory_read_error(&cfg_path);
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("D0 unreadable");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        [format!(
+            "re-bind failed for 'D0': failed to read D0/config.toml: {os_cause}"
+        )],
+        "the failure keeps the OS cause",
+    );
+    assert_eq!(
+        partial.moved, "moved 5 rows on 1 account onto the built-in preset models.\n",
+        "DS1 still moved after D0 failed",
+    );
+}
+
+/// Rows saved to disk before a live-settings re-apply failure still count as
+/// moved: the active account's rows appear in the moved line AND the account
+/// appears in the failure line.
+#[test]
+fn rows_saved_before_a_settings_failure_still_count_as_moved() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+    // Make D0 the active account, then a directory at the live settings.json
+    // fails its re-apply AFTER the config save.
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("D0")),
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("DS1")],
+        ..AppState::default()
+    })
+    .expect("state");
+    let settings = _home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::create_dir(&settings).expect("directory at settings.json");
+    let os_cause = crate::testutil::directory_read_error(&settings);
+
+    let mut config = load_config().expect("config");
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("settings re-apply fails");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "D0's saved rows and DS1's rows both count as moved",
+    );
+    assert_eq!(
+        partial.failures,
+        [format!(
+            "re-bind failed for 'D0': failed to read {}: {os_cause}",
+            settings.display()
+        )],
+        "the failure names D0 with the settings cause",
+    );
+}
+
+/// `--yes` when every offered row was already changed between the offer and the
+/// apply prints the quiet line and exits 0 (nothing moved).
+#[test]
+fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
+    use crate::profile::{Profile, save_profile};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let filled = crate::profile::ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        subagent: None,
+    };
+    // A concurrent writer fills every offered row before the apply re-reads the
+    // fresh profile, so every move is skipped.
+    for name in ["D0", "DS1"] {
+        let mut p = Profile::new(
+            name.to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        );
+        p.models = filled.clone();
+        save_profile(&p).expect("concurrent write");
+    }
+
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out, "every account already uses the built-in preset models.\n",
+        "nothing moved, so the quiet line exits 0",
+    );
+}
+
+/// The CLI login carrier forwards the probe's plan into the snapshot, so a login
+/// whose `/profile` verification ran seeds that body's plan at commit time — the
+/// same seed the TUI's `apply_login` carries, on the one constructor both doors
+/// share. A `plan: None` plant in the carrier reds this. tollgate carries the
+/// probed email on the identity anchor, not on the plan.
+#[test]
+fn the_cli_login_carrier_forwards_the_probe_plan() {
+    use crate::actions::{AnchorAction, capture_snapshot_from_outcome};
+    use crate::oauth_login::LoginOutcome;
+    use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
+    use crate::profile_cache::AccountIdentity;
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let plan = PlanInfo {
+        tier: PlanTier::Max(Some(5)),
+        ..PlanInfo::default()
+    };
+    let identity = AccountIdentity {
+        email: Some("cloudy@example.com".to_string()),
+        ..AccountIdentity::uuid_only(AccountId::from("uuid-new"), 0)
+    };
+    let outcome = LoginOutcome {
+        credentials: ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-new".to_string(),
+                refresh_token: Some("rt-new".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        },
+        identity: Some(identity.clone()),
+        plan: Some(plan),
+    };
+
+    let snapshot = capture_snapshot_from_outcome(outcome);
+
+    let carried = snapshot
+        .plan
+        .expect("the probe's plan rides the CLI snapshot");
+    assert_eq!(
+        carried.tier,
+        PlanTier::Max(Some(5)),
+        "the probe body's exact tier rides to the commit that seeds it"
+    );
+    assert_eq!(
+        snapshot.anchor,
+        AnchorAction::Proven(identity),
+        "and the probed identity, email included, rides it as a proven anchor"
+    );
+}
+
+/// `tollgate login` lands what its round trip produced on the account the login
+/// started for, read after the trip: an account deleted and recreated under the
+/// name, or a name another account took, receives nothing.
+mod a_cli_login_lands_on_its_own_account {
+    use super::*;
+    use crate::profile::{ClaudeCredentials, ConsoleCredential, ConsoleSite, OAuthToken};
+    use crate::testutil::HomeSandbox;
+
+    const INTL: &str = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+
+    fn create(name: &str, base_url: Option<&str>) {
+        crate::actions::create_blank_profile(
+            &mut load_config().expect("config"),
+            name.to_string(),
+            base_url.map(str::to_string),
+            Some("sk-cli".to_string()),
+            None,
+        )
+        .expect("create");
+    }
+
+    fn delete(name: &str) {
+        let name = ProfileName::from(name);
+        let guard = crate::actions::rotation_guard_for_mutation(&name).expect("guard");
+        crate::actions::delete_profile(&mut load_config().expect("config"), &name, false, &guard)
+            .expect("delete");
+    }
+
+    fn stored(name: &str) -> Option<Profile> {
+        load_config()
+            .expect("config")
+            .find(&ProfileName::from(name))
+            .cloned()
+    }
+
+    fn minted() -> crate::actions::CaptureSnapshot {
+        crate::actions::capture_snapshot_from_outcome(crate::oauth_login::LoginOutcome {
+            credentials: ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at-minted".to_string(),
+                    refresh_token: Some("rt-minted".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            },
+            identity: None,
+            plan: None,
+        })
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_trip() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the recreated account refuses the login");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the recreated account holds no login"
+        );
+    }
+
+    #[test]
+    fn a_new_login_refuses_a_name_another_account_took_during_the_trip() {
+        let _home = HomeSandbox::new();
+        let err = capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || {
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the taken name refuses the login");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the account that took the name holds no login"
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_nothing_on_an_account_recreated_on_the_same_front() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        let err = console_login_into(&ProfileName::from("qwen"), None, |_, _| {
+            delete("qwen");
+            create("qwen", Some(INTL));
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site: ConsoleSite::International,
+                    region: "ap-southeast-1".to_string(),
+                },
+            })
+        })
+        .expect_err("the recreated account refuses the session");
+        assert_eq!(err.to_string(), "profile 'qwen' no longer exists");
+        assert!(
+            stored("qwen").is_some_and(|p| p.console.is_none()),
+            "the recreated account holds no console session"
+        );
+    }
+
+    const SETUP_TOKEN: &str = "sk-ant-oat01-n24-setup";
+
+    fn holds_setup_token(name: &str) -> bool {
+        claude::session_token_status(&ProfileName::from(name)).is_some()
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_paste() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || {
+                delete("work");
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the recreated account refuses the token");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the recreated account holds no long-lived token"
+        );
+    }
+
+    #[test]
+    fn a_setup_token_for_a_new_name_refuses_a_name_another_account_took_during_the_paste() {
+        let _home = HomeSandbox::new();
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            false,
+            None,
+            || Ok(true),
+            || {
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the taken name refuses the token");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the account that took the name holds no long-lived token"
+        );
+    }
+
+    // ── nothing moved during the trip: each seam lands ──────────────────────
+
+    #[test]
+    fn a_reauth_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_login_creates_the_account() {
+        let _home = HomeSandbox::new();
+        capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || Ok(minted()),
+        )
+        .expect("the create lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), None, |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.console.map(|c| c.token)),
+            Some("intl-token".to_string())
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_on_the_account_it_started_for_and_on_a_new_name() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands on the existing account");
+        assert!(holds_setup_token("work"));
+
+        setup_token_into(
+            &ProfileName::from("fresh"),
+            false,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token creates the new account");
+        assert!(holds_setup_token("fresh"));
+    }
+
+    // ── a declined login lands nothing ──────────────────────────────────────
+    // A login claims its account as it starts, minting an id into an account
+    // that has none. Declined at the confirm, it never runs the trip, lands no
+    // credential, and changes nothing in `config.toml` but that id.
+
+    /// Drops `name`'s id: the state an account an older tollgate created is in
+    /// until a login claims one. Returns its `config.toml` path.
+    fn strip_id(name: &str) -> std::path::PathBuf {
+        let path = profile::profile_dir(&ProfileName::from(name))
+            .expect("dir")
+            .join("config.toml");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(&path, without_id(&raw)).expect("strip");
+        path
+    }
+
+    fn without_id(raw: &str) -> String {
+        let id_line = raw
+            .lines()
+            .find(|l| l.starts_with("id = "))
+            .expect("an id")
+            .to_string();
+        raw.replacen(&format!("{id_line}\n"), "", 1)
+    }
+
+    #[test]
+    fn a_declined_reauth_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(false),
+            |_| panic!("a declined login never opens the browser"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(stored("work").is_some_and(|p| p.credentials.is_none()));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    #[test]
+    fn a_declined_setup_token_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(false),
+            || panic!("a declined capture never reads a token"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(!holds_setup_token("work"));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    // ── the y/N prompt is a wait too ────────────────────────────────────────
+    // The login names its account when the prompt opens, so an account
+    // recreated or renamed in while the operator reads it receives nothing.
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the login started for the old work must not land on the recreated one"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "the setup token must not land on the recreated work"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                let other = ProfileName::from("other");
+                let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+                crate::actions::rename_profile(
+                    &mut load_config().expect("config"),
+                    &other,
+                    &ProfileName::from("work"),
+                    &guard,
+                )
+                .expect("rename");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// An account an older tollgate created has no id until the login starts
+    /// and mints one. The account recreated during the prompt carries another,
+    /// so the write refuses and nothing lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_refuses_one_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the recreated account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// The same id-less account with nothing moved: the login mints its id as
+    /// it starts and lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_mints_its_id_and_lands() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .any(|l| l.starts_with("id = ")),
+            "the id the login minted stays"
+        );
+    }
+
+    // ── an account with no id yet is claimed before the prompt too ──────────
+    // An account an older tollgate created has no id until a login claims one.
+    // The claim mints it when the login starts, so a rename-in during the
+    // prompt meets an account holding another id, or none, and lands nothing.
+
+    fn rename_other_into_work() {
+        delete("work");
+        let other = ProfileName::from("other");
+        let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+        crate::actions::rename_profile(
+            &mut load_config().expect("config"),
+            &other,
+            &ProfileName::from("work"),
+            &guard,
+        )
+        .expect("rename");
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                rename_other_into_work();
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in id-less account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                rename_other_into_work();
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "a renamed-in id-less account must not receive the setup token"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// Another login starting on the same account during the prompt claims
+    /// the id this one already holds: the same account, so this one lands.
+    #[test]
+    fn a_sibling_claim_during_the_prompt_leaves_the_login_landing() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                profile::claim_profile_id(&ProfileName::from("work")).expect("sibling claim");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        )
+        .expect("the same account lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    /// An account dropped from the roster during the prompt while its
+    /// directory stays is no account: the token lands nowhere, so a later
+    /// create under the name inherits nothing.
+    #[test]
+    fn a_setup_token_never_lands_in_a_directory_dropped_from_the_roster() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("keep", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                let mut state = crate::profile::load_app_state().expect("state");
+                state.profiles.retain(|n| n.as_str() != "work");
+                crate::profile::save_app_state(&state).expect("save");
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+        assert!(!holds_setup_token("work"), "nothing landed in the orphan");
+        create("work", None);
+        assert!(
+            !holds_setup_token("work"),
+            "the account created later inherits no token"
+        );
+    }
+
+    // ── an api re-key keeps the chain the account holds when it lands ───────
+    // The re-key installs no login: the OAuth pair stays the account's own,
+    // read when the write lands, never one read before the login's waits.
+
+    fn pair(refresh: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("at-{refresh}"),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn give_pair(name: &str, refresh: &str) {
+        let mut p = profile::load_profile(&ProfileName::from(name)).expect("load");
+        p.credentials = Some(pair(refresh));
+        profile::save_profile(&p).expect("save");
+    }
+
+    fn api_rekey(claimed: &Profile) -> Result<actions::CaptureSnapshot> {
+        collect_api_reauth_snapshot(
+            Some("https://api.deepseek.com/anthropic"),
+            Some("sk-rekey"),
+            Some(claimed),
+            false,
+        )
+    }
+
+    /// The account renamed in after the command read its config keeps its own
+    /// chain: the previous account's pair never rides the re-key onto it.
+    #[test]
+    fn an_api_rekey_never_carries_another_accounts_chain_onto_a_renamed_in_account() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        give_pair("work", "rt-A");
+        give_pair("other", "rt-O");
+        rename_other_into_work();
+        reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("the re-key lands on the account it claimed");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-O".to_string()),
+            "the renamed-in account keeps its own chain"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-O".to_string()),
+            "its whole pair"
+        );
+    }
+
+    /// A rotation landing while the prompt is open leaves the fresh pair in
+    /// place: the re-key never writes back the pair the rotation spent.
+    #[test]
+    fn an_api_rekey_keeps_a_pair_rotated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        give_pair("work", "rt-A");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                give_pair("work", "rt-B");
+                Ok(true)
+            },
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-B".to_string()),
+            "the rotated pair survives the re-key"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-B".to_string()),
+            "its whole pair"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.api_key),
+            Some("sk-rekey".to_string()),
+            "and the re-key itself landed"
+        );
+    }
+
+    // ── after the claim, everything reads the claimed account ───────────────
+
+    /// `--model` lands with the login, on the account the login claimed.
+    #[test]
+    fn a_reauth_lands_its_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        reauth_profile(
+            &ProfileName::from("work"),
+            Some("opus"),
+            |_| Ok(true),
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+    }
+
+    /// The console and setup-token arms land `--model` on the claimed account
+    /// the same way.
+    #[test]
+    fn the_console_and_setup_token_arms_land_their_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), Some("opus"), |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            Some("sonnet"),
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("sonnet".to_string())
+        );
+    }
+
+    /// The model write after a landing is its own id-checked write: an account
+    /// renamed in between keeps its own endpoint, key and model.
+    #[test]
+    fn a_model_never_lands_on_an_account_renamed_in_after_the_login_landed() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        let account = crate::testutil::profile_id("work");
+        let mut landed = reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("lands")
+            .expect("confirmed");
+        rename_other_into_work();
+        let err = crate::actions::set_profile_default_model(
+            &mut landed,
+            &ProfileName::from("work"),
+            &account,
+            "opus",
+        )
+        .expect_err("the renamed-in account refuses the model");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert_eq!(
+            stored("work").map(|p| (p.base_url, p.api_key, p.models.default)),
+            Some((
+                Some("https://b.example/anthropic".to_string()),
+                Some("sk-cli".to_string()),
+                None
+            )),
+            "the renamed-in account keeps its own endpoint, key and model"
+        );
+    }
+
+    /// A headless re-key reuses the stored endpoint of the account the login
+    /// claimed, read after the claim: one renamed in before it keeps its own.
+    #[test]
+    fn a_headless_rekey_reuses_the_claimed_accounts_endpoint() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        rename_other_into_work();
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |claimed| collect_api_reauth_snapshot(None, Some("sk-rekey"), Some(claimed), false),
+        )
+        .expect("lands")
+        .expect("confirmed");
+        assert_eq!(
+            stored("work").and_then(|p| p.base_url),
+            Some("https://b.example/anthropic".to_string()),
+            "the re-key keeps the claimed account's own endpoint"
+        );
     }
 }

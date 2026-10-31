@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 — 2026-10-31
+
+### Upstream port
+
+- Ported upstream `0336e802..d01f99cb` (428 commits) onto tollgate. The highlights:
+  - **TUI:** paging everywhere, focusable tokens cards, alt-digit tab jumps that keep edits, quit on a second ctrl+c, the live chip split into own sessions and delegates, tps and peak speed on the header, tokens and usage tabs, codex accounts on setup and usage, picking claude or codex when creating an account, a warning before a switch or quit drops unsaved edits, and `e` from an Overview row to its setup editor.
+  - **Daemon:** the session bridge and push routes, the background hold for delegates, the bare macOS Keychain item settle, credit-refusal tracking that walks a session home once a turn lands, and the usage probe.
+  - **Plugin:** the plugin's `register.ts` hooks module, beside the command hooks.
+- Kept out, as in earlier ports: the Services tab, the shunt editor and pool admin, gateway client tokens, proxies, the clawd mascot, and self-update.
+- Upstream's write and kill sites were checked against guest mode while `~/.clauth` exists. 58 new gates and 47 kept ones each have a test, including a guest stand-down in `register.ts`, which in a guest session also skips the profile note. In guest mode a phone's terminal attach no longer takes over the pane, so tollgate yields it to upstream's daemon. The herdr pane routes and the session-keyed herdr fallback stay open in guest mode, as before.
+- tollgate kept its own behaviour where upstream diverged: the native Plugin tab, monitors and the observation model, the walk order and the 30-minute walk dwell, the strict note editor, and the hidden Overview harness filter.
+- The CLI's ASCII-only rule comes over from upstream. tollgate's usage card layer, which the TUI and `tollgate usage` share, keeps its marks. The fallback reasons now read `>=`, and a usage message cut for `--json`, the local API or MCP now ends in `...`.
+
 ## 0.4.4 — 2026-10-22
 
 ### Usage and monitors

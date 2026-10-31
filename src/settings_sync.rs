@@ -9,7 +9,8 @@
 //!
 //! This module reconciles the same member set the credentials watchdog already
 //! ticks: the operator's `~/.claude/settings.json` plus every SHARED profile
-//! runtime copy. Newest parseable copy wins for the shared fields; each member
+//! runtime copy. The highest-ranked member — each ranks by the mtime of the
+//! Claude Code write its bytes carry — wins for the shared fields; each member
 //! keeps its own per-profile fields ([`key_role`]). The merge machinery is
 //! [`crate::jsonsync`], shared with the `.claude.json` reconciler.
 //!
@@ -42,7 +43,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -84,9 +84,9 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "model",
 ];
 
-/// Newest mtime from the last [`sync_once`] that did work; the key for
+/// The stat snapshot from the last [`sync_once`] that did work; the key for
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
-static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
+static LAST_SYNCED: Mutex<Option<Vec<crate::jsonsync::MemberSnapshot>>> = Mutex::new(None);
 
 /// Latch for [`warn_paused`], so the pause is reported once rather than on every
 /// watchdog tick. Cleared by the next clean [`per_profile_env_keys`] read.
@@ -204,20 +204,38 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     // can never become a member (a codex home matches no `runtime*` stem) —
     // so a codex `[env]` can neither join the union nor, unparseable, pause a
     // claude-only sync.
-    let codex = match crate::codex_profiles::CodexState::load() {
+    let codex = match crate::codex_profiles::CodexState::load_with_position() {
         Ok(state) => {
             CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
             state
         }
-        Err(e) => {
+        Err(err) => {
             if !CODEX_ROSTER_WARNED.swap(true, Ordering::Relaxed) {
                 let path = tollgate_dir().ok()?.join("codex-profiles.toml");
-                logline!(
-                    "tollgate: {} did not yield the codex roster ({}); settings.json sync \
-                     reads every profile dir as claude until it reads cleanly",
-                    path.display(),
-                    e.root_cause()
-                );
+                match err {
+                    crate::codex_profiles::CodexRosterError::Parse(pos) => {
+                        let head = crate::format::parse_refusal(
+                            format!(
+                                "tollgate: {} did not yield the codex roster",
+                                path.display()
+                            ),
+                            pos,
+                        );
+                        logline!(
+                            "{head}; settings.json sync reads every profile dir as claude until \
+                             it reads cleanly"
+                        );
+                    }
+                    crate::codex_profiles::CodexRosterError::Read(e) => {
+                        logline!(
+                            "tollgate: {} did not yield the codex roster ({}); settings.json sync \
+                             reads every profile dir as claude until it reads cleanly",
+                            path.display(),
+                            e.root_cause()
+                        );
+                    }
+                    crate::codex_profiles::CodexRosterError::NoHome(_) => {}
+                }
             }
             crate::codex_profiles::CodexState::default()
         }
@@ -256,7 +274,14 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         };
         match toml::from_str::<EnvOnlyConfig>(&raw) {
             Ok(config) => keys.extend(config.env.into_keys()),
-            Err(e) => return warn_paused(&path, &format!("is not valid TOML ({e})")),
+            Err(e) => {
+                let reason = crate::format::parse_refusal(
+                    "is not valid TOML",
+                    crate::format::toml_parse_position(&raw, &e),
+                )
+                .to_string();
+                return warn_paused(&path, &reason);
+            }
         }
     }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
@@ -268,8 +293,8 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
 fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
-            "tollgate: settings.json sync paused — {} {reason}; \
-             the affected profiles' custom [env] keys are unknown, so no \
+            "tollgate: settings.json sync paused: {} {reason}. \
+             The affected profiles' custom [env] keys are unknown, so no \
              settings are synced until it reads cleanly",
             path.display()
         );
@@ -277,12 +302,17 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     None
 }
 
-/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` mtime
+/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` stat
 /// fast path in [`crate::jsonsync::run_with_cache`].
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
     crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || sync_members(&paths))
 }
+
+/// The written-copy record for `settings.json`, persisted under the same state
+/// flock the merge holds in [`sync_members`] — tollgate's own echoes never
+/// outrank a real Claude Code write.
+const SETTINGS_SYNC_WRITTEN_FILENAME: &str = ".settings-sync-written.json";
 
 /// Merge the members under the cross-process state flock. Returns whether the
 /// merge ran (`false` = paused on an unreadable `config.toml`).
@@ -309,11 +339,12 @@ pub(crate) fn sync_once() -> Result<()> {
 /// `settings.json` reads, parses, and writes.
 fn sync_members(paths: &[PathBuf]) -> Result<bool> {
     let operator_file = claude_dir()?.join("settings.json");
+    let record = tollgate_dir()?.join(SETTINGS_SYNC_WRITTEN_FILENAME);
     with_state_lock(|_held| {
         let Some(custom_env) = per_profile_env_keys() else {
             return Ok(false);
         };
-        crate::jsonsync::sync_paths(paths, Some(&operator_file), |path| {
+        crate::jsonsync::sync_paths(paths, Some(&operator_file), Some(&record), |path| {
             key_role(path, &custom_env)
         })?;
         Ok(true)

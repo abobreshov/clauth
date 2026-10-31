@@ -13,6 +13,7 @@
 //! [`crate::profile::set_home_override`] so real files are never touched.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -33,7 +34,8 @@ use crate::usage::{
 #[test]
 #[ignore = "interactive TUI; run with `cargo test showcase -- --ignored --nocapture` in a real terminal"]
 fn showcase() {
-    run(demo_config()).expect("showcase loop");
+    let (config, readings) = demo_config();
+    run(config, readings).expect("showcase loop");
 }
 
 /// Redirect home into a tempdir so all disk ops land on scratch space.
@@ -185,18 +187,22 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
 }
 
 /// Same as [`super::run`] but with home redirected into a tempdir.
-fn run(config: AppConfig) -> Result<()> {
+fn run(config: AppConfig, readings: DemoReadings) -> Result<()> {
     let _home = ShowcaseHome::new();
     let mut terminal = ratatui::try_init()?;
-    let outcome = showcase_loop(&mut terminal, config);
+    let outcome = showcase_loop(&mut terminal, config, &readings);
     ratatui::restore();
     outcome
 }
 
 /// Real event loop without startup reconciliation — no bootstrap/scheduler spawns.
-fn showcase_loop(terminal: &mut ratatui::DefaultTerminal, config: AppConfig) -> Result<()> {
+fn showcase_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    config: AppConfig,
+    readings: &DemoReadings,
+) -> Result<()> {
     let mut application = app::App::new(config);
-    seed_usage(&application);
+    seed_usage(&application, readings);
     seed_timers(&application);
     seed_history(&application);
     let mut last_tick = Instant::now();
@@ -270,7 +276,7 @@ fn oauth_profile(
     extra: Option<ExtraUsage>,
     spend: Option<SpendInfo>,
     fetch_status: Option<FetchStatus>,
-) -> Profile {
+) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) {
     let five_hour = Some(UsageWindow {
         utilization: five_util,
         resets_at: five_resets_in.map(future_iso),
@@ -285,61 +291,83 @@ fn oauth_profile(
             },
         })
         .collect();
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
-            plan: Some(PlanInfo {
-                tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
-                subscription_status: None,
-                codex_plan: None,
-            }),
-            five_hour,
-            seven_day: None,
-            weekly_scoped,
-            window_dollars: Vec::new(),
-            extra_usage: extra,
-            spend,
-            codex_limit_reached: None,
-            codex_reset_credits: None,
-            codex_credits: None,
-            codex_spend_control_reached: None,
-            codex_additional_windows: Vec::new(),
-            open_at: None,
-            fetched_at: None,
+    let usage = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+            subscription_status: None,
+            codex_plan: None,
         }),
+        five_hour,
+        seven_day: None,
+        monthly: None,
+        weekly_scoped,
+        window_dollars: Vec::new(),
+        extra_usage: extra,
+        spend,
+        codex_limit_reached: None,
+        codex_reset_credits: None,
+        codex_credits: None,
+        codex_spend_control_reached: None,
+        codex_additional_windows: Vec::new(),
+        open_at: None,
+        fetched_at: None,
+    };
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            check_credit_cap: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            // A login puts the demo account on the OAuth fetch leg, so the
+            // Overview counts down to its refresh instead of marking its bars
+            // as a cached reading nothing polls.
+            credentials: Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "demo".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: Some(plan_type.into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            }),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
+            provider: None,
+        },
+        Some(usage),
         fetch_status,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+    )
 }
 
-fn api_profile(name: &str) -> Profile {
-    Profile {
+fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) {
+    let profile = Profile {
         name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some(
             "sk-ant-api03-demo0000000000000000000000000000000000000000000000".to_string(),
         ),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -351,48 +379,55 @@ fn api_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+    };
+    (profile, None, None)
 }
 
-fn failed_profile(name: &str) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: Some(90.0),
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: Some(FetchStatus::Failed),
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: Some(90.0),
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            check_credit_cap: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
+            provider: None,
+        },
+        None,
+        Some(FetchStatus::Failed),
+    )
 }
 
-fn demo_config() -> AppConfig {
+fn demo_config() -> (AppConfig, DemoReadings) {
     let max20 = oauth_profile(
         "personal",
         "claude_max",
@@ -443,7 +478,7 @@ fn demo_config() -> AppConfig {
             percent: Some(32.0),
             currency: Some("USD".to_string()),
         }),
-        Some(FetchStatus::Cached), // cached → warning underline
+        Some(FetchStatus::Cached), // cached → warning refresh countdown
     );
 
     let pro = oauth_profile(
@@ -477,41 +512,54 @@ fn demo_config() -> AppConfig {
     .map(|s| (*s).into())
     .collect();
 
-    AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("personal".into()),
             profiles: names,
             fallback_chain: vec!["personal".into(), "work".into(), "side-project".into()],
             ..AppState::default()
         },
-        profiles: vec![max20, max5, pro, api, stale],
+        profiles: vec![
+            max20.0.clone(),
+            max5.0.clone(),
+            pro.0.clone(),
+            api.0.clone(),
+            stale.0.clone(),
+        ],
+    };
+    let mut readings = DemoReadings::default();
+    for (profile, usage, status) in [max20, max5, pro, api, stale] {
+        if let Some(u) = usage {
+            readings.usage.insert(profile.name.to_string(), u);
+        }
+        if let Some(s) = status {
+            readings.status.insert(profile.name.to_string(), s);
+        }
     }
+    (config, readings)
+}
+
+/// The demo readings the profile builders produced, kept beside the config so
+/// `seed_usage` can push them into the live stores the frame snapshot reads.
+#[derive(Default)]
+struct DemoReadings {
+    usage: HashMap<String, UsageInfo>,
+    status: HashMap<String, FetchStatus>,
 }
 
 // ── Seeding ─────────────────────────────────────────────────────────────────
 
 /// Seed the live usage stores from demo profile data, as a real fetch worker would.
 /// Without this, the first `on_tick` → `apply_usage` blanks all windows to `-`.
-fn seed_usage(application: &app::App) {
-    let snapshot: Vec<(String, Option<UsageInfo>, Option<FetchStatus>)> = {
-        let cfg = application.config();
-        cfg.profiles
-            .iter()
-            .map(|p| (p.name.to_string(), p.usage.clone(), p.fetch_status))
-            .collect()
-    };
+fn seed_usage(application: &app::App, readings: &DemoReadings) {
     if let Ok(mut store) = application.usage_store.lock() {
-        for (name, usage, _) in &snapshot {
-            if let Some(u) = usage {
-                store.insert(name.clone(), u.clone());
-            }
+        for (name, usage) in &readings.usage {
+            store.insert(name.clone(), usage.clone());
         }
     }
     if let Ok(mut status) = application.usage_status.lock() {
-        for (name, _, fetch_status) in &snapshot {
-            if let Some(s) = fetch_status {
-                status.insert(name.clone(), *s);
-            }
+        for (name, s) in &readings.status {
+            status.insert(name.clone(), *s);
         }
     }
 }
@@ -555,7 +603,7 @@ fn seed_history(application: &app::App) {
 
 #[test]
 fn demo_config_has_expected_profiles() {
-    let cfg = demo_config();
+    let (cfg, readings) = demo_config();
     assert_eq!(cfg.profiles.len(), 5);
     assert_eq!(cfg.state.active_profile.as_deref(), Some("personal"));
     assert_eq!(cfg.state.fallback_chain.len(), 3);
@@ -565,9 +613,10 @@ fn demo_config_has_expected_profiles() {
 
     let work = cfg.profiles.iter().find(|p| p.name == "work");
     assert!(work.is_some_and(|p| {
-        p.fetch_status == Some(FetchStatus::Cached)
-            && p.usage
-                .as_ref()
+        readings.status.get(&p.name.to_string()) == Some(&FetchStatus::Cached)
+            && readings
+                .usage
+                .get(&p.name.to_string())
                 .and_then(|u| u.extra_usage.as_ref())
                 .is_some_and(|e| e.is_enabled)
     }));
@@ -576,9 +625,10 @@ fn demo_config_has_expected_profiles() {
     assert!(api.is_some_and(|p| !p.is_oauth()));
 
     let failed = cfg.profiles.iter().find(|p| p.name == "research");
-    assert!(
-        failed.is_some_and(|p| p.fetch_status == Some(FetchStatus::Failed) && p.usage.is_none())
-    );
+    assert!(failed.is_some_and(|p| {
+        readings.status.get(&p.name.to_string()) == Some(&FetchStatus::Failed)
+            && !readings.usage.contains_key(&p.name.to_string())
+    }));
 }
 
 #[test]
@@ -592,8 +642,9 @@ fn future_iso_parses() {
 #[test]
 fn seed_history_yields_burn_rates() {
     let _home = ShowcaseHome::new();
-    let app = app::App::new(demo_config());
-    seed_usage(&app);
+    let (config, readings) = demo_config();
+    let app = app::App::new(config);
+    seed_usage(&app, &readings);
     seed_history(&app);
 
     let personal = app.history_cache.get("personal").unwrap();
@@ -621,8 +672,9 @@ fn headless_showcase_renders() {
     // RankedMutex is ever held while taking HOME_TEST_LOCK, now the outermost
     // rank — the lock-order check enforces that ordering.
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
-    seed_usage(&app);
+    let (config, readings) = demo_config();
+    let mut app = app::App::new(config);
+    seed_usage(&app, &readings);
     seed_timers(&app);
     seed_history(&app);
 
@@ -662,6 +714,16 @@ fn headless_showcase_renders() {
         overview.contains("work"),
         "second profile row renders in the overview list"
     );
+    // The demo's Claude Code accounts are logged in, so no row marks its bars
+    // as a cached reading nothing polls (the README screenshot shows these).
+    for name in ["personal", "work", "side-project"] {
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("the {name} row renders"));
+        assert!(!row.contains('⋯'), "{name} is polled, not marked: {row}");
+    }
     // Tab-bar labels render (lowercase, un-truncated at 120w); `setup`/`config`
     // are tab-only words on the overview surface, so finding them proves the bar.
     assert!(
@@ -695,7 +757,7 @@ fn headless_showcase_renders() {
 
     // Select the profile carrying a populated spend cap. Real accounts return it
     // disabled, so the demo is the only place the guarded spend bar is observable.
-    app.profile_cursor = 1; // personal → work
+    app.profile_cursor.set(1); // personal → work
     term.draw(|f| render::draw(f, &app)).unwrap();
     let work_usage = flatten(&term);
     assert!(
@@ -786,10 +848,10 @@ fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
 #[test]
 fn demo_data_drives_all_actions() {
     let _home = ShowcaseHome::new();
-    let config = demo_config();
+    let (config, readings) = demo_config();
     crate::profile::save_app_state(&config.state).expect("persist state");
     let mut app = app::App::new(config);
-    seed_usage(&app);
+    seed_usage(&app, &readings);
     seed_timers(&app);
     seed_history(&app);
 
@@ -862,20 +924,15 @@ fn demo_data_drives_all_actions() {
         a.config().state.active_profile.as_deref() == Some("work")
     });
 
-    // Seeded usage windows must survive on_tick → apply_usage during the switch.
-    {
-        let cfg = app.config();
-        let util = cfg
-            .find(&crate::profile::ProfileName::from("personal"))
-            .and_then(|p| p.usage.as_ref())
+    // Seeded usage windows must survive the switch's ticks into what a frame reads.
+    assert_eq!(
+        app.readings_snapshot()
+            .usage_of("personal")
             .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization);
-        assert_eq!(
-            util,
-            Some(64.3),
-            "seeded 5h utilization must survive on_tick → apply_usage"
-        );
-    }
+            .map(|w| w.utilization),
+        Some(64.3),
+        "seeded 5h utilization must survive into the frame's readings after the switch"
+    );
 
     // State file written to the tempdir, not the real home.
     assert!(
@@ -888,7 +945,11 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right); // Usage → Tokens
     press(&mut app, KeyCode::Right); // Tokens → Setup
     assert_eq!(app.tab, Tab::Setup);
-    assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "cursor carried over from the switch"
+    );
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
@@ -1012,6 +1073,8 @@ fn demo_data_drives_all_actions() {
         "first ⏎ arms the delete row"
     );
     press(&mut app, KeyCode::Enter); // confirm
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(app.profile_count(), before - 1, "delete drops one profile");
     assert!(
         app.config()
@@ -1024,12 +1087,13 @@ fn demo_data_drives_all_actions() {
     let before = app.profile_count();
     // Navigate to the + new row (last slot in Setup list)
     press(&mut app, KeyCode::Down); // 4 → end ("+ new")
-    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on Name)
+    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on the `type` row)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
 
     // Fill the create form: Name, BaseUrl, ApiKey
-    // Cursor starts on first row (Name)
+    // The first row is `type`; step down onto Name.
+    press(&mut app, KeyCode::Down); // type → Name
     press(&mut app, KeyCode::Enter); // start capturing Name
     type_str(&mut app, "sandbox-test");
     press(&mut app, KeyCode::Enter); // commit Name
@@ -1099,6 +1163,8 @@ fn demo_data_drives_all_actions() {
             .is_some_and(|d| d.armed_action == Some(app::ConfigRow::Delete))
     );
     press(&mut app, KeyCode::Enter); // confirm delete
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(
         app.profile_count(),
         before - 1,
@@ -1125,7 +1191,7 @@ fn demo_data_drives_all_actions() {
         );
 
         // Burn rates should compute from the seeded history after apply_usage
-        // (the first on_tick calls apply_usage which populates profile.usage
+        // (the first on_tick calls apply_usage which populates the snapshot
         // from usage_store, which was seeded in seed_usage).
     }
 
@@ -1142,13 +1208,13 @@ fn demo_data_drives_all_actions() {
 
     // ── Quit ──
     press(&mut app, KeyCode::Char('q'));
-    assert!(app.armed_quit, "first q arms the quit");
+    assert!(app.armed_quit.is_some(), "first q arms the quit");
     assert!(!app.quit, "first q does not quit yet");
     assert!(app.footer_alert.is_some(), "first q sets a footer alert");
 
     // any non-q key disarms the alert (Esc at top level is a no-op but still disarms)
     press(&mut app, KeyCode::Esc);
-    assert!(!app.armed_quit, "unhandled key disarms quit");
+    assert!(app.armed_quit.is_none(), "unhandled key disarms quit");
     assert!(app.footer_alert.is_none(), "disarm clears footer alert");
 
     // x dismisses the alert directly when no toasts are queued
@@ -1157,7 +1223,7 @@ fn demo_data_drives_all_actions() {
     assert!(app.footer_alert.is_some(), "re-arm sets alert");
     press(&mut app, KeyCode::Char('x'));
     assert!(app.footer_alert.is_none(), "x dismisses the footer alert");
-    assert!(!app.armed_quit, "x also disarms quit");
+    assert!(app.armed_quit.is_none(), "x also disarms quit");
 
     press(&mut app, KeyCode::Char('q'));
     press(&mut app, KeyCode::Char('q'));
@@ -1172,7 +1238,7 @@ fn demo_data_drives_all_actions() {
 fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
     use app::Tab;
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
+    let mut app = app::App::new(demo_config().0);
 
     assert_eq!(app.tab, Tab::Overview);
     press(&mut app, KeyCode::Tab);
@@ -1205,7 +1271,7 @@ fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
 fn tab_key_does_not_leak_past_modal_or_field_capture() {
     use app::Tab;
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
+    let mut app = app::App::new(demo_config().0);
 
     // ── Setup field capture: Tab/BackTab must stay inert, not switch tabs ──
     press(&mut app, KeyCode::Tab); // Overview → Usage
@@ -1291,7 +1357,7 @@ fn config_reset_rows_cycle_and_persist_with_the_clock_row_gated() {
     use crate::profile::{ClockFormat, ResetDisplay};
     use app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
+    let mut app = app::App::new(demo_config().0);
     app.tab = Tab::Config;
 
     let cursor_to = |app: &mut app::App, row: GlobalConfigRow| {

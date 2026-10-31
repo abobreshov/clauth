@@ -19,7 +19,7 @@ pub(crate) enum DivergenceChoice {
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{FetchStatus, UsageInfo, WalletSample};
+use crate::usage::{UsageInfo, WalletSample};
 
 /// A slot that reads like its inner value but writes only through the
 /// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
@@ -343,6 +343,15 @@ pub(crate) struct Profile {
     pub(crate) api_key: Option<String>,
     /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
     pub(crate) auto_start: bool,
+    /// Opt-in usage probe for an account `/usage` cannot read: a
+    /// `claude setup-token` login with no OAuth pair stored. A 1-token Haiku
+    /// message every [`Profile::usage_probe_interval_ms`], read for the usage
+    /// its response headers carry; it may start the 5h window. Inert while a
+    /// pair is stored, since `/usage` reads that account.
+    pub(crate) usage_probe: bool,
+    /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
+    /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
+    pub(crate) usage_probe_interval_ms: u64,
     /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
     pub(crate) env: BTreeMap<String, String>,
     /// Per-account Claude Code model configuration, written into this profile's
@@ -405,6 +414,10 @@ pub(crate) struct Profile {
     /// windows are ignored here: the account stays in rotation for use with
     /// other models. Default on.
     pub(crate) check_scoped: bool,
+    /// Whether auto-switching checks this account's usage-credit cap
+    /// (fallback chain only). On, a spent cap keeps this account out of the
+    /// walk's target passes; off, the cap is ignored there. Default on.
+    pub(crate) check_credit_cap: bool,
     /// 5h utilization % at/above which the alert fires: the TUI toast and the
     /// daemon's `bell_command`.
     /// None = no alert for this profile.
@@ -421,19 +434,37 @@ pub(crate) struct Profile {
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
-    pub(crate) usage: Option<UsageInfo>,
-    pub(crate) fetch_status: Option<FetchStatus>,
-    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
-    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the same age
-    /// source `status.json`'s `stale` arm reads (the body's `fetched_at` for
-    /// OAuth, the cache mtime for third-party), keyed to the live refresh
-    /// interval; a fact orthogonal to `fetch_status`, so a `cached` pill and
-    /// this cue can coexist.
-    pub(crate) usage_stale: bool,
+    /// Recorded at load: the profile's `session-token.json` sidecar holds a
+    /// genuine long-lived login ([`crate::claude::has_session_token`]). Loaded
+    /// state like `credentials`, never serialized — only the loader reads the
+    /// sidecar, so every walk site reads the fact off this field instead of a
+    /// second per-member disk read. A struct literal / [`Profile::new`] leaves
+    /// it `false` ("no sidecar").
+    pub(crate) has_long_lived_sidecar: bool,
+    /// Recorded at load: the profile's committed `credentials.json` exists but
+    /// cannot be read, and no `.staged`/`.pending` sidecar supplied the pair.
+    /// Loaded state like `has_long_lived_sidecar`, never serialized — the
+    /// account reads logged out while its config and the torn bytes stay on
+    /// disk. Carries the reason so the notice and the refusal can name it
+    /// (parse failure vs the OS read error). A struct literal / [`Profile::new`]
+    /// leaves it `None`.
+    pub(crate) unreadable_credentials_store: Option<UnreadableStoreReason>,
+    /// Recorded at load beside `has_long_lived_sidecar`: the digest of the
+    /// setup token a switch would install from the sidecar, the credential a
+    /// pairless account's sessions run on, so a refused one is matched against
+    /// it with no disk read under the config guard. A re-mint moves the
+    /// sidecar's write time, which reloads every holder. A struct literal /
+    /// [`Profile::new`] leaves it `None`.
+    pub(crate) setup_token_digest: Option<u64>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
-    /// Provider-specific usage data (e.g. DeepSeek balance).
-    pub(crate) third_party_usage: Option<ThirdPartyStats>,
+}
+
+/// The one judgment behind both login reads — [`Profile::holds_login`] over
+/// loaded state and [`stored_login`] over the committed store — so the
+/// two cannot drift apart. Any one of the three facts is a login.
+fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth: bool) -> bool {
+    stored_pair || long_lived_sidecar || inference_auth
 }
 
 impl Profile {
@@ -444,6 +475,8 @@ impl Profile {
             base_url,
             api_key,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
             fallback_threshold: None,
@@ -455,15 +488,15 @@ impl Profile {
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: slot(None),
-            usage: None,
-            fetch_status: None,
-            usage_stale: false,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider,
-            third_party_usage: None,
         }
     }
 
@@ -484,6 +517,24 @@ impl Profile {
     /// [`Profile::routing_endpoint`] for a profile already in hand.
     pub(crate) fn login_is_oauth(&self) -> bool {
         self.credentials.is_some() || self.is_oauth()
+    }
+
+    /// "Holds a login" — the ONE predicate every automatic walk reads to keep
+    /// a login-less member from being linked. A stored OAuth pair (a
+    /// `claude_ai_oauth` block in `credentials`, the shape [`load_profile`]
+    /// puts there), a long-lived `session-token.json` sidecar (recorded on
+    /// [`Profile::has_long_lived_sidecar`] at load), or a usable inference
+    /// credential ([`crate::claude::has_inference_auth`]: an api key or an
+    /// `[env]` inference token). Loaded-state only — no disk read — so a walk
+    /// never re-reads `session-token.json` per member.
+    pub(crate) fn holds_login(&self) -> bool {
+        holds_login_facts(
+            self.credentials
+                .as_ref()
+                .is_some_and(|c| c.claude_ai_oauth.is_some()),
+            self.has_long_lived_sidecar,
+            crate::claude::has_inference_auth(self),
+        )
     }
 
     /// The endpoint a LOADED profile routes its requests to, env half first:
@@ -587,12 +638,14 @@ impl Profile {
 
     /// Replace the stored credential set. Requires the state-flock witness:
     /// the slot is read-modify-written cross-process, so an unlocked write can
-    /// clobber a concurrent rotation.
+    /// clobber a concurrent rotation. Any install or blanking replaces whatever
+    /// bytes the disk held, so the unreadable-store fact clears with it.
     pub(crate) fn set_credentials(
         &mut self,
         credentials: Option<ClaudeCredentials>,
         _held: &StateLockHeld,
     ) {
+        self.unreadable_credentials_store = None;
         self.credentials.set(credentials, _held);
     }
 }
@@ -1091,6 +1144,11 @@ pub(crate) struct AppState {
     /// from the file while at its default.
     #[serde(default, skip_serializing_if = "local_api_is_default")]
     pub(crate) local_api: crate::local_api::LocalApiSettings,
+    /// The built-in bind-table digest the TUI last offered to move accounts
+    /// onto. `None` = never offered, so the next TUI launch with a non-empty
+    /// offer list re-offers. The CLI never reads or writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preset_binds_offered: Option<String>,
 }
 
 fn local_api_is_default(local_api: &crate::local_api::LocalApiSettings) -> bool {
@@ -1247,7 +1305,9 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-fn is_false(b: &bool) -> bool {
+/// `skip_serializing_if` guard: serialize a bool field only when true. Shared
+/// with [`crate::providers::UsageBar`]'s `inference_quota` mark.
+pub(crate) fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -1265,6 +1325,34 @@ pub(crate) const MAX_REFRESH_INTERVAL_MS: u64 = 3_600_000;
 
 fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
+}
+
+/// Default `usage_probe_interval_ms` (90 s).
+pub(crate) const DEFAULT_USAGE_PROBE_INTERVAL_MS: u64 = 90_000;
+
+/// Floor of `usage_probe_interval_ms`. Every probe is an inference request on
+/// the account, so the floor sits well above the usage poll's.
+pub(crate) const MIN_USAGE_PROBE_INTERVAL_MS: u64 = 60_000;
+
+/// Ceiling of `usage_probe_interval_ms`, so a probed account gets a burn rate.
+/// Each landing is stamped up to `interval/4` past the interval, the history
+/// writer bridges every change 1 ms before it, and the burn rate cuts its
+/// series at the last gap between two equal readings longer than
+/// [`crate::usage::BURN_GAP_CUT_MS`]: past that, two points are left, below
+/// [`crate::usage::BURN_MIN_SAMPLES`]. At three quarters of the cut,
+/// `interval + interval/4` stays a sixteenth of it short, room for the tick,
+/// the request slot and the round trip.
+pub(crate) const MAX_USAGE_PROBE_INTERVAL_MS: u64 = crate::usage::BURN_GAP_CUT_MS * 3 / 4;
+const _: () = assert!(
+    MAX_USAGE_PROBE_INTERVAL_MS + MAX_USAGE_PROBE_INTERVAL_MS / 4 < crate::usage::BURN_GAP_CUT_MS
+);
+
+/// A stored probe interval as the profile carries it: absent is the default,
+/// anything outside the band is clamped into it.
+fn usage_probe_interval(stored: Option<u64>) -> u64 {
+    stored.map_or(DEFAULT_USAGE_PROBE_INTERVAL_MS, |ms| {
+        ms.clamp(MIN_USAGE_PROBE_INTERVAL_MS, MAX_USAGE_PROBE_INTERVAL_MS)
+    })
 }
 
 /// Default chain-wide weekly (7d) exhaustion line (percent). Why 98 and not
@@ -1348,6 +1436,7 @@ impl Default for AppState {
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
             local_api: crate::local_api::LocalApiSettings::default(),
+            preset_binds_offered: None,
         }
     }
 }
@@ -1462,7 +1551,7 @@ impl AppConfig {
             return None;
         }
         Some(format!(
-            "{} accounts claim {}: {} — the chain returns to whichever of them reads clear first",
+            "{} accounts claim {}: {}. The chain returns to whichever of them reads clear first",
             names.len(),
             day.to_string().to_ascii_lowercase(),
             names.join(", "),
@@ -1504,7 +1593,7 @@ impl AppConfig {
         // uncarried one has quietly fallen back to the flag.
         let tail = match self.day_listers(day, key_rejected).next() {
             Some(carrier) => format!("'{carrier}' carries it"),
-            None => format!("nothing else claims {named}, so `preferred` decides it"),
+            None => format!("Nothing else claims {named}, so `preferred` decides it"),
         };
         let subject = if blocked.len() == 1 {
             "the list on"
@@ -1512,7 +1601,7 @@ impl AppConfig {
             "the lists on"
         };
         Some(format!(
-            "{named}: {subject} {} cannot claim it — {tail}",
+            "{named}: {subject} {} cannot claim it. {tail}",
             blocked.join(", ")
         ))
     }
@@ -1662,6 +1751,33 @@ impl ModelSettings {
             && self.fable.is_none()
             && self.subagent.is_none()
     }
+
+    /// The stored id for a row named by its settings key (`default`, `opus`,
+    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    pub(crate) fn field(&self, row: &str) -> Option<&String> {
+        match row {
+            "default" => self.default.as_ref(),
+            "opus" => self.opus.as_ref(),
+            "sonnet" => self.sonnet.as_ref(),
+            "haiku" => self.haiku.as_ref(),
+            "fable" => self.fable.as_ref(),
+            "subagent" => self.subagent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Set one row by settings key; an unknown key writes nothing.
+    pub(crate) fn set_field(&mut self, row: &str, value: Option<String>) {
+        match row {
+            "default" => self.default = value,
+            "opus" => self.opus = value,
+            "sonnet" => self.sonnet = value,
+            "haiku" => self.haiku = value,
+            "fable" => self.fable = value,
+            "subagent" => self.subagent = value,
+            _ => {}
+        }
+    }
 }
 
 /// Which Alibaba Model Studio front the console session belongs to. The two
@@ -1744,12 +1860,39 @@ struct ConsoleConfig {
     region: Option<String>,
 }
 
+/// A profile's own identity, apart from its name: random, written as `id` into
+/// its `config.toml` by the create ([`save_new_profile`]), carried by a rename
+/// (the dir moves whole) and gone with a delete. A login names its account by
+/// this at start and lands only where the name still holds it, so an account
+/// deleted and recreated, or renamed into the name, during the wait receives
+/// nothing. The codex roster keys its own the same way.
+///
+/// [`ProfileConfig`] does not model it: the config writers read it off disk
+/// under the flock, so a stale in-memory profile never writes an old one back,
+/// and a writer that renders without it (an older tollgate) carries it as an
+/// unmodelled key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProfileId(String);
+
+impl ProfileId {
+    pub(crate) fn mint() -> Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("CSPRNG failure: {e}"))?;
+        Ok(Self(hex::encode(bytes)))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
     #[serde(default, alias = "kick_timer")]
     auto_start: bool,
+    #[serde(default)]
+    usage_probe: bool,
+    #[serde(default)]
+    usage_probe_interval_ms: Option<u64>,
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
@@ -1784,6 +1927,8 @@ struct ProfileConfig {
     check_weekly: Option<bool>,
     #[serde(default)]
     check_scoped: Option<bool>,
+    #[serde(default)]
+    check_credit_cap: Option<bool>,
     #[serde(default)]
     #[serde(alias = "five_hour_alert_threshold")]
     bell_threshold: Option<f64>,
@@ -1911,6 +2056,12 @@ pub(crate) struct ReloadFingerprint {
     /// milliseconds-scale walk per rolling profile per ~2h — accepted over
     /// giving the fingerprint eyes into credential bytes.
     config_mtimes: Vec<ProfileStamps>,
+    /// `(profile dir name, account_id.json write time, auth.json write time)` —
+    /// the identity files the reload compare keys on, in a SECOND per-name vec so
+    /// the config tuple above keeps its shape. An anchor-only write (a re-anchor)
+    /// or an auth.json-only write (codex rewriting its store in place) flips the
+    /// fingerprint through this.
+    identity_mtimes: Vec<IdentityStamps>,
 }
 
 /// One profile dir's entry in [`ReloadFingerprint::config_mtimes`].
@@ -1921,14 +2072,21 @@ type ProfileStamps = (
     Option<SystemTime>,
 );
 
-/// Filesystem stat of the reload triggers, plus the swap receipt beside a
-/// `session-token.json` that exists — never that file's contents, since this runs
-/// per TUI frame. Holds NO locks — `config` sits high in the rank hierarchy, so
-/// this must stay lock-free — and fails soft: a readdir/stat error contributes
-/// the empty value instead of erroring.
+/// One profile dir's identity-file stamps in
+/// [`ReloadFingerprint::identity_mtimes`]: the anchor and the codex `auth.json`,
+/// each through [`crate::profile_cache::effective_write_time`].
+type IdentityStamps = (String, Option<SystemTime>, Option<SystemTime>);
+
+/// Filesystem stat of the reload triggers, plus the touch receipt beside each
+/// store stamped through [`crate::profile_cache::effective_write_time`] (the
+/// session-token, credentials, anchor and codex-auth files) — never the files'
+/// contents, since this runs per TUI frame. Holds NO locks — `config` sits high
+/// in the rank hierarchy, so this must stay lock-free — and fails soft: a
+/// readdir/stat error contributes the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
     let mut config_mtimes: Vec<ProfileStamps> = Vec::new();
+    let mut identity_mtimes: Vec<IdentityStamps> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -1945,14 +2103,23 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             );
             let store =
                 crate::profile_cache::effective_write_time(&entry.path().join("credentials.json"));
-            config_mtimes.push((name, config_mtime, token, store));
+            let anchor = crate::profile_cache::effective_write_time(
+                &entry
+                    .path()
+                    .join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+            );
+            let auth = crate::profile_cache::effective_write_time(&entry.path().join("auth.json"));
+            config_mtimes.push((name.clone(), config_mtime, token, store));
+            identity_mtimes.push((name, anchor, auth));
         }
     }
     config_mtimes.sort();
+    identity_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
         codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
         config_mtimes,
+        identity_mtimes,
     }
 }
 
@@ -2440,27 +2607,124 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     ))
 }
 
+/// Read a regular file with a hard byte ceiling: stat before open (a FIFO is
+/// refused instead of freezing the open), re-check the opened handle, and
+/// bound the read with `take(cap + 1)`. Returns the UTF-8 text or a plain
+/// detail string (an io error's own Display, "not a regular file", or the cap
+/// refusal) — callers render their own copy around it. Shared by the MCP
+/// prompt reader and the cc-exemption settings reader.
+pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::result::Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let size = meta.len();
+    if size > cap {
+        return Err(format!("{size} bytes over the {cap} byte cap"));
+    }
+    read_validated_handle(file, cap)
+}
+
+/// Read an already-opened, type-checked handle with a hard byte ceiling. A
+/// file can grow past the cap between a size check and the read; `take` bounds
+/// the read to cap + 1, and a read that actually hit the bound is refused
+/// instead of silently truncating. Invalid UTF-8 is refused at the byte
+/// offset, never lossily decoded.
+pub(crate) fn read_validated_handle(
+    file: std::fs::File,
+    cap: u64,
+) -> std::result::Result<String, String> {
+    let mut reader = std::io::Read::take(file, cap + 1);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > cap as usize {
+        return Err(format!("grew past the {cap} byte cap during the read"));
+    }
+    let text = std::str::from_utf8(&buf)
+        .map_err(|e| format!("invalid UTF-8 at byte offset {}", e.valid_up_to()))?;
+    Ok(text.to_string())
+}
+
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())
+    })
+}
+
+/// [`atomic_write`] with the content written by `write` into the temp file
+/// once it is open. The temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = tmp_sibling(path);
-    std::fs::write(&tmp, content)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp(&tmp, path, f, write)
+}
+
+/// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
+/// `path`; the temp is removed when either step fails, so a failing writer
+/// never leaves one behind (each temp name is used once).
+fn publish_temp(
+    tmp: &Path,
+    path: &Path,
+    f: std::fs::File,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    publish_temp_checked(tmp, path, f, write, || Ok(true)).map(|_| ())
+}
+
+/// [`publish_temp`] with `check` rerun between the write and the rename: a
+/// refusal (`Ok(false)`) or a failing check removes the temp and leaves `path`
+/// as it was. `Ok(true)` once the rename landed.
+fn publish_temp_checked(
+    tmp: &Path,
+    path: &Path,
+    mut f: std::fs::File,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    check: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let written = write(&mut f);
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    match check() {
+        Ok(true) => {}
+        result => {
+            let _ = std::fs::remove_file(tmp);
+            return result;
+        }
+    }
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(true),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp);
             Err(e)
         }
     }
 }
 
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
-/// so the file is never world-readable even for the instant before the rename.
-/// On non-Unix this is identical to [`atomic_write`].
+/// so the file is never world-readable even for the instant before the rename,
+/// and a stale temp at its name is removed first, so the mode is applied at
+/// creation.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    atomic_write_600_checked(path, content, || Ok(true)).map(|_| ())
+    atomic_write_600_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())
+    })
 }
 
 /// Recheck a caller's publication precondition after staging the bytes, just
@@ -2468,6 +2732,35 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
 pub(crate) fn atomic_write_600_checked(
     path: &Path,
     content: impl AsRef<[u8]>,
+    check: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    atomic_write_600_with_checked(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())
+        },
+        check,
+    )
+}
+
+/// [`atomic_write_600`] with the content written by `write` into the temp
+/// file once it is open, so a writer refused at the temp's creation (a
+/// read-only or unwritable dir) never pays for building the content. The
+/// temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_600_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_write_600_with_checked(path, write, || Ok(true)).map(|_| ())
+}
+
+/// The one 0o600 staging body behind [`atomic_write_600_with`] and
+/// [`atomic_write_600_checked`]: `write` fills the temp, `check` rechecks the
+/// caller's precondition just before the rename (`Ok(false)` refuses).
+fn atomic_write_600_with_checked(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     check: impl FnOnce() -> std::io::Result<bool>,
 ) -> std::io::Result<bool> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -2485,32 +2778,17 @@ pub(crate) fn atomic_write_600_checked(
         std::fs::remove_file(&tmp)?;
     }
     #[cfg(unix)]
-    {
-        use std::io::Write;
+    let f = {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_ref())?;
-    }
+            .open(&tmp)?
+    };
     #[cfg(not(unix))]
-    std::fs::write(&tmp, content)?;
-    match check() {
-        Ok(true) => {}
-        result => {
-            let _ = std::fs::remove_file(&tmp);
-            return result;
-        }
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp_checked(&tmp, path, f, write, check)
 }
 
 /// The import journal's durable write (spec `docs/specs/import-clauth.md`
@@ -2596,12 +2874,13 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Retighten an existing `~/.tollgate` tree to the owner-only invariant (0o700
-/// dirs, 0o600 files). Installs created before the invariant carry umask modes
-/// no writer revisits once the bytes stop changing, so [`load_config`] runs
-/// this on every entry point. Symlinks are skipped and never traversed: a
-/// shared-mode runtime is full of links into the operator's `~/.claude`, and
-/// following one would chmod a file tollgate does not own. Best-effort per entry
-/// — a chmod failure on one path never aborts the walk or the load.
+/// dirs, 0o600 files, 0o700 for a file whose owner exec bit is set).
+/// Installs created before the invariant carry umask modes no writer revisits
+/// once the bytes stop changing, so [`load_config`] runs this on every entry
+/// point. Symlinks are skipped and never traversed: a shared-mode runtime is
+/// full of links into the operator's `~/.claude`, and following one would
+/// chmod a file tollgate does not own. Best-effort per entry — a chmod failure
+/// on one path never aborts the walk or the load.
 pub(crate) fn enforce_tollgate_perms(root: &Path) {
     #[cfg(unix)]
     {
@@ -2613,8 +2892,17 @@ pub(crate) fn enforce_tollgate_perms(root: &Path) {
             return;
         }
         let is_dir = meta.is_dir();
-        let want = if is_dir { 0o700 } else { 0o600 };
-        if meta.permissions().mode() & 0o777 != want {
+        let mode = meta.permissions().mode() & 0o777;
+        // A file keeps an owner exec bit it already had: Claude Code writes
+        // runtime wrappers like `chrome/chrome-native-host` 0755 and the
+        // browser execs them, so forcing 0600 breaks the install. Only the
+        // owner's own bit carries over; no group or other bit ever does.
+        let want = if is_dir {
+            0o700
+        } else {
+            0o600 | (mode & 0o100)
+        };
+        if mode != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
         // A codex home's CONTENTS are codex's own: the PATH-alias helper
@@ -2641,16 +2929,135 @@ pub(crate) fn enforce_tollgate_perms(root: &Path) {
     let _ = root;
 }
 
+/// Clear the group and other bits on the `~/.claude` dirs tollgate's rescue and
+/// store-link writers create — the rescue's [`crate::sessions::SIDECAR_TREES`],
+/// the store-link dirs `jobs` and `projects`, and each direct child of
+/// `projects/` (CC's and tollgate's alike) — so the session-id listing those
+/// trees expose stays owner-only. A dir those writers created under an older
+/// build keeps its umask mode forever (nothing revisits it once the bytes stop
+/// changing); [`load_config`] runs this on every entry point, beside the
+/// `~/.tollgate` walk.
+///
+/// Not every `~/.claude` dir a tollgate writer makes is in the set: the fake-mode
+/// mirror's other names and the nested rescue dirs under a named tree are born
+/// 0700 via [`mkdir_700`] and stay outside it, and
+/// [`crate::claude::publish_credential_link`] and
+/// `apply_profile_to_claude_settings_inner` create `~/.claude` itself with
+/// `create_dir_all` at the umask. The set is fixed and non-recursive: nothing
+/// below the named dirs, never a file. A symlink for a named dir itself is
+/// never followed (the open refuses it; the owner-read-off fallback is by
+/// path, see [`tighten_owner_dir_by_path`]), but the `projects/` children are
+/// listed and opened by path, so a swap of `projects/` for a link between the
+/// listing gate and a child's open is followed — `O_NOFOLLOW` guards only the
+/// last component, and closing the gap needs an `openat` walk std lacks
+/// (the swap needs write on `~/.claude`: the owner alone unless that dir is
+/// group- or other-writable). Best-effort: a chmod
+/// failure on one path never aborts the load.
+///
+/// Guest mode ([`crate::identity::upstream_active`], plan §4.0) changes no
+/// mode under `~/.claude`: upstream clauth owns that tree until an import, and
+/// tollgate's own guest stores live under `~/.tollgate`, which the
+/// `~/.tollgate` walk already tightens.
+pub(crate) fn enforce_claude_dirs_perms() {
+    if crate::identity::upstream_active() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(claude) = claude_dir() else {
+            return;
+        };
+        for name in crate::sessions::SIDECAR_TREES
+            .iter()
+            .copied()
+            .chain(crate::runtime::SHARED_STORES.iter().map(|(name, _)| *name))
+        {
+            tighten_owner_dir(&claude.join(name));
+        }
+        let projects = claude.join("projects");
+        // `read_dir` follows a symlink, so gate the listing on the node itself
+        // being a real dir — a linked `projects/` must list nothing, not the
+        // operator's children through the link.
+        if let Ok(meta) = projects.symlink_metadata()
+            && !meta.file_type().is_symlink()
+            && meta.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&projects)
+        {
+            for entry in entries.flatten() {
+                tighten_owner_dir(&entry.path());
+            }
+        }
+    }
+}
+
+/// Clear the group and other bits on a real directory, decided by opening it
+/// no-follow (`O_NOFOLLOW | O_DIRECTORY`) and chmodding the open handle: the
+/// open itself refuses a symlink and a non-dir, and the handle pins the node,
+/// so a path swapped for a link between the open and the chmod is never
+/// followed. Owner bits and setgid stay as found — a 0500 dir is never widened
+/// to 0700. A dir whose owner read bit is off (e.g. 0377) fails that open and
+/// takes the [`tighten_owner_dir_by_path`] fallback.
+#[cfg(unix)]
+fn tighten_owner_dir(path: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+    {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tighten_owner_dir_by_path(path);
+            return;
+        }
+        Err(_) => return,
+    };
+    let Ok(mode) = dir.metadata().map(|m| m.permissions().mode()) else {
+        return;
+    };
+    if mode & 0o077 != 0 {
+        let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
+/// By-path retighten for a dir whose owner read bit is off: the no-follow open
+/// needs owner read and fails `EACCES` (e.g. 0377), yet the group and other
+/// bits are exactly what must go. `chmod` needs no read on the target, so this
+/// re-checks the node is a real dir and clears them by path — a swap between
+/// that check and the by-path chmod is followed (the swap needs write on the
+/// parent: the owner alone unless it is group- or other-writable).
+#[cfg(unix)]
+fn tighten_owner_dir_by_path(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str(&content).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
 }
 
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    toml::from_str(&content).map_err(|e| {
+        crate::format::parse_error(
+            path.display(),
+            crate::format::toml_parse_position(&content, &e),
+        )
+    })
 }
 
 /// The configured active profile, read from `profiles.toml` alone. For callers
@@ -2734,7 +3141,46 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     Ok(state)
 }
 
+/// Test seam: [`save_app_state`] writes fail the way a read-only `~/.tollgate`
+/// would (`atomic_write_600`'s temp create refuses), so a test can land the
+/// profile save and fail only the state write. Armed through the RAII
+/// [`FailAppStateSave`] guard, cleared on drop so an arm that never reached a
+/// save cannot leak into a sibling test.
+#[cfg(test)]
+static FAIL_APP_STATE_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`save_app_state`] failure for the guard's lifetime,
+/// clearing it on drop even if the test panics. It BORROWS the
+/// [`HomeSandbox`](crate::testutil::HomeSandbox): the override is a
+/// process-global serialized by `HOME_TEST_LOCK`, which the home sandbox holds,
+/// so dropping the home first is E0505 at compile time instead of a race
+/// nothing checks.
+#[cfg(test)]
+pub(crate) struct FailAppStateSave<'a>(std::marker::PhantomData<&'a crate::testutil::HomeSandbox>);
+
+#[cfg(test)]
+impl<'a> FailAppStateSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_APP_STATE_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailAppStateSave<'_> {
+    fn drop(&mut self) {
+        FAIL_APP_STATE_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_APP_STATE_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write profiles.toml: Permission denied (os error 13)"
+        ));
+    }
     with_state_lock(|_held| {
         mkdir_700(&tollgate_dir()?)?;
         let path = app_state_path()?;
@@ -2760,7 +3206,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
 /// the moment the model gains the table.
 ///
-/// Two exclusions, each closing the other's hole. "Modelled" is decided by
+/// Three exclusions; the first two close each other's hole. "Modelled" is decided by
 /// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
 /// modelled key the new state just moved to a default (absent from the render,
 /// its `skip_serializing_if` omitted it) cannot come back from disk with its
@@ -2768,8 +3214,12 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// ON-DISK value is itself the skipped default (`show_pace = false` written
 /// by hand), so the second exclusion drops any key the RENDER already names —
 /// without it, a save that moves such a key off default emits it twice, and a
-/// duplicate top-level key is a hard parse error bricking the file. A carried
-/// key is one the model's round-trip never saw AND the render does not write.
+/// duplicate top-level key is a hard parse error bricking the file. The third,
+/// [`carry_is_inert`] (per nested entry, [`nested_carry_if_inert`]), catches what
+/// the round-trip cannot see: a serde alias of a modelled key reads as
+/// unmodelled, and carried beside its field it duplicates that field. A carried
+/// key is one the model's round-trip never saw, the render does not write, and
+/// whose presence leaves what the file parses to unchanged.
 fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return rendered; // nothing on disk to preserve (first save)
@@ -2788,8 +3238,10 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered; // a render that does not parse: nothing safe to merge
     };
-    let rendered = merge_nested_carried_keys(
+    let baseline = parsed_as::<AppState>(&rendered);
+    let rendered = nested_carry_if_inert::<AppState>(
         rendered,
+        baseline.as_deref(),
         &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
     );
     let carried: Vec<(String, toml::Value)> = disk
@@ -2799,6 +3251,7 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
                 && !modelled.contains(k.as_str())
                 && !rendered_table.contains_key(k.as_str())
         })
+        .filter(|(k, v)| carry_is_inert::<AppState>(baseline.as_deref(), &rendered_table, k, v))
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -2881,6 +3334,73 @@ fn nested_unmodelled(
         }
     }
     out
+}
+
+/// What `text` parses to as a `T`, re-rendered: the value the inert rule
+/// compares. Callers parse the render once per save and hand it down.
+fn parsed_as<T>(text: &str) -> Option<String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    toml::to_string(&toml::from_str::<T>(text).ok()?).ok()
+}
+
+/// Whether carrying `key = value` beside `rendered` leaves what the file parses
+/// to exactly as the render alone has it (`baseline`, the render's
+/// [`parsed_as`]): the last word on every top-level carry. The round-trip that
+/// decides "modelled" cannot see a serde alias (`kick_timer` for
+/// `auto_start`): the alias parses into its field and re-emits under the
+/// field's own name, so the alias reads as unmodelled. Serde counts an alias
+/// and its field as ONE field, so carried beside the render's copy it is a
+/// duplicate field and the next load fails outright; carried where the render
+/// leaves the field at its skipped default, it turns the field back on. Any
+/// carry that breaks the parse or changes a parsed value is dropped; a
+/// genuinely unmodelled key parses the same with or without it and stays. A
+/// render that does not parse (`baseline` `None`) carries nothing.
+fn carry_is_inert<T>(
+    baseline: Option<&str>,
+    rendered: &toml::Table,
+    key: &str,
+    value: &toml::Value,
+) -> bool
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let mut with = rendered.clone();
+    with.insert(key.to_string(), value.clone());
+    let parsed = toml::to_string(&with)
+        .ok()
+        .and_then(|text| parsed_as::<T>(&text));
+    matches!((baseline, parsed), (Some(a), Some(b)) if a == b)
+}
+
+/// The nested carry with [`carry_is_inert`]'s rule one level down, entry by
+/// entry: each `[table] key = value` is merged only when it alone leaves what
+/// the file parses to as the render has it (`baseline`), so one bad nested
+/// key never costs the genuine ones beside it.
+fn nested_carry_if_inert<T>(
+    rendered: String,
+    baseline: Option<&str>,
+    nested: &[(String, String, toml::Value)],
+) -> String
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let Some(baseline) = baseline else {
+        return rendered;
+    };
+    let inert: Vec<(String, String, toml::Value)> = nested
+        .iter()
+        .filter(|entry| {
+            let one = merge_nested_carried_keys(rendered.clone(), std::slice::from_ref(*entry));
+            parsed_as::<T>(&one).is_some_and(|parsed| parsed == baseline)
+        })
+        .cloned()
+        .collect();
+    if inert.is_empty() {
+        return rendered;
+    }
+    merge_nested_carried_keys(rendered, &inert)
 }
 
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
@@ -3192,9 +3712,9 @@ fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::
     out
 }
 
-/// A key segment the carry can re-attach: a bare TOML identifier, the charset
-/// the model's own fields serialize with. Anything else is dropped rather than
-/// risk a mis-scoped header (see [`merge_nested_carried_keys`]).
+/// A key segment the carry ([`merge_nested_carried_keys`]) can re-attach: a
+/// bare TOML identifier, the charset the model's own fields serialize with.
+/// Anything else is dropped rather than risk a mis-scoped header.
 fn is_bare_key(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -3320,7 +3840,7 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`stored_usage_cache_is_third_party`], [`stored_provider`] and
 /// [`stored_endpoint`]'s managed half, which answer the same question without
 /// the side effects.
-fn effective_base_url(
+pub(crate) fn effective_base_url(
     configured: Option<String>,
     has_credentials: bool,
     api_key: Option<&str>,
@@ -3342,9 +3862,16 @@ fn effective_base_url(
 /// two load-side predicates that count it ([`effective_base_url`] and
 /// [`usage_cache_is_third_party`]).
 fn env_has_inference_token(env: &BTreeMap<String, String>) -> bool {
+    inference_env_token(env).is_some()
+}
+
+/// The inference env token, read the same way [`env_has_inference_token`] reads
+/// it; value-shaped so the digest and the boolean cannot drift.
+pub(crate) fn inference_env_token(env: &BTreeMap<String, String>) -> Option<String> {
     ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
         .iter()
-        .any(|k| env.get(*k).map(|v| v.trim()).is_some_and(|v| !v.is_empty()))
+        .find_map(|k| env.get(*k).map(|v| v.trim()).filter(|v| !v.is_empty()))
+        .map(str::to_string)
 }
 
 /// Whether an account's usage figures live in `third_party_cache.json` rather
@@ -3408,26 +3935,23 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample,
-/// [`crate::profile_json::published_windows`], and the MCP roster's
-/// `load_windows` — can observe it; every other caller runs
-/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
-/// and it costs at most one digest call or one roster row reporting no refresh. Pinned, in that
+/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
+/// [`crate::profile_json::published_windows`] — can observe it; every
+/// other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
+/// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a
+/// lock-free read like this one, but both its callers run `load_config` first,
+/// so the staged pair is gone before it reads — the divergence costs at most
+/// one digest call reporting no refresh. Pinned, in that
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
 /// `the_lock_free_third_party_read_agrees_with_a_full_load`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
-    let Ok(config_path) = profile_config_path(name) else {
+    let Some(config) = read_profile_config(name) else {
         return false;
     };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return false;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
-        return false;
-    };
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let has_credentials = stored_credentials_file_exists(name);
     let base_url = effective_base_url(
         config.base_url,
         has_credentials,
@@ -3443,6 +3967,62 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
     )
 }
 
+/// Read and parse `name`'s `config.toml`, lock-free — the prologue every
+/// name-keyed lock-free reader shares. `None` when the config cannot be read or
+/// parsed.
+fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
+    let config_path = profile_config_path(name).ok()?;
+    let raw = std::fs::read_to_string(&config_path).ok()?;
+    toml::from_str::<ProfileConfig>(&raw).ok()
+}
+
+/// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
+fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
+    profile_id_at(&profile_config_path(name).ok()?)
+}
+
+/// The [`ProfileId`] a login, capture or adopt starting on `name` lands by,
+/// minted into its `config.toml` when an older tollgate created it without one.
+pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
+    with_state_lock(|_held| {
+        // The roster first: a leftover directory no account owns is no one's.
+        if !claude_roster_names()?.contains(name) {
+            anyhow::bail!("profile '{name}' no longer exists");
+        }
+        if let Some(id) = stored_profile_id(name) {
+            return Ok(id);
+        }
+        let id = ProfileId::mint()?;
+        write_config_render(&read_profile(name)?, Some(&id))?;
+        Ok(id)
+    })
+}
+
+/// `name`'s profile read fresh, only while it is still the account `account`
+/// was claimed from: what a CLI login shows and reuses after its claim.
+pub(crate) fn read_claimed_profile(name: &ProfileName, account: &ProfileId) -> Result<Profile> {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        read_profile(name)
+    })
+}
+
+/// Refuse unless `name` still holds the account `expected` was claimed from: a
+/// rename away and a delete-then-recreate both leave another id, or none, under
+/// the name, and a name dropped from the roster leaves a directory no account
+/// owns. The caller holds the state flock across this and its write.
+pub(crate) fn require_profile_id(
+    name: &ProfileName,
+    expected: &ProfileId,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    if !claude_roster_names()?.contains(name) || stored_profile_id(name).as_ref() != Some(expected)
+    {
+        anyhow::bail!("profile '{name}' no longer exists");
+    }
+    Ok(())
+}
+
 /// The recognised [`Provider`] for `name`, read lock-free off one `config.toml`
 /// read the same way [`stored_usage_cache_is_third_party`] reads its own answer.
 /// `None` for an unreadable config, an OAuth account, and a generic api-key
@@ -3453,16 +4033,8 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// `ANTHROPIC_BASE_URL` reroutes the request but does not change which provider
 /// tollgate typed it as.
 pub(crate) fn stored_provider(name: &ProfileName) -> Option<Provider> {
-    let Ok(config_path) = profile_config_path(name) else {
-        return None;
-    };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return None;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
-        return None;
-    };
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let config = read_profile_config(name)?;
+    let has_credentials = stored_credentials_file_exists(name);
     let base_url = effective_base_url(
         config.base_url,
         has_credentials,
@@ -3526,13 +4098,7 @@ pub(crate) enum StoredEndpoint {
 /// an auth token keeps the endpoint on both readers, so the divergence is the
 /// no-env-auth shape alone.
 pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
-    let Ok(config_path) = profile_config_path(name) else {
-        return StoredEndpoint::Unknown;
-    };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return StoredEndpoint::Unknown;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
+    let Some(config) = read_profile_config(name) else {
         return StoredEndpoint::Unknown;
     };
     if let Some(url) = config
@@ -3543,7 +4109,7 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     {
         return StoredEndpoint::Custom(url.to_string());
     }
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let has_credentials = stored_credentials_file_exists(name);
     match effective_base_url(
         config.base_url,
         has_credentials,
@@ -3555,30 +4121,304 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     }
 }
 
-/// Whether a profile load may repair what it finds on disk.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LoadMode {
-    /// The entry-point load: adopts (writes) a staged rotation sidecar and
-    /// deletes it, and rewrites a drifted `config.toml`.
-    Repair,
-    /// Reads only. A staged sidecar the repairing load would adopt is used in
-    /// memory, so both loads describe the same account, but nothing is
-    /// written, renamed, deleted or locked.
-    ReadOnly,
+/// The identity-relevant endpoint fields of `name`'s stored `config.toml`, read
+/// lock-free (never `load_profile`, which takes the state flock). `base_url` is
+/// the EFFECTIVE managed base_url when [`stored_endpoint_identity`] reads it, and
+/// the RAW managed field when a change site builds the struct for
+/// [`crate::usage::endpoint_identity_plan`], which derives the effective form
+/// itself; the api key, the console credential and the raw env map are the same
+/// either way. `None` when the config cannot be read.
+pub(crate) struct StoredEndpointIdentity {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) console: Option<ConsoleCredential>,
+    pub(crate) env: BTreeMap<String, String>,
+}
+
+/// Whether `name`'s `credentials.json` exists (the throughput identity's
+/// effective-base_url guard).
+pub(crate) fn stored_credentials_file_exists(name: &ProfileName) -> bool {
+    profile_credentials_path(name).is_ok_and(|p| p.exists())
+}
+
+/// [`StoredEndpointIdentity`] for `name`, off ONE read of its `config.toml`,
+/// the same lock-free shape [`stored_endpoint`] / [`stored_provider`] use.
+pub(crate) fn stored_endpoint_identity(name: &ProfileName) -> Option<StoredEndpointIdentity> {
+    let config = read_profile_config(name)?;
+    let has_credentials = stored_credentials_file_exists(name);
+    let base_url = effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    );
+    Some(StoredEndpointIdentity {
+        base_url,
+        api_key: config.api_key,
+        console: console_credential(&config.console),
+        env: config.env,
+    })
 }
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
-    load_profile_with(name, LoadMode::Repair)
+    load_profile_with(name, true)
 }
 
-/// [`load_profile`] that writes, renames, deletes and locks nothing: a staged
-/// rotation it would adopt is used in memory only. For executor B's checks,
-/// which run inside the state-flock hold and must never repair a profile.
+/// [`load_profile`]'s read-only form, used by the shared swap-target check and
+/// the `tollgate mcp` handshake: the same read, but never through
+/// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
+/// write-through, both of which take the state flock — a `config.toml` whose
+/// canonical render does not parse back is left as it is, and an adoptable
+/// sidecar is answered from memory and left for the next ordinary load to
+/// land.
+pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, false)
+}
+
+/// [`read_profile`] under the name executor B's checks call it by: they run
+/// inside the state-flock hold and must never repair a profile.
 pub(crate) fn load_profile_read_only(name: &ProfileName) -> Result<Profile> {
-    load_profile_with(name, LoadMode::ReadOnly)
+    read_profile(name)
 }
 
-fn load_profile_with(name: &ProfileName, mode: LoadMode) -> Result<Profile> {
+fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
+    let mut source = read_profile_source(name)?;
+    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
+    // never committed is adopted.
+    source.credentials = recover_pending_credentials(name, source.credentials, rewrite);
+    let (profile, config_path, raw_config) = build_profile(name, source);
+    if rewrite {
+        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    }
+    if unreadable_store_notice(&profile).is_some() {
+        notice_torn_store(&profile);
+    }
+    Ok(profile)
+}
+
+/// Whether the torn-store notice may print. Off by default — the TUI's stderr
+/// is its alternate screen, the daemon's is `daemon.log`, the MCP server's is
+/// Claude Code's, a hook's is its caller's — so only the CLI dispatch arms for
+/// the user-facing commands turn it on ([`enable_torn_store_notice`]).
+static TORN_STORE_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The account names whose notice already printed, so however many times one
+/// process reloads the roster, one torn store yields one line.
+static TORN_STORE_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Turn the torn-store notice on for the rest of the process. Called once by
+/// the CLI dispatch, and only for the user-facing commands.
+pub(crate) fn enable_torn_store_notice() {
+    TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One stderr line naming an unreadable account, at most once per account per
+/// process. No-op unless [`enable_torn_store_notice`] ran and the account has
+/// not been named yet.
+fn notice_torn_store(profile: &Profile) {
+    if !TORN_STORE_NOTICE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut told = TORN_STORE_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if told
+        .iter()
+        .any(|told_name| told_name == profile.name.as_str())
+    {
+        return;
+    }
+    told.push(profile.name.as_str().to_string());
+    let Some(notice) = unreadable_store_notice(profile) else {
+        return;
+    };
+    crate::out::errln!("{notice}");
+}
+
+/// Test-only RAII: turn the torn-store notice on for the guard's lifetime,
+/// clearing it on drop so a test that loads a torn store cannot leak the
+/// enabled flag into a sibling test in the same process.
+#[cfg(test)]
+pub(crate) struct TornStoreNoticeArmed(());
+
+#[cfg(test)]
+impl TornStoreNoticeArmed {
+    pub(crate) fn new() -> Self {
+        TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TornStoreNoticeArmed {
+    fn drop(&mut self) {
+        TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test-only: put the torn-store notice back to its off default and clear the
+/// already-named set, so an in-process `dispatch()` test that armed the
+/// process-global flag cannot leak it into a sibling test. Called by the test
+/// home sandbox, which already resets the other process-global overrides.
+#[cfg(test)]
+pub(crate) fn reset_torn_store_notice_for_test() {
+    TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+    TORN_STORE_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Why a profile's committed `credentials.json` could not be read, recorded at
+/// load so the notice and the refusal can name it instead of always blaming a
+/// parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreadableStoreReason {
+    /// The file exists but does not parse as credentials JSON.
+    Parse,
+    /// The file could not be read at all; the OS error's `Display` is carried
+    /// so the notice names the actual cause (a directory in its place, an I/O
+    /// error).
+    Io(String),
+}
+
+/// The parenthetical naming why a store cannot be read, shared by the notice
+/// and the refusal so the two surfaces cannot drift. Parse failures keep the
+/// file name alone; read failures add the OS error's own spelling.
+fn unreadable_store_parenthetical(reason: &UnreadableStoreReason) -> String {
+    match reason {
+        UnreadableStoreReason::Parse => "credentials.json does not parse".to_string(),
+        UnreadableStoreReason::Io(io) => format!("credentials.json: {io}"),
+    }
+}
+
+/// The one-line stderr notice for a loaded profile whose store cannot be read,
+/// `None` when the store reads (or is absent).
+pub(crate) fn unreadable_store_notice(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "tollgate: {name}: {} ({}), so it shows as logged out until `tollgate login {name}`",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = profile.name,
+    ))
+}
+
+/// The refusal a re-key over an unreadable store raises, `None` when the store
+/// reads. The CLI renders it through its usual error prefix.
+pub(crate) fn unreadable_store_refusal(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "{name}: {} ({}); log in again with `tollgate login {name}` first, or the re-key would drop it",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = profile.name,
+    ))
+}
+
+/// What a lock-free on-disk login read proves: the store holds a login, holds
+/// none, or the read could not tell (a store that exists but cannot be read or
+/// parsed). The drains drop a target only on [`StoredLogin::HoldsNone`] and
+/// never link on [`StoredLogin::Unknown`]: a store that exists but cannot be
+/// read or parsed proves nothing about absence, so it is never read as "no
+/// credential" (the repo precedent: `src/usage/forget.rs` `SnapshotIdentities`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredLogin {
+    /// A readable fact proves a login: a parsed stored pair, a parsed long-lived
+    /// sidecar, or a parsed `config.toml` whose api key / `[env]` token passes
+    /// [`crate::claude::has_inference_auth`].
+    HoldsLogin,
+    /// Every store that exists is readable and holds none of the three facts.
+    HoldsNone,
+    /// At least one store exists but cannot be read or parsed, and nothing
+    /// readable proves a login. The disk proves nothing, so a caller must not
+    /// read this as "no login".
+    Unknown,
+}
+
+/// The long-lived sidecar fact plus its unreadable flag, off ONE read of
+/// `session-token.json`: `(holds, unreadable)`. A parsed sidecar classifies the
+/// same way [`crate::claude::session_token_status`] does (a refresh-token
+/// sidecar is a mis-fill, not a login); an existing-but-unparseable sidecar is
+/// `(false, true)` — unknown, not "no sidecar" — because a sidecar that exists
+/// but cannot be parsed proves nothing about absence. An absent sidecar is
+/// `(false, false)`.
+fn stored_sidecar_login(name: &ProfileName) -> (bool, bool) {
+    let Ok(path) = profile_subpath(name, "session-token.json") else {
+        return (false, false);
+    };
+    if !path.exists() {
+        return (false, false);
+    }
+    let Ok(creds) = read_json_file::<ClaudeCredentials>(&path) else {
+        return (false, true);
+    };
+    let Some(oauth) = creds.claude_ai_oauth else {
+        return (false, false);
+    };
+    (oauth.refresh_token.is_none(), false)
+}
+
+/// [`Profile::holds_login`] for a caller holding only a name, read lock-free
+/// from the committed store — the SAME three facts the loaded-state read
+/// answers, each off its existing lock-free reader: the stored OAuth pair
+/// ([`crate::usage::read_oauth_for_compare`], which also reports an
+/// unreadable `credentials.json`), a long-lived sidecar ([`stored_sidecar_login`]),
+/// and `config.toml`'s api key + env fed to [`crate::claude::has_inference_auth`]
+/// ([`stored_endpoint_identity`] `None` while the file exists is the unreadable
+/// flag, the same check [`crate::usage::read_third_party_for_compare`] makes).
+/// The holds judgment is [`holds_login_facts`], shared so the loaded read and
+/// this read cannot drift.
+///
+/// Deliberately NOT `load_profile(name)`: that path recovers a legacy `.pending`
+/// rotation sidecar, which takes the cross-process state flock and rewrites
+/// `credentials.json`, and `maybe_rewrite_config_toml` may rewrite
+/// `config.toml` — no caller asking a read-only question should mutate a
+/// credential store. The TUI's own drain runs it on the UI thread, so it takes
+/// no lock and does bounded single-file reads only.
+pub(crate) fn stored_login(name: &ProfileName) -> StoredLogin {
+    let (oauth, oauth_unreadable) = crate::usage::read_oauth_for_compare(name);
+    let stored_pair = oauth.stored.is_some();
+    let (long_lived_sidecar, sidecar_unreadable) = stored_sidecar_login(name);
+    let endpoint = stored_endpoint_identity(name);
+    let (inference_auth, config_unreadable) = match endpoint {
+        Some(e) => {
+            let mut profile = Profile::new(name.as_str().to_string(), None, e.api_key);
+            profile.env = e.env;
+            (crate::claude::has_inference_auth(&profile), false)
+        }
+        None => (false, profile_config_path(name).is_ok_and(|p| p.exists())),
+    };
+
+    if holds_login_facts(stored_pair, long_lived_sidecar, inference_auth) {
+        StoredLogin::HoldsLogin
+    } else if oauth_unreadable || sidecar_unreadable || config_unreadable {
+        StoredLogin::Unknown
+    } else {
+        StoredLogin::HoldsNone
+    }
+}
+
+/// The parsed source of a profile: one `config.toml` read, whose parse failure
+/// still fails here, and one committed `credentials.json` read, whose unreadable
+/// fact is captured as [`ProfileSource::store_unreadable`] rather than failing.
+/// NO state flock, NO legacy `.pending` adoption, NO `config.toml` rewrite —
+/// those are the legs [`load_profile`] adds on top.
+struct ProfileSource {
+    config_path: PathBuf,
+    raw_config: String,
+    config: ProfileConfig,
+    credentials: Option<ClaudeCredentials>,
+    /// The committed `credentials.json` exists but could not be read, and why.
+    /// Kept apart from `credentials` because a `.staged`/`.pending` sidecar can
+    /// still supply the pair, which clears the unreadable fact at
+    /// [`build_profile`].
+    store_unreadable: Option<UnreadableStoreReason>,
+}
+
+/// The `config.toml` half of [`read_profile_source`], split out for a caller
+/// that must not depend on any other file of the profile.
+fn read_profile_config_source(name: &ProfileName) -> Result<(PathBuf, String, ProfileConfig)> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3588,63 +4428,98 @@ fn load_profile_with(name: &ProfileName, mode: LoadMode) -> Result<Profile> {
     let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
     } else {
-        toml::from_str(&raw_config)
-            .with_context(|| format!("failed to parse {name}/config.toml"))?
+        toml::from_str(&raw_config).map_err(|e| {
+            crate::format::parse_error(
+                format!("{name}/config.toml"),
+                crate::format::toml_parse_position(&raw_config, &e),
+            )
+        })?
     };
+    Ok((config_path, raw_config, config))
+}
+
+fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
+    let (config_path, raw_config, config) = read_profile_config_source(name)?;
 
     let cred_path = profile_credentials_path(name)?;
-    let credentials = if cred_path.exists() {
-        Some(read_json_file(&cred_path)?)
+    let (credentials, store_unreadable) = if cred_path.exists() {
+        match read_json_file(&cred_path) {
+            Ok(creds) => (Some(creds), None),
+            Err(e) => {
+                // `read_json_file`'s read error is `with_context` over the
+                // `io::Error`; its parse error is a source-free `anyhow!`, so
+                // the downcast alone tells the two apart. `read_to_string`
+                // surfaces a cut multi-byte character as `InvalidData`, which
+                // is a content tear, not an OS read failure, so it stays
+                // Parse.
+                let reason = match e.downcast_ref::<std::io::Error>() {
+                    Some(io) if io.kind() != std::io::ErrorKind::InvalidData => {
+                        UnreadableStoreReason::Io(io.to_string())
+                    }
+                    _ => UnreadableStoreReason::Parse,
+                };
+                (None, Some(reason))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    Ok(ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+        store_unreadable,
+    })
+}
+
+/// A profile's stored api_key, off its `config.toml` alone: the key lives
+/// there, so a torn `credentials.json` beside it must never cost the account
+/// its key. No lock and no write, unlike [`load_profile`], since Claude Code's
+/// `apiKeyHelper` calls it. `Ok(None)` when the profile has no api_key (a
+/// missing or blank `config.toml` included); the caller trims and validates.
+pub(crate) fn read_api_key(name: &ProfileName) -> Result<Option<String>> {
+    let (_, _, config) = read_profile_config_source(name)?;
+    Ok(config.api_key)
+}
+
+/// Build the loaded [`Profile`] from parsed [`ProfileSource`], consuming the
+/// source. Returns the profile plus the source's rewrite inputs (the config path
+/// and raw text), since the caller still owes the [`maybe_rewrite_config_toml`]
+/// leg.
+fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf, String) {
+    let ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+        store_unreadable,
+    } = source;
+
+    // An unreadable store reads logged out only when no sidecar supplied the
+    // pair; an adopted `.pending`/`.staged` pair is a login, so the fact clears.
+    let unreadable_credentials_store = if credentials.is_none() {
+        store_unreadable
     } else {
         None
-    };
-    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
-    // never committed is adopted.
-    let credentials = match mode {
-        LoadMode::Repair => recover_pending_credentials(name, credentials),
-        LoadMode::ReadOnly => crate::oauth::live_stage_credentials(name, credentials.as_ref())
-            .or_else(|| adoptable_pending_credentials(name))
-            .or(credentials),
     };
 
     let base_url = effective_base_url(
         config.base_url,
-        credentials.is_some(),
+        credentials.is_some() || unreadable_credentials_store.is_some(),
         config.api_key.as_deref(),
         &config.env,
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
-    // Seed third-party usage from disk for every account whose figures live in
-    // that cache — the predicate is named there so no reader has to restate it.
-    let third_party_usage = if usage_cache_is_third_party(
-        provider,
-        base_url.as_deref(),
-        config.api_key.as_deref(),
-        credentials.is_some(),
-        &config.env,
-    ) {
-        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        )
-    } else {
-        None
-    };
-    // A third-party account's windows ARE its usage snapshot, so seed `usage`
-    // from them at the same boundary. Every OAuth account keeps `None` here and
-    // is filled by the usage store as before — this load has no OAuth cache to
-    // read, and `third_party_usage` is `Some` only where that store never had an
-    // entry to begin with, so the two can't overwrite each other.
-    let usage = third_party_usage
-        .as_ref()
-        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
+        usage_probe: config.usage_probe,
+        usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
         fallback_threshold: finite_pct(config.fallback_threshold),
@@ -3671,28 +4546,26 @@ fn load_profile_with(name: &ProfileName, mode: LoadMode) -> Result<Profile> {
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         check_weekly: config.check_weekly.unwrap_or(true),
         check_scoped: config.check_scoped.unwrap_or(true),
+        check_credit_cap: config.check_credit_cap.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage,
-        fetch_status: None,
-        usage_stale: false,
+        has_long_lived_sidecar: crate::claude::has_session_token(name),
+        unreadable_credentials_store,
+        setup_token_digest: crate::claude::installed_session_token(name)
+            .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
-        third_party_usage,
     };
 
-    if mode == LoadMode::Repair {
-        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
-    }
-
-    Ok(profile)
+    (profile, config_path, raw_config)
 }
 
-/// Refresh config.toml when its semantic content drifts from what we'd render
-/// today. Comment-only or whitespace-only differences shouldn't trigger a
-/// rewrite — the TUI reloads on every state-file change and we don't want to
-/// thrash disk on every reload.
+/// Rewrite config.toml only when the canonical render of the loaded profile does
+/// not parse back to it. The parsed comparison never reads the raw file: a hand
+/// edit that parses stays on disk as written until the next save, so the TUI's
+/// reload on every state-file change never touches disk. A render that does not
+/// parse is compared byte-wise against the raw file instead.
 fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
     let rendered = render_config_toml(profile);
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
@@ -3701,6 +4574,10 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 base_url: profile.base_url.clone(),
                 api_key: profile.api_key.clone(),
                 auto_start: profile.auto_start,
+                usage_probe: profile.usage_probe,
+                usage_probe_interval_ms: (profile.usage_probe_interval_ms
+                    != DEFAULT_USAGE_PROBE_INTERVAL_MS)
+                    .then_some(profile.usage_probe_interval_ms),
                 env: profile.env.clone(),
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
@@ -3715,6 +4592,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 // on disk normalizes away on the next rewrite.
                 check_weekly: (!profile.check_weekly).then_some(false),
                 check_scoped: (!profile.check_scoped).then_some(false),
+                check_credit_cap: (!profile.check_credit_cap).then_some(false),
                 bell_threshold: profile.bell_threshold,
                 disabled: profile.disabled,
                 console: console_config(profile.console.as_ref()),
@@ -3725,8 +4603,11 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     };
     if needs_rewrite {
         let _ = with_state_lock(|_held| {
+            // Read under the hold: a claim may have minted one since the load.
+            let id = profile_id_at(config_path);
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
-            let rendered = preserving_config_render(&rendered, config_path);
+            let rendered =
+                preserving_config_render(&with_profile_id(rendered, id.as_ref()), config_path);
             let _ = atomic_write_600(config_path, &rendered);
             Ok(())
         });
@@ -3744,7 +4625,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
 /// decided should cross, while this only rewrites a store over itself, where an
 /// unrecognised key belongs to the account whose file it already is. Dropping it
 /// here would lose data no other writer holds.
-fn serialize_credentials_preserving_extra(
+pub(crate) fn serialize_credentials_preserving_extra(
     creds: &ClaudeCredentials,
     cred_path: &Path,
 ) -> Result<String> {
@@ -3902,12 +4783,25 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
 /// because an in-memory pair can lag a rotation another process landed and
 /// writing it back rewinds the store to a spent token.
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, None)
+}
+
+/// [`save_profile`] for a create: the new account gets a fresh [`ProfileId`],
+/// whatever a leftover directory under its name still holds.
+pub(crate) fn save_new_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, Some(ProfileId::mint()?))
+}
+
+fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<()> {
     with_state_lock(|held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
-        write_profile_config(profile)
+        match fresh {
+            Some(id) => write_config_render(profile, Some(&id)),
+            None => write_profile_config(profile),
+        }
     })
 }
 
@@ -3919,13 +4813,39 @@ pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     })
 }
 
+/// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
+    let id = profile_id_at(&profile_config_path(&profile.name)?);
+    write_config_render(profile, id.as_ref())
+}
+
+/// The `id` key of the `config.toml` at `config_path`, read on its own so a
+/// hand-edit breaking another key does not lose it.
+fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(ProfileId(table.get("id")?.as_str()?.to_string()))
+}
+
+/// `config.toml` from `profile` plus `id`, carrying every unmodelled key the
+/// file already holds. The caller holds the state flock.
+fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
+    let rendered = with_profile_id(render_config_toml(profile), id);
     atomic_write_600(
         &config_path,
-        preserving_config_render(&render_config_toml(profile), &config_path),
+        preserving_config_render(&rendered, &config_path),
     )
     .context("failed to write config.toml")
+}
+
+/// `rendered` with `id = "…"` as its first key, under the header comment.
+fn with_profile_id(rendered: String, id: Option<&ProfileId>) -> String {
+    let Some(id) = id else {
+        return rendered;
+    };
+    let line = format!("\n\nid = {}\n\n", toml::Value::String(id.0.clone()));
+    rendered.replacen("\n\n", &line, 1)
 }
 
 /// The credential leg every store writer shares: `Some` writes the login
@@ -3973,7 +4893,9 @@ pub(crate) fn write_profile_credentials(
 /// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
 /// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
 /// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. `load_profile`'s
+/// absent from the render, and must not come back from disk. The same three
+/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
+/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
 /// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
 /// them does not add write thrash.
 pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
@@ -3994,8 +4916,10 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered.to_string(); // a render that does not parse: merge nothing
     };
-    let merged = merge_nested_carried_keys(
+    let baseline = parsed_as::<ProfileConfig>(rendered);
+    let merged = nested_carry_if_inert::<ProfileConfig>(
         rendered.to_string(),
+        baseline.as_deref(),
         &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
     );
     let carried: Vec<(String, toml::Value)> = disk
@@ -4004,6 +4928,9 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
             k != "five_hour_alert_threshold"
                 && !modelled.contains(k.as_str())
                 && !rendered_table.contains_key(k.as_str())
+        })
+        .filter(|(k, v)| {
+            carry_is_inert::<ProfileConfig>(baseline.as_deref(), &rendered_table, k, v)
         })
         .collect();
     if carried.is_empty() {
@@ -4061,46 +4988,56 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     }
 }
 
-/// The legacy rotation sidecar [`recover_pending_credentials`] would adopt, read
-/// without writing or removing anything.
-fn adoptable_pending_credentials(name: &ProfileName) -> Option<ClaudeCredentials> {
-    let pending_path = profile_credentials_pending_path(name).ok()?;
-    let cred_path = profile_credentials_path(name).ok()?;
-    adoptable_pending(&pending_path, &cred_path)
+/// The RESOLVE half of [`recover_pending_credentials`]: what a full load would
+/// end with, read-only. Returns the resolved credentials and whether the LAND
+/// leg is owed (a `.pending` sidecar exists to adopt or discard). A live
+/// `credentials.json.staged` resolves in place of the store; an adoptable
+/// legacy `credentials.json.pending` resolves as the login; a stale one
+/// resolves as the store's raw login and is still owed a removal. No state
+/// flock, no write, no removal.
+fn resolve_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<&ClaudeCredentials>,
+) -> (Option<ClaudeCredentials>, bool) {
+    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded) {
+        return (Some(staged), false);
+    }
+    let (Ok(pending_path), Ok(cred_path)) = (
+        profile_credentials_pending_path(name),
+        profile_credentials_path(name),
+    ) else {
+        return (loaded.cloned(), false);
+    };
+    if pending_path.symlink_metadata().is_err() {
+        return (loaded.cloned(), false); // no sidecar — the common case
+    }
+    (
+        adoptable_pending(&pending_path, &cred_path).or_else(|| loaded.cloned()),
+        true,
+    )
 }
 
-/// What `load_profile` reads as the profile's credentials, given the store's
-/// raw `loaded` value. A live `credentials.json.staged` (a rotation whose
-/// persist never landed, `oauth::live_stage_credentials`) is the chain head
-/// and loads into memory only: read lock-free, never written through, never
-/// deleted, since a loader deciding outside the rotation guard raced installs
-/// and refused the rotation's own persist. A legacy `credentials.json.pending`
-/// from an older binary keeps its mtime rule.
-fn recover_pending_credentials(
+/// The LAND half of [`recover_pending_credentials`]: make the disk match what
+/// [`resolve_pending_credentials`] judged. Called only when that resolve said a
+/// land is due. A sidecar the rule already discards goes lock-free, as it
+/// always did: a stale one must not make every load of this profile wait on the
+/// flock. An adoptable one is re-decided inside the flock and the sidecar goes
+/// only once the write-through it justified has landed in that same hold: a
+/// sidecar deleted beside a write that never happened loses the only live pair.
+fn land_pending_credentials(
     name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
 ) -> Option<ClaudeCredentials> {
-    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded.as_ref()) {
-        return Some(staged);
-    }
     let (Ok(pending_path), Ok(cred_path)) = (
         profile_credentials_pending_path(name),
         profile_credentials_path(name),
     ) else {
         return loaded;
     };
-    if pending_path.symlink_metadata().is_err() {
-        return loaded; // no sidecar — the common case
-    }
-    // A sidecar the rule already discards goes lock-free, as it always did: a
-    // stale one must not make every load of this profile wait on the flock.
     if adoptable_pending(&pending_path, &cred_path).is_none() {
         let _ = std::fs::remove_file(&pending_path);
         return loaded;
     }
-    // The rule is re-decided inside the flock, and the sidecar goes only once
-    // the write-through it justified has landed in that same hold: a sidecar
-    // deleted beside a write that never happened loses the only live pair.
     let landed = with_state_lock(|_held| {
         let adopted = adoptable_pending(&pending_path, &cred_path);
         if let Some(pending) = &adopted {
@@ -4119,6 +5056,38 @@ fn recover_pending_credentials(
         // later load to land, and this load still answers with the pair the
         // rule judges live.
         Err(_) => adoptable_pending(&pending_path, &cred_path).or(loaded),
+    }
+}
+
+/// What `load_profile` reads as the profile's credentials, given the store's
+/// raw `loaded` value: the read-only [`resolve_pending_credentials`] verdict,
+/// then the [`land_pending_credentials`] write-through + `.pending` removal
+/// whenever a land is due and `rewrite` allows it. A live
+/// `credentials.json.staged` (a rotation whose persist never landed,
+/// `oauth::live_stage_credentials`) is the chain head and loads into memory
+/// only: read lock-free, never written through, never deleted, since a loader
+/// deciding outside the rotation guard raced installs and refused the
+/// rotation's own persist. A legacy `credentials.json.pending` from an older
+/// binary keeps its mtime rule.
+///
+/// `rewrite == false` is the no-rewrite read (the MCP handshake and the shared
+/// swap-target check): the resolve verdict is answered read lock-free and the
+/// `.pending` sidecar is left for the next ordinary load to land under the
+/// flock, so this path never takes the state lock and never writes
+/// `credentials.json`.
+fn recover_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<ClaudeCredentials>,
+    rewrite: bool,
+) -> Option<ClaudeCredentials> {
+    let (resolved, land_due) = resolve_pending_credentials(name, loaded.as_ref());
+    if !rewrite {
+        return resolved;
+    }
+    if land_due {
+        land_pending_credentials(name, loaded)
+    } else {
+        resolved
     }
 }
 
@@ -4149,17 +5118,37 @@ fn adoptable_pending(pending_path: &Path, cred_path: &Path) -> Option<ClaudeCred
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {
+    load_config_with(true)
+}
+
+/// [`load_config`] for a caller that answers before it serves and must never
+/// wait on the state flock — the `tollgate mcp` handshake's `instructions` block.
+/// Same reads, but each profile loads through
+/// [`read_profile`], so neither a `config.toml` rewrite nor a
+/// legacy `.pending` sidecar's write-through blocks the handshake on the flock.
+pub(crate) fn load_config_without_rewrite() -> Result<AppConfig> {
+    load_config_with(false)
+}
+
+fn load_config_with(rewrite: bool) -> Result<AppConfig> {
     mkdir_700(&profiles_root()?)?;
     // Every entry point loads config early, so this is the tree-wide chokepoint
     // that retightens an install created before the owner-only invariant.
     if let Ok(dir) = tollgate_dir() {
         enforce_tollgate_perms(&dir);
     }
+    enforce_claude_dirs_perms();
     let state = load_app_state()?;
     let profiles = state
         .profiles
         .iter()
-        .map(load_profile)
+        .map(|name| {
+            if rewrite {
+                load_profile(name)
+            } else {
+                read_profile(name)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }
@@ -4176,7 +5165,7 @@ pub(crate) fn load_config_read_only() -> Result<AppConfig> {
     let profiles = state
         .profiles
         .iter()
-        .map(|name| load_profile_with(name, LoadMode::ReadOnly))
+        .map(read_profile)
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }
@@ -4238,6 +5227,33 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("auto_start = true\n");
     } else {
         out.push_str("# auto_start = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
+    out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
+    out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
+    out.push_str("# window. Inert while an OAuth pair is stored. OAuth profiles only.\n");
+    if profile.usage_probe {
+        out.push_str("usage_probe = true\n");
+    } else {
+        out.push_str("# usage_probe = true\n");
+    }
+    out.push('\n');
+
+    out.push_str(&format!(
+        "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
+         # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
+    ));
+    if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
+        out.push_str(&format!(
+            "# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "usage_probe_interval_ms = {}\n",
+            profile.usage_probe_interval_ms
+        ));
     }
     out.push('\n');
 
@@ -4354,6 +5370,15 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("check_scoped = false\n");
     }
     out.push('\n');
+    out.push_str("# Whether auto-switching keeps off this account while its usage-credit cap\n");
+    out.push_str("# is spent (Claude Code then refuses credit-billed models such as Fable).\n");
+    out.push_str("# Set false to keep it in rotation for other models.\n");
+    if profile.check_credit_cap {
+        out.push_str("# check_credit_cap = false\n");
+    } else {
+        out.push_str("check_credit_cap = false\n");
+    }
+    out.push('\n');
 
     out.push_str("# 5-hour utilization percentage at/above which tollgate alerts: a TUI toast,\n");
     out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
@@ -4433,7 +5458,14 @@ fn render_config_toml(profile: &Profile) -> String {
     } else {
         out.push_str("[env]\n");
         for (k, v) in &profile.env {
-            out.push_str(&format!("{k} = {}\n", toml_str(v)));
+            // The key encoder, never `toml_str`: a value encoder emits a
+            // multi-line string for a newline or for both quote kinds, which
+            // TOML refuses as a key.
+            out.push_str(&format!(
+                "{} = {}\n",
+                toml_edit::Key::new(k.as_str()),
+                toml_str(v)
+            ));
         }
     }
 

@@ -149,6 +149,25 @@ fn a_config_that_does_not_parse_fails_before_anything_is_written() {
     assert!(plan_config("this is not toml", "prefix+a", false).is_err());
 }
 
+/// A torn herdr config would otherwise quote the source line in the parser's
+/// message; the plan names the position alone.
+#[test]
+fn a_torn_config_names_the_position() {
+    let err = match plan_config("api_key = \"sk-c2probe-NOTAKEY", "prefix+a", false) {
+        Ok(_) => panic!("a torn config fails the plan"),
+        Err(e) => e,
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "herdr's config.toml does not parse; fix it before wiring tollgate into it (line 1, column 30)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
 /// Comments and unrelated keys survive, because the write appends text rather
 /// than reserializing a parsed document.
 #[test]

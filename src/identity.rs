@@ -35,7 +35,7 @@ pub(crate) const DATA_DIR_NAME: &str = concat!(".", tool_name!());
 /// (`TOLLGATE_NO_API`, `TOLLGATE_MCP_DEPTH`, …).
 #[allow(
     dead_code,
-    reason = "the env-var sites still spell the prefix out; §4.0 routes them here"
+    reason = "the env-var sites still spell the prefix out; plan section 4.0 routes them here"
 )]
 pub(crate) const ENV_PREFIX: &str = "TOLLGATE_";
 

@@ -107,7 +107,7 @@ impl UsageSource for OpenaiSource {
                             retain_costs(&mut reading, prior, target.now_secs);
                         }
                         reading.note = Some(format!(
-                            "{NOTE}; costs need an OpenAI admin key (sk-admin-…)"
+                            "{NOTE}; costs need an OpenAI admin key (sk-admin-...)"
                         ))
                     }
                     Err(failure) => {

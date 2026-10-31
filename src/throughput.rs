@@ -74,15 +74,21 @@ fn model_key(model: Option<&str>) -> String {
 }
 
 /// Record one successful delegate run's observed pace. No-op on a zero/missing
-/// duration or token count — nothing meaningful to measure.
+/// duration or token count — nothing meaningful to measure — and no-op when the
+/// stored throughput identity no longer matches the credential the delegate was
+/// launched under (`captured`).
 pub(crate) fn record_success(
     profile: &crate::profile::ProfileName,
     model: Option<&str>,
     output_tokens: u64,
     duration_ms: u64,
     now: i64,
+    captured: Option<u64>,
 ) {
     if output_tokens == 0 || duration_ms == 0 {
+        return;
+    }
+    if !identity_matches(profile, captured) {
         return;
     }
     let tok_s = output_tokens as f64 / (duration_ms as f64 / 1000.0);
@@ -101,18 +107,32 @@ pub(crate) fn record_success(
 }
 
 /// Record a rate-limit / 429 hit for a model, with an optional Retry-After hint.
+/// No-op when the stored throughput identity no longer matches the credential
+/// the delegate was launched under (`captured`).
 pub(crate) fn record_rate_limit(
     profile: &crate::profile::ProfileName,
     model: Option<&str>,
     retry_after_s: Option<u64>,
     now: i64,
+    captured: Option<u64>,
 ) {
+    if !identity_matches(profile, captured) {
+        return;
+    }
     let mut store: ThroughputStore =
         load_profile_cache(profile, THROUGHPUT_CACHE_FILE).unwrap_or_default();
     let entry = store.models.entry(model_key(model)).or_default();
     entry.last_rate_limited_at = Some(now);
     entry.last_retry_after_s = retry_after_s;
     write_profile_cache(profile, THROUGHPUT_CACHE_FILE, &store);
+}
+
+/// Whether the stored throughput identity still equals the one captured at
+/// delegate spawn. An identity file that exists but will not read or parse
+/// writes nothing (one lost sample, never a sample under the wrong credential).
+fn identity_matches(profile: &crate::profile::ProfileName, captured: Option<u64>) -> bool {
+    let (disk, unreadable) = crate::usage::read_throughput_for_compare(profile);
+    !unreadable && disk == captured
 }
 
 /// Display summary for a profile's models, most-recently-sampled first. Empty

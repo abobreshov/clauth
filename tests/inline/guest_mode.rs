@@ -179,6 +179,14 @@ fn upstream_active_needs_the_upstream_dir_and_no_completed_import() {
 fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_identical() {
     let home = HomeSandbox::new();
     stage_upstream(home.home());
+    // The heal legs below read agentgear's marker tree and resolve `claude`
+    // off the process env (`HOME`, `XDG_DATA_HOME`, `PATH`). Pin all of them to
+    // the sandbox with no `claude` on PATH, so the pre-check reads this box,
+    // not the operator's real install, and nothing can spawn.
+    #[cfg(unix)]
+    let _claude = crate::testutil::FakeClaude::new_without_claude(&home);
+    #[cfg(not(unix))]
+    crate::plugin_host::arm_heal_throttle_for_test();
     let config = two_profiles();
     let before = global_files(home.home());
     assert!(upstream_active());
@@ -200,7 +208,7 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
 
     // The headless switch (MCP tool, daemon API) refuses as an authored sentence.
     let (config, out) = through_handle(config, |h| {
-        crate::actions::switch_profile_noninteractive(h, &two, None, no_refresh)
+        crate::actions::switch_profile_noninteractive(h, &two, None, no_refresh, None)
     });
     match out {
         Err(crate::actions::SwitchError::Refused(sentence)) => {
@@ -274,7 +282,8 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
     let one = config.find(&ProfileName::from("one")).unwrap().clone();
     crate::claude::apply_profile_to_claude_settings(&one, &["UPSTREAM".to_string()])
         .expect("settings write is a silent no-op");
-    crate::claude_json::strip_home_oauth_account().expect("strip is a silent no-op");
+    // The strip is infallible now; in guest mode it returns before any read.
+    crate::claude_json::strip_home_oauth_account();
     crate::settings_sync::sync_once().expect("sync");
     crate::claude_json::sync_once().expect("sync");
 
@@ -282,8 +291,8 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
     // writes now (`tests/inline/guest_write.rs` pins them). The heal legs
     // touch nothing of upstream's: the `self-heal` hook stands down outside a
     // tollgate session, the repoint re-points only tollgate's own rows, and
-    // with nothing of tollgate's registered neither detached leg spawns (both
-    // return before the fake-claude assertion).
+    // with nothing of tollgate's registered (and no `claude` to drive) the
+    // pre-check heals nothing.
     crate::plugin_host::self_heal().expect("self-heal is a no-op here");
     let repoint = crate::plugin_host::repoint_registry().unwrap();
     assert!(repoint.line.is_none() && !repoint.changed);
@@ -291,8 +300,13 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
     crate::plugin_host::preflight();
 
     // The codex capture adopts ~/.codex/auth.json, so it refuses too.
-    let err =
-        crate::actions::codex_login_capture_at("cx", "2026-09-29T00:00:00+00:00").unwrap_err();
+    let err = crate::actions::codex_login_capture_at(
+        "cx",
+        "2026-09-29T00:00:00+00:00",
+        crate::actions::CodexLandMode::CreateOrReauth,
+    )
+    .err()
+    .expect("guest mode refuses the codex capture");
     assert!(is_guest_refusal(&err));
 
     // Account edits on the recorded-active profile keep their global legs off.
@@ -303,6 +317,27 @@ fn guest_mode_refuses_every_global_mutation_and_leaves_upstreams_files_byte_iden
         std::collections::BTreeMap::from([("NEW_KEY".to_string(), "v".to_string())]),
     )
     .expect("the store edit lands; settings.json is skipped");
+    // C-G81: `tollgate login`'s model write; C-G78: the presets rebind. Both
+    // re-apply the active profile to `settings.json` only through the gated
+    // `apply_profile_to_claude_settings`.
+    crate::actions::set_profile_default_model(
+        &mut config,
+        &ProfileName::from("one"),
+        &crate::testutil::profile_id("one"),
+        "opus",
+    )
+    .expect("the model lands in the store; settings.json is skipped");
+    let moved = crate::actions::apply_rebind_account(
+        &mut config,
+        &ProfileName::from("one"),
+        &[crate::presets::RowMove {
+            row: "sonnet",
+            old: None,
+            new: Some("rebound-sonnet".to_string()),
+        }],
+    )
+    .expect("the rebind lands in the store; settings.json is skipped");
+    assert_eq!(moved, 1);
     crate::actions::clear_profile_credentials(&mut config, &ProfileName::from("one"))
         .expect("logout clears the store and our marker only");
     assert!(config.state.active_profile.is_none());
@@ -333,12 +368,52 @@ fn a_first_account_in_guest_mode_is_created_but_never_auto_activated() {
             ..OAuthToken::default_extra()
         }),
     };
-    crate::actions::create_profile_from_login(&mut config, "fresh".to_string(), None, creds, None)
-        .expect("the profile is created");
+    crate::actions::create_profile_from_login(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        creds,
+        None,
+        None,
+    )
+    .expect("the profile is created");
     assert!(config.find(&ProfileName::from("fresh")).is_some());
     assert!(
         config.state.active_profile.is_none(),
         "the first account does not take the global slot in guest mode"
+    );
+    assert_eq!(global_files(home.home()), before);
+
+    // C-G80: `capture_new_profile` lands through `capture_into_profile`,
+    // whose no-active arm is gated the same way: still no active profile, so
+    // outside guest mode this capture would take the global slot.
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "captured-access".to_string(),
+                refresh_token: Some("captured-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }),
+        base_url: None,
+        api_key: None,
+        anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
+    };
+    crate::actions::capture_into_profile(
+        &mut config,
+        "captured".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("the captured profile is created");
+    assert!(config.find(&ProfileName::from("captured")).is_some());
+    assert!(
+        config.state.active_profile.is_none(),
+        "a captured first account does not take the global slot in guest mode"
     );
     assert_eq!(global_files(home.home()), before);
 }
@@ -417,7 +492,7 @@ fn guest_sync_keeps_runtime_copies_out_of_the_operator_member_set() {
     };
 
     // A runtime copy is newest: neither its sibling nor the operator file follows.
-    crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
+    crate::jsonsync::sync_paths(&paths, Some(&base), None, shared).unwrap();
     assert_eq!(std::fs::read(&base).unwrap(), br#"{"theme":"base"}"#);
     assert_eq!(theme(&a), "a");
     assert_eq!(theme(&b), "b");
@@ -425,7 +500,7 @@ fn guest_sync_keeps_runtime_copies_out_of_the_operator_member_set() {
     // The operator file is newest: no runtime copy takes it, and it stays unwritten.
     std::fs::write(&base, br#"{"theme":"edited"}"#).unwrap();
     set_mtime(&base, now + std::time::Duration::from_secs(60));
-    crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
+    crate::jsonsync::sync_paths(&paths, Some(&base), None, shared).unwrap();
     assert_eq!(std::fs::read(&base).unwrap(), br#"{"theme":"edited"}"#);
     assert_eq!(theme(&a), "a");
     assert_eq!(theme(&b), "b");
@@ -435,7 +510,7 @@ fn guest_sync_keeps_runtime_copies_out_of_the_operator_member_set() {
     std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
     std::fs::write(&journal, br#"{"state":"complete"}"#).unwrap();
     assert!(!upstream_active());
-    crate::jsonsync::sync_paths(&paths, Some(&base), shared).unwrap();
+    crate::jsonsync::sync_paths(&paths, Some(&base), None, shared).unwrap();
     assert_eq!(theme(&a), "edited");
     assert_eq!(theme(&b), "edited");
 }
@@ -538,6 +613,7 @@ fn a_guest_b_swap_and_relaunch_leave_every_operator_tree_byte_identical() {
     let before = operator_trees(home.home());
 
     let launch = crate::runtime::LaunchInfo {
+        launcher: crate::live_sessions::Launcher::Own,
         hot_swap: crate::hot_swap::HotSwapPolicy::Allowed,
         spawn_cwd: Some(cwd.clone()),
         relaunch_capable: true,
@@ -671,4 +747,187 @@ fn guest_codex_native_refuses_upstream_profile_store_symlink() {
     assert_eq!(std::fs::read(&upstream).unwrap(), UPSTREAM_CODEX_AUTH);
     assert_eq!(std::fs::read_link(&global).unwrap(), upstream);
     assert!(upstream_active());
+}
+
+/// Upstream's live login, as a login a bare-item save would take.
+fn upstream_login() -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "upstream-access".to_string(),
+            refresh_token: Some("upstream-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// C-G56, C-G57, C-G58 (ledger): the bare-item saves and the live-file capture
+/// refuse in guest mode before they read or write anything, since the item's
+/// login and the live file's are upstream clauth's refresh chain. No profile
+/// is created and every global file stays byte-identical.
+#[test]
+fn guest_mode_refuses_the_bare_item_saves_and_the_live_file_capture() {
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    let mut config = two_profiles();
+    let before = global_files(home.home());
+    assert!(upstream_active());
+
+    let err =
+        crate::actions::save_bare_item_as_profile(&mut config, "saved", upstream_login(), None)
+            .unwrap_err();
+    assert!(is_guest_refusal(&err), "{err:#}");
+    let err = crate::actions::save_bare_item_as_profile_fresh(
+        &mut config,
+        "saved",
+        upstream_login(),
+        None,
+    )
+    .unwrap_err();
+    assert!(is_guest_refusal(&err), "{err:#}");
+    assert!(config.find(&ProfileName::from("saved")).is_none());
+    assert!(
+        !crate::profile::profile_dir(&ProfileName::from("saved"))
+            .unwrap()
+            .exists(),
+        "no profile dir was created"
+    );
+
+    let err = crate::actions::capture_live_file_snapshot().unwrap_err();
+    assert!(is_guest_refusal(&err), "{err:#}");
+    // C-G58: the capture of the login in use refuses too, and on macOS its
+    // refusal sits above the bare-item branch's `security` read.
+    let err = crate::actions::capture_snapshot().unwrap_err();
+    assert!(is_guest_refusal(&err), "{err:#}");
+    let body = include_str!("../../src/actions.rs")
+        .split_once("pub(crate) fn capture_snapshot(")
+        .expect("capture_snapshot defined")
+        .1
+        .split_once("\n}\n")
+        .expect("capture_snapshot closes")
+        .0;
+    let refuse = body
+        .find("refuse_foreign_live_login()?")
+        .expect("capture_snapshot refuses first");
+    let read = body
+        .find("read_bare_keychain_item()")
+        .expect("capture_snapshot reads the bare item on macOS");
+    assert!(refuse < read, "the refusal runs before the bare-item read");
+
+    assert_eq!(global_files(home.home()), before);
+}
+
+/// C-G68 (ledger): deleting the recorded-active profile in guest mode
+/// removes tollgate's own record and dir, and leaves upstream's live
+/// credentials and `settings.json` byte-identical: guest mode wired nothing
+/// into either, so there is nothing to unwire.
+#[test]
+fn guest_mode_deletes_the_active_profile_without_unwiring_upstreams_slot() {
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    let mut config = two_profiles();
+    let one = ProfileName::from("one");
+    assert!(config.is_active(&one));
+    // C-G10: a dead tree's rescue tombstone the delete's rescue leg lifts, and
+    // the operator's transcript store it must leave alone.
+    let projects = home.home().join(".claude").join("projects").join("-ws");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(projects.join("operator.jsonl"), b"{\"op\":1}\n").unwrap();
+    let tomb = crate::profile::profile_dir(&one)
+        .unwrap()
+        .join("runtime-isolated-4260-0.rescuing");
+    std::fs::create_dir_all(tomb.join("projects").join("-ws")).unwrap();
+    std::fs::write(tomb.join("projects/-ws/tomb.jsonl"), b"{\"t\":1}\n").unwrap();
+    let before = global_files(home.home());
+
+    let rotation = crate::actions::rotation_guard_for_mutation(&one).unwrap();
+    crate::actions::delete_profile(&mut config, &one, false, &rotation)
+        .expect("guest mode deletes a tollgate profile");
+    drop(rotation);
+    assert!(config.find(&one).is_none());
+    assert!(!crate::profile::profile_dir(&one).unwrap().exists());
+
+    assert_eq!(
+        global_files(home.home()),
+        before,
+        "the delete left upstream's live slot and settings.json alone"
+    );
+    let operator_store: Vec<_> = std::fs::read_dir(&projects)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        operator_store,
+        vec![std::ffi::OsString::from("operator.jsonl")],
+        "the delete's rescue added nothing to ~/.claude/projects"
+    );
+    assert_eq!(
+        std::fs::read(projects.join("operator.jsonl")).unwrap(),
+        b"{\"op\":1}\n",
+        "the operator's transcript is untouched"
+    );
+    assert_eq!(
+        std::fs::read(
+            crate::runtime::guest_projects_store()
+                .unwrap()
+                .join("-ws/tomb.jsonl")
+        )
+        .unwrap(),
+        b"{\"t\":1}\n",
+        "the tombstone's transcript landed in the guest store"
+    );
+}
+
+/// C-G67, C-G79 (ledger): a reauth of the recorded-active profile in guest
+/// mode (`tollgate login <active>` lands through `overwrite_captured_profile`)
+/// rewrites only tollgate's store. The guest arm in
+/// `overwrite_captured_profile_with` skips both the relink and the
+/// `settings.json` write, so upstream's live slot and settings stay
+/// byte-identical; without it the `was_active` arm's force-link refuses.
+#[test]
+fn guest_mode_reauth_of_the_active_profile_rewrites_only_the_store() {
+    let home = HomeSandbox::new();
+    stage_upstream(home.home());
+    let mut config = two_profiles();
+    let one = ProfileName::from("one");
+    let account = crate::testutil::profile_id("one");
+    let before = global_files(home.home());
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "one-reauthed".to_string(),
+                refresh_token: Some("one-reauthed-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }),
+        base_url: None,
+        api_key: None,
+        anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
+    };
+
+    crate::actions::overwrite_captured_profile(&mut config, &one, &account, snapshot)
+        .expect("guest mode reauths tollgate's own store");
+
+    assert!(config.is_active(&one), "the reauth keeps the record");
+    let stored = crate::profile::load_profile(&one).unwrap();
+    assert_eq!(
+        stored
+            .credentials
+            .and_then(|c| c.claude_ai_oauth)
+            .map(|o| o.access_token)
+            .as_deref(),
+        Some("one-reauthed"),
+        "the store took the new login"
+    );
+    assert_eq!(
+        global_files(home.home()),
+        before,
+        "the reauth left upstream's live slot and settings.json alone"
+    );
 }

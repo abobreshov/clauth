@@ -15,7 +15,10 @@
 //! atomic so a re-selection re-renders in the new palette on the next frame
 //! without a process restart. Renders read it via the accessor fns below.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -33,8 +36,8 @@ pub(crate) enum Tier {
 }
 
 impl Tier {
-    /// Stable atomic encoding. `0` doubles as "uninitialized" so the accessor
-    /// can fall back to auto-detect before [`init`] runs.
+    /// Stable code. `0` doubles as "uninitialized": the production accessor
+    /// falls back to auto-detect, the test accessor to `Full`.
     fn as_code(self) -> u8 {
         match self {
             Tier::Full => 1,
@@ -51,9 +54,25 @@ impl Tier {
     }
 }
 
-/// Process-global tier as an atomic code (`0` = unset → auto-detect). Seeded by
-/// [`init`] and swappable at runtime via [`set_tier`] for the live theme picker.
+/// Tier holder. In production builds a process-global atomic code (`0` = unset
+/// → auto-detect), seeded by [`init`] and swappable at runtime via [`set_tier`]
+/// for the live theme picker. In test builds a thread-local cell, so a
+/// `TierSandbox` on one test thread never changes another thread's tier.
+#[cfg(not(test))]
 static TIER: AtomicU8 = AtomicU8::new(0);
+
+/// Terminal family holder, paired with [`TIER`]. Claude Code draws a different
+/// working-line set when `TERM` is `xterm-ghostty`, so the choice is made once
+/// at startup rather than per frame.
+#[cfg(not(test))]
+static GHOSTTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static TIER: Cell<u8> = const { Cell::new(0) };
+    static GHOSTTY: Cell<bool> = const { Cell::new(false) };
+    static TEST_PALETTE: Cell<Option<Palette>> = const { Cell::new(None) };
+}
 
 /// Detect the tier from `$COLORTERM`:
 /// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
@@ -68,44 +87,73 @@ pub(crate) fn detect() -> Tier {
     }
 }
 
-/// Seed the process tier at startup.
+/// Detect the terminal family Claude Code draws its other working-line set for.
+pub(crate) fn detect_ghostty() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty")
+}
+
+/// Seed the process tier and terminal family at startup.
 /// Precedence (highest first): explicit override → auto-detect.
 pub(crate) fn init(override_tier: Option<Tier>) {
     set_tier(override_tier.unwrap_or_else(detect));
+    set_ghostty(detect_ghostty());
+}
+
+/// Whether the terminal is the family Claude Code draws its other working-line
+/// set for.
+pub(crate) fn ghostty_marks() -> bool {
+    #[cfg(not(test))]
+    {
+        GHOSTTY.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        GHOSTTY.with(Cell::get)
+    }
+}
+
+pub(crate) fn set_ghostty(on: bool) {
+    #[cfg(not(test))]
+    GHOSTTY.store(on, Ordering::Relaxed);
+    #[cfg(test)]
+    GHOSTTY.with(|c| c.set(on));
 }
 
 /// Swap the active tier at runtime. The next render reads the new value, so the
 /// Config tab's theme selector applies immediately.
 pub(crate) fn set_tier(tier: Tier) {
+    #[cfg(not(test))]
     TIER.store(tier.as_code(), Ordering::Relaxed);
+    #[cfg(test)]
+    TIER.with(|c| c.set(tier.as_code()));
 }
 
-/// Return the active tier. Falls back to auto-detect if [`init`] was not called.
+/// Return the active tier. Falls back to auto-detect if [`init`] was not called;
+/// in test builds an unset tier is `Full`, independent of the ambient
+/// `$COLORTERM`.
 #[inline]
 pub(crate) fn tier() -> Tier {
-    Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    #[cfg(not(test))]
+    {
+        Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    }
+    #[cfg(test)]
+    {
+        Tier::from_code(TIER.with(|c| c.get())).unwrap_or(Tier::Full)
+    }
 }
 
-/// Serializes tests that pin the tier. Every `tests/inline/*.rs` module compiles
-/// into the one bin target, so under `cargo test` they run as threads sharing
-/// this `TIER`. `testutil::TierSandbox` acquires it as an RAII guard.
-#[cfg(test)]
-pub(crate) static TIER_TEST_LOCK: crate::lockorder::RankedMutex<
-    (),
-    crate::lockorder::rank::TierTest,
-> = crate::lockorder::RankedMutex::new(());
-
-/// Read the stored pin, `None` for unset. [`tier`] collapses unset into a
-/// detected tier, which a restore would then write back as a real pin.
+/// Read the stored pin, `None` for unset. [`tier`] collapses unset into the
+/// test default `Full`, which a restore would then write back as a real pin.
 #[cfg(test)]
 pub(crate) fn tier_override() -> Option<Tier> {
-    Tier::from_code(TIER.load(Ordering::Relaxed))
+    Tier::from_code(TIER.with(|c| c.get()))
 }
 
 /// Put back a [`tier_override`] reading.
 #[cfg(test)]
 pub(crate) fn restore_tier(snapshot: Option<Tier>) {
-    TIER.store(snapshot.map_or(0, Tier::as_code), Ordering::Relaxed);
+    TIER.with(|c| c.set(snapshot.map_or(0, Tier::as_code)));
 }
 
 // ── Palette tables ────────────────────────────────────────────────────────────
@@ -140,6 +188,7 @@ impl Swatch {
         }
     }
 
+    #[cfg(not(test))]
     const fn pack(self) -> u32 {
         (self.rgb.0 as u32) << 24
             | (self.rgb.1 as u32) << 16
@@ -147,6 +196,7 @@ impl Swatch {
             | self.idx as u32
     }
 
+    #[cfg(not(test))]
     const fn unpack(v: u32) -> Self {
         Self::new((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8)
     }
@@ -225,69 +275,56 @@ pub(crate) const CATPPUCCIN: Palette = Palette {
 /// [`PALETTE_SET`] is true, so the zero-initialised slots never render.
 /// Per-role atomics rather than a lock: an accessor runs per cell per frame,
 /// and a torn read across roles during a live reload lasts one frame.
+#[cfg(not(test))]
 static SLOTS: [AtomicU32; ROLE_COUNT] = [const { AtomicU32::new(0) }; ROLE_COUNT];
+#[cfg(not(test))]
 static PALETTE_SET: AtomicBool = AtomicBool::new(false);
-/// `0` = Catppuccin, `1` = Omarchy.
-static PALETTE_KIND: AtomicU8 = AtomicU8::new(0);
 
 /// Make `palette` the one every accessor reads from the next frame on.
 pub(crate) fn install_palette(palette: &Palette) {
-    for (slot, sw) in SLOTS.iter().zip(palette.swatches.iter()) {
-        slot.store(sw.pack(), Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        for (slot, sw) in SLOTS.iter().zip(palette.swatches.iter()) {
+            slot.store(sw.pack(), Ordering::Relaxed);
+        }
+        PALETTE_SET.store(true, Ordering::Release);
     }
-    PALETTE_KIND.store(
-        match palette.kind {
-            PaletteKind::Catppuccin => 0,
-            PaletteKind::Omarchy => 1,
-        },
-        Ordering::Relaxed,
-    );
-    PALETTE_SET.store(true, Ordering::Release);
+    #[cfg(test)]
+    TEST_PALETTE.with(|p| p.set(Some(*palette)));
 }
 
 /// The installed palette (Catppuccin until something is installed).
 #[cfg(test)]
 pub(crate) fn current_palette() -> Palette {
-    if !PALETTE_SET.load(Ordering::Acquire) {
-        return CATPPUCCIN;
-    }
-    let mut swatches = CATPPUCCIN.swatches;
-    for (sw, slot) in swatches.iter_mut().zip(SLOTS.iter()) {
-        *sw = Swatch::unpack(slot.load(Ordering::Relaxed));
-    }
-    Palette {
-        kind: if PALETTE_KIND.load(Ordering::Relaxed) == 1 {
-            PaletteKind::Omarchy
-        } else {
-            PaletteKind::Catppuccin
-        },
-        swatches,
-    }
+    TEST_PALETTE.with(Cell::get).unwrap_or(CATPPUCCIN)
 }
 
-/// Test-only: the raw install state, so a test that installs a palette can put
-/// the process back the way it found it.
+/// Test-only: save the installing thread's palette pin.
 #[cfg(test)]
 pub(crate) fn palette_snapshot() -> Option<Palette> {
-    PALETTE_SET.load(Ordering::Acquire).then(current_palette)
+    TEST_PALETTE.with(Cell::get)
 }
 
 /// Test-only: restore a [`palette_snapshot`].
 #[cfg(test)]
 pub(crate) fn restore_palette(snapshot: Option<Palette>) {
-    match snapshot {
-        Some(p) => install_palette(&p),
-        None => PALETTE_SET.store(false, Ordering::Release),
-    }
+    TEST_PALETTE.with(|p| p.set(snapshot));
 }
 
 /// The installed swatch for `role`.
 #[inline]
 pub(crate) fn swatch(role: Role) -> Swatch {
-    if !PALETTE_SET.load(Ordering::Acquire) {
-        return CATPPUCCIN.get(role);
+    #[cfg(not(test))]
+    {
+        if !PALETTE_SET.load(Ordering::Acquire) {
+            return CATPPUCCIN.get(role);
+        }
+        Swatch::unpack(SLOTS[role as usize].load(Ordering::Relaxed))
     }
-    Swatch::unpack(SLOTS[role as usize].load(Ordering::Relaxed))
+    #[cfg(test)]
+    {
+        current_palette().get(role)
+    }
 }
 
 /// `role`'s colour at the active tier.
@@ -360,7 +397,6 @@ pub(crate) fn accent_color() -> Color {
 pub(crate) fn accent_2_color() -> Color {
     pick(Role::Accent2)
 }
-
 // ── Semantic ──────────────────────────────────────────────────────────────────
 #[inline]
 pub(crate) fn success_color() -> Color {
@@ -392,20 +428,81 @@ pub(crate) fn bg_warning_color() -> Color {
 }
 
 /// Per-channel RGB blend of `over` onto `beneath`, weighted by `alpha`
-/// (the weight of `over`, clamped to `0.0..=1.0`).
-/// Blends only on the full truecolor tier with both colors RGB-resolvable;
-/// otherwise returns `over` unchanged.
+/// (the weight of `over`, clamped to `0.0..=1.0`). The full tier blends two
+/// `Color::Rgb`s and returns `over` unchanged otherwise — the call shape the
+/// identity-wave crest uses. The compatible tier resolves both colors to RGB
+/// (an indexed color to the RGB its xterm index stands in for, an unknown or
+/// `Reset` one to `BG`), blends, and snaps to the nearest xterm-256 index.
 pub(crate) fn blend_over(beneath: Color, over: Color, alpha: f64) -> Color {
-    let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
-        return over;
-    };
-    if tier() != Tier::Full {
-        return over;
-    }
     let a = alpha.clamp(0.0, 1.0);
     let mix = |o: u8, b: u8| -> u8 { (a * f64::from(o) + (1.0 - a) * f64::from(b)).round() as u8 };
-    Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+    match tier() {
+        Tier::Full => {
+            let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
+                return over;
+            };
+            Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+        }
+        Tier::Compatible => {
+            let (br, bg, bb) = rgb_of(beneath);
+            let (or, og, ob) = rgb_of(over);
+            Color::Indexed(nearest_xterm256((mix(or, br), mix(og, bg), mix(ob, bb))))
+        }
+    }
 }
+
+/// Resolve an indexed surface through the installed palette's paired RGB
+/// column, then the standard xterm table. Unknown colours use the current
+/// background, so toast glass follows a live Omarchy palette change too.
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => indexed_rgb(i),
+        _ => swatch(Role::Bg).rgb,
+    }
+}
+
+#[allow(
+    clippy::needless_range_loop,
+    reason = "`role` indexes the live slots or the default table, chosen per cfg"
+)]
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    for role in 0..ROLE_COUNT {
+        #[cfg(not(test))]
+        let sw = if PALETTE_SET.load(Ordering::Acquire) {
+            Swatch::unpack(SLOTS[role].load(Ordering::Relaxed))
+        } else {
+            CATPPUCCIN.swatches[role]
+        };
+        #[cfg(test)]
+        let sw = current_palette().swatches[role];
+        if sw.idx == i {
+            return sw.rgb;
+        }
+    }
+    xterm256_rgb(i).unwrap_or(ANSI_RGB[usize::from(i.min(15))])
+}
+
+/// A fixed fallback for indexed ANSI colours not minted by the palette.
+/// Nearest-colour matching never targets these terminal-defined indices.
+const ANSI_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
 
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
 
@@ -425,6 +522,38 @@ pub(crate) fn toggle_off() -> &'static str {
         Tier::Full => "○─",
         Tier::Compatible => "[off]",
     }
+}
+
+// Claude Code's working-line marks, in its default terminals and in the set it
+// draws when `TERM` is `xterm-ghostty`.
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+const CLAUDE_WORKING_FRAMES_GHOSTTY: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✻"];
+const CLAUDE_WORKING_PERIOD_MS: u64 = 2_000;
+const CLAUDE_WORKING_SNAP_MS: u64 = 64;
+
+/// The active claude account's mark `elapsed_ms` into its working animation:
+/// six frames over a 2 s period, eased in and out by a cosine.
+pub(crate) fn active_claude_frame(elapsed_ms: u64, ghostty: bool) -> &'static str {
+    let phase =
+        elapsed_ms / CLAUDE_WORKING_SNAP_MS * CLAUDE_WORKING_SNAP_MS % CLAUDE_WORKING_PERIOD_MS;
+    let turn = std::f64::consts::TAU * phase as f64 / CLAUDE_WORKING_PERIOD_MS as f64;
+    let index = ((1.0 - turn.cos()) / 2.0 * 5.0).round() as usize;
+    let frames = if ghostty {
+        &CLAUDE_WORKING_FRAMES_GHOSTTY
+    } else {
+        &CLAUDE_WORKING_FRAMES
+    };
+    frames[index.min(frames.len() - 1)]
+}
+
+/// The mark an active claude account rests on while it spends nothing.
+pub(crate) fn active_claude_rest() -> &'static str {
+    CLAUDE_WORKING_FRAMES[4]
+}
+
+/// The active codex account's mark. Static on both tiers.
+pub(crate) fn active_codex_mark() -> &'static str {
+    "⏣"
 }
 
 /// Gutter glyph for a row in edit mode — replaces the `❯` selection caret while
@@ -474,6 +603,11 @@ pub(crate) fn label() -> Style {
     Style::default()
         .fg(text_dim_color())
         .add_modifier(Modifier::BOLD)
+}
+
+/// Eyebrow label while focus rests in its section — bold + text.
+pub(crate) fn label_active() -> Style {
+    body().add_modifier(Modifier::BOLD)
 }
 
 pub(crate) fn accent() -> Style {
@@ -886,3 +1020,9 @@ pub(crate) fn ink_color(ink: crate::usage::cards::Ink) -> Color {
 #[cfg(test)]
 #[path = "../../tests/inline/tui_theme.rs"]
 mod tests;
+
+// The upstream toast blending and harness-mark regressions share the same
+// palette engine as tollgate's Omarchy tests.
+#[cfg(test)]
+#[path = "../../tests/inline/tui_theme_upstream.rs"]
+mod upstream_tests;

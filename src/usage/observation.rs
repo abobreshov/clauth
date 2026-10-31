@@ -744,16 +744,24 @@ const MAX_MESSAGE_CHARS: usize = 160;
 /// Make a message safe to publish: control characters dropped, whitespace
 /// collapsed, anything that looks like a credential replaced with
 /// `[redacted]` (a word after `Bearer`, an `sk-`/`sess-`-style key, any
-/// 32+-char run of token alphabet), and the result cut to 160 chars.
+/// 32+-char run of token alphabet), and the result cut to 160 chars ending in
+/// ASCII `...`: the text reaches `tollgate usage --json`, the local API and
+/// MCP, where upstream's rule (8dd3c65b) is that cut text ends in `...`.
 pub(crate) fn sanitize_message(raw: &str) -> String {
     let joined = redact_credentials(raw);
     if joined.chars().count() <= MAX_MESSAGE_CHARS {
         return joined;
     }
-    let mut cut: String = joined.chars().take(MAX_MESSAGE_CHARS - 1).collect();
-    cut.push('…');
+    let mut cut: String = joined
+        .chars()
+        .take(MAX_MESSAGE_CHARS - CUT_MARK.len())
+        .collect();
+    cut.push_str(CUT_MARK);
     cut
 }
+
+/// What a cut [`sanitize_message`] ends in.
+const CUT_MARK: &str = "...";
 
 /// [`sanitize_message`] without the length cap: control characters dropped,
 /// whitespace collapsed, credential-shaped words replaced with `[redacted]`.
