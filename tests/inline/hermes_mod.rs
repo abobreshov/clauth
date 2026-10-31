@@ -309,14 +309,16 @@ fn new_reads_the_key_before_taking_any_lock() {
     let mut prompted = false;
     new_profile(&opts("or-main", Provider::Openrouter), &mut |p| {
         assert_eq!(p, Provider::Openrouter);
-        assert!(!crate::lockorder::holds::<crate::lockorder::rank::Rotation>());
-        assert!(!crate::lockorder::holds::<crate::lockorder::rank::State>());
+        debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Rotation>());
+        debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::State>());
         prompted = true;
         Ok(TEST_KEY.into())
     })
     .unwrap();
     assert!(prompted);
-    assert!(points().contains(&("the key prompt".to_string(), false)));
+    assert!(points().iter().any(|(w, _)| w == "the key prompt"));
+    // Debug only: `lockorder::holds` always reads true in release.
+    debug_assert!(points().contains(&("the key prompt".to_string(), false)));
     // An OAuth home never prompts.
     new_profile(&opts("nous-a", Provider::Nous), &mut |_| unreachable!()).unwrap();
 }
@@ -452,7 +454,8 @@ fn new_pins_every_auxiliary_task() {
         .filter(|(w, _)| w == "hermes config set")
         .collect();
     assert_eq!(sets.len(), 15);
-    assert!(sets.iter().all(|(_, held)| !held));
+    // Debug only: `lockorder::holds` always reads true in release.
+    debug_assert!(sets.iter().all(|(_, held)| !held));
 }
 
 /// Test 25a: a `config.yaml` rewritten between the projector and the guard
@@ -516,7 +519,8 @@ fn no_child_process_runs_under_a_tollgate_lock() {
             "{what} was never marked: {seen:?}"
         );
     }
-    assert!(seen.iter().all(|(_, held)| !held), "{seen:?}");
+    // Debug only: `lockorder::holds` always reads true in release.
+    debug_assert!(seen.iter().all(|(_, held)| !held), "{seen:?}");
 }
 
 /// Test 26: every pinned registry var and every plugin-scan var is removed

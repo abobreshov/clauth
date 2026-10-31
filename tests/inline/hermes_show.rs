@@ -235,6 +235,13 @@ fn strategy_writer_runs_hermes_config_set_idle_only_and_never_writes_auth_json()
     assert!(
         points
             .iter()
+            .any(|(w, _)| w == "hermes config set (strategy)"),
+        "{points:?}"
+    );
+    // Debug only: `lockorder::holds` always reads true in release.
+    debug_assert!(
+        points
+            .iter()
             .any(|(w, held)| w == "hermes config set (strategy)" && !held),
         "{points:?}"
     );

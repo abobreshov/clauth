@@ -574,6 +574,7 @@ impl Drop for PublishLock {
 
 /// Atomic no-replace rename where Linux supports it. The caller's exclusive
 /// publish lock permits plain rename when this and hard links are unsupported.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))] // the rename is Linux-only
 fn rename_no_replace(staging: &Path, request: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -1065,6 +1066,7 @@ impl TtyState {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by Linux-only tests
     pub(crate) fn termios(&self) -> &libc::termios {
         &self.termios
     }

@@ -1,4 +1,7 @@
 //! Borrow agy's Secret Service login without activating or unlocking a wallet.
+// The live fetch and the CLI paths run on Linux alone; the parsing stays compiled
+// everywhere for its tests.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 use super::{
     config::MonitorKind,
     source::{HttpReply, MonitorHttp, MonitorTarget, Reading, Secret, UsageSource},

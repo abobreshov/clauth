@@ -10,6 +10,7 @@
 
 - Clippy on Rust 1.99 no longer fails on a deprecated atomic method or a needless borrow.
 - The macOS CI job installs nextest on images whose rustup comes from Homebrew.
+- Clippy is clean on macOS, and four hermes lock-order tests no longer fail in release builds.
 - CI no longer runs on Windows, where tollgate's test suite does not compile yet.
 - `cargo deny` parks three unmaintained zbus 5 sub-crates (RUSTSEC-2026-0370 to -0372) until the move to zbus 6.
 
