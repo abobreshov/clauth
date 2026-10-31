@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.4 — 2026-10-22
+
+### Usage and monitors
+
+- Grok (`grok`) billing mapping now treats a proto3-omitted `creditUsagePercent` on an active billing period (or unified billing config) as `0%` used instead of unknown (`None`), falls back to top-level `billingPeriodStart` / `billingPeriodEnd` and `monthlyLimit` / `used` when needed, and repairs cached `grok.shared` windows that were persisted with `used_pct: null` after a period rollover.
+
 ## 0.4.3 — 2026-10-21
 
 ### Sessions and account switching
