@@ -1,6 +1,6 @@
 # Install
 
-Linux, macOS, and Windows (Git Bash / MSYS2). tollgate needs `claude` on `PATH` for `tollgate start`, `resume`, the MCP `delegate` tool, and the Claude Code plugin's install and self-heal, both of which drive the `claude plugin` CLI. Everything else works without it, including `tollgate usage`, the monitors and the local agent API.
+Linux, macOS, and Windows (Git Bash / MSYS2). CI covers Linux and macOS only: Windows is untested, since tollgate's test suite does not compile there yet. tollgate needs `claude` on `PATH` for `tollgate start`, `resume`, the MCP `delegate` tool, and the Claude Code plugin's install and self-heal, both of which drive the `claude plugin` CLI. Everything else works without it, including `tollgate usage`, the monitors and the local agent API.
 
 tollgate is a fork of [clauth](https://github.com/uwuclxdy/clauth) and installs beside it: a different binary (`tollgate`), a different data dir (`~/.tollgate`). If upstream clauth is installed, read [Guest mode](Guest-Mode) before you start.
 

@@ -15,7 +15,11 @@ yanked = "deny"
 # `{ id = "RUSTSEC-YYYY-NNNN", reason = "why it's safe / no fix yet" }`; revisit
 # each on the next audit. cargo-deny v2 has no time-based grace period — this
 # explicit list IS the triage record.
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained, no known vulnerability; via zbus 5, used only by the antigravity monitor. Fix: move to zbus 6, a separate change because it needs a live check of the agy login read" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained, no known vulnerability; via zbus 5, used only by the antigravity monitor. Fix: move to zbus 6, a separate change because it needs a live check of the agy login read" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained, no known vulnerability; via zbus 5, used only by the antigravity monitor. Fix: move to zbus 6, a separate change because it needs a live check of the agy login read" },
+]
 
 # ---------------------------------------------------------------------------
 # Licenses
