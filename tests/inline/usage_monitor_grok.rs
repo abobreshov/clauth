@@ -237,23 +237,48 @@ fn usage_adopts_one_official_login_and_keeps_the_auth_file() {
 }
 
 #[test]
-fn usage_leaves_a_missing_percent_unknown_and_hides_money() {
+fn usage_maps_proto3_omitted_zero_percent_and_hides_money() {
     let sandbox = crate::testutil::HomeSandbox::new();
     stage_login(
         sandbox.home(),
         r#"{"https://auth.x.ai::test":{"key":"ACCESS","expires_at":2000000000}}"#,
     );
     let http = billing_http(
-        json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":2000000000,"end":2000604800},"prepaidBalance":{"val":10000},"onDemandCap":{"val":5}}}),
+        json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-21T15:38:08.991028+00:00","end":"2026-10-28T15:38:08.991028+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":10000},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","billingPeriodStart":"2026-10-21T15:38:08.991028+00:00","billingPeriodEnd":"2026-10-28T15:38:08.991028+00:00"}}),
     );
     let accounts =
         crate::usage::report::accounts(&crate::usage::collect::CollectOpts::default(), &http);
     let account = grok_account(&accounts);
     assert_eq!(account.plan.as_deref(), Some("SuperGrok Plus"));
-    assert_eq!(account.windows[0].used_pct, None);
-    assert_eq!(account.windows[0].resets_at.unwrap().secs(), 2000604800);
+    assert_eq!(account.windows[0].label, "7d");
+    assert_eq!(account.windows[0].used_pct, Some(0.0));
+    assert_eq!(account.windows[0].window_secs, Some(604_800));
+    assert_eq!(account.windows[0].resets_at.unwrap().secs(), 1_793_201_888);
     assert!(account.windows[0].attribution.is_empty());
     assert!(account.money.is_empty());
+}
+
+#[test]
+fn grok_falls_back_to_top_level_billing_period_and_monthly_limit() {
+    let reading = map_billing(
+        &json!({
+            "config": {
+                "currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY"},
+                "billingPeriodStart": 2000000000,
+                "billingPeriodEnd": 2002592000,
+                "monthlyLimit": {"val": 200},
+                "used": {"val": 25}
+            }
+        }),
+        &json!({"subscriptionTier": "SuperGrok"}),
+        None,
+    )
+    .unwrap();
+    let w = &reading.windows[0];
+    assert_eq!(w.label, "30d");
+    assert_eq!(w.used_pct, Some(12.5));
+    assert_eq!(w.window_secs, Some(2_592_000));
+    assert_eq!(w.resets_at.unwrap().secs(), 2_002_592_000);
 }
 
 #[test]

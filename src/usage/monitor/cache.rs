@@ -131,6 +131,14 @@ pub(crate) fn load(id: &str) -> Option<MonitorCache> {
                 {
                     cache.hold_until_ms = None;
                 }
+                for window in &mut reading.windows {
+                    if window.id == "grok.shared"
+                        && window.used_pct.is_none()
+                        && (window.resets_at.is_some() || window.window_secs.is_some())
+                    {
+                        window.used_pct = Some(0.0);
+                    }
+                }
             }
             cache
         })

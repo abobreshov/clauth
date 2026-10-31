@@ -727,3 +727,31 @@ fn recovered_agy_login_and_legacy_project_backfill_make_monitor_due_immediately(
         );
     });
 }
+
+#[test]
+fn persisted_grok_dated_window_without_percent_repairs_to_zero() {
+    use crate::usage::observation::{QuotaWindow, Timestamp, WindowScope};
+    let _home = HomeSandbox::new();
+    let monitor = MonitorConfig::new("grok", MonitorKind::Grok);
+    let mut cache = MonitorCache::empty(&monitor);
+    cache.checked_at_ms = Some(T0);
+    cache.observed_at_ms = Some(T0);
+    let mut win = QuotaWindow::new("grok.shared", "7d", WindowScope::Shared);
+    win.window_secs = Some(604_800);
+    win.used_pct = None;
+    win.resets_at = Some(Timestamp((T0 / 1000 + 604_800) as i64));
+    cache.reading = Some(Reading {
+        plan: Some("SuperGrokPlus".into()),
+        windows: vec![win],
+        ..Reading::default()
+    });
+    crate::profile::mkdir_700(&monitors_dir().unwrap()).unwrap();
+    save(&cache).unwrap();
+
+    let loaded = load("grok").unwrap();
+    assert_eq!(
+        loaded.reading.unwrap().windows[0].used_pct,
+        Some(0.0),
+        "dated grok.shared window with null used_pct is repaired to 0% on load"
+    );
+}

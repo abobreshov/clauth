@@ -183,8 +183,10 @@ pub(crate) fn map_billing(
         ));
     }
     let period = &config["currentPeriod"];
-    let start = super::nous::value_timestamp(&period["start"]);
-    let end = super::nous::value_timestamp(&period["end"]);
+    let start = super::nous::value_timestamp(&period["start"])
+        .or_else(|| super::nous::value_timestamp(&config["billingPeriodStart"]));
+    let end = super::nous::value_timestamp(&period["end"])
+        .or_else(|| super::nous::value_timestamp(&config["billingPeriodEnd"]));
     let secs = start
         .zip(end)
         .and_then(|(s, e)| u64::try_from(e.secs() - s.secs()).ok())
@@ -197,9 +199,28 @@ pub(crate) fn map_billing(
             .unwrap_or_else(|| "shared".into()),
     };
     let mut window = QuotaWindow::new("grok.shared", label, WindowScope::Shared);
+    // xAI's proto3 JSON encoder omits scalar default `credit_usage_percent = 0.0`
+    // at the start of a billing period; match grok-native by falling back to
+    // monthlyLimit/used when positive and then 0.0 when a billing period is active.
     window.used_pct = config["creditUsagePercent"]
         .as_f64()
-        .filter(|p| p.is_finite());
+        .filter(|p| p.is_finite())
+        .map(|p| p.max(0.0))
+        .or_else(|| {
+            let limit = config["monthlyLimit"]["val"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v > 0.0)?;
+            let used = config["used"]["val"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)?;
+            Some(((used / limit) * 10_000.0).round() / 100.0)
+        })
+        .or_else(|| {
+            (start.is_some()
+                || end.is_some()
+                || config["isUnifiedBillingUser"].as_bool() == Some(true))
+            .then_some(0.0)
+        });
     window.exhausted = window.used_pct.is_some_and(|p| p >= 100.);
     window.resets_at = end;
     window.window_secs = secs;
