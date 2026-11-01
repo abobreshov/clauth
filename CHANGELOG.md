@@ -6,11 +6,17 @@
 
 - Dependency versions now match upstream's lockfile, which the 0.5.0 port missed: rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10 and tokio 1.54.1. These close six RustSec vulnerabilities (RUSTSEC-2026-0346 to -0349, -0381 and -0382) and the tokio `AsyncFd` soundness advisory (RUSTSEC-2026-0386). 0.4.4 and 0.5.0 both shipped the older versions.
 
+### Fixes
+
+- On macOS the rotate-all confirmation now says background sessions are skipped too, as upstream has it.
+
 ### Build
 
 - Clippy on Rust 1.99 no longer fails on a deprecated atomic method or a needless borrow.
 - The macOS CI job installs nextest on images whose rustup comes from Homebrew.
 - Clippy is clean on macOS, and four hermes lock-order tests no longer fail in release builds.
+- macOS tests: the 98 import and 12 antigravity tests that need those Linux-only features now skip off Linux, a new test pins that import refuses there, and the hermes fixture's entry script now also runs on macOS.
+- The coverage job keeps its gate but no longer stores reports on a `coverage` branch, which the fork does not have.
 - CI no longer runs on Windows, where tollgate's test suite does not compile yet.
 - `cargo deny` parks three unmaintained zbus 5 sub-crates (RUSTSEC-2026-0370 to -0372) until the move to zbus 6.
 

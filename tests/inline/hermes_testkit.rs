@@ -113,9 +113,11 @@ exit "$(cat "$CTL/hermes.exit" 2>/dev/null || echo 0)"
         write_exec(&python, &stub);
         write_exec(
             &entry,
+            // macOS will not take the stub, a script, as an interpreter, so it
+            // falls back to running this file with sh; line 3 hands over to the stub.
             &format!(
-                "#!{}\n# -*- coding: utf-8 -*-\nfrom hermes_cli.main import main\n",
-                python.display()
+                "#!{py}\n# -*- coding: utf-8 -*-\nexec '{py}' \"$0\" \"$@\"\n",
+                py = python.display()
             ),
         );
         std::fs::create_dir_all(hsp.join("hermes_cli")).unwrap();

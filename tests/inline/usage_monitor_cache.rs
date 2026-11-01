@@ -435,6 +435,7 @@ fn key_health_rate_limit_verdict_is_cached_and_holds_for_retry_after() {
     assert_eq!(http.calls().len(), 1);
 }
 // Slice-1 review: exercise the real cache floor, not only the source's hint.
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_rate_limit_cache_hold_has_a_fifteen_minute_floor() {
     use crate::usage::monitor::antigravity::{KeyringMetadata, KeyringProbe, with_test_keyring};

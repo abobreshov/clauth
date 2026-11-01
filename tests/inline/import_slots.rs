@@ -31,6 +31,7 @@ fn files_with(env: &Env, needle: &str) -> Vec<String> {
 
 /// Test 29. A slot linked into an upstream store is repointed in the same
 /// journal entry that moves the store (`move_relink`), not a later one.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_symlinked_live_slot_is_repointed_in_the_move_step() {
     let env = Env::new();
@@ -59,6 +60,7 @@ fn a_symlinked_live_slot_is_repointed_in_the_move_step() {
 
 /// Test 30. A regular slot holding the active profile's own login becomes
 /// the store (its inode, with its newer `mcpOAuth`), then a link to it.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_same_regular_live_slot_becomes_the_store_then_a_link() {
     let env = Env::new();
@@ -91,6 +93,7 @@ fn a_same_regular_live_slot_becomes_the_store_then_a_link() {
 /// relinked, never captured: the sidecar keeps its inode and stays the
 /// install source, the live copy moves to the profile's quarantine (review
 /// lens credentials #4), and M8's assert passes.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured() {
     let env = Env::new();
@@ -122,6 +125,7 @@ fn a_same_regular_slot_on_a_session_token_profile_is_relinked_not_captured() {
 /// `--adopt-live`, which captures it as the profile (the stored chain is
 /// kept in the profile's quarantine). On a session-token profile it refuses
 /// either way.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_it() {
     let env = Env::new();
@@ -170,6 +174,7 @@ fn a_diverged_regular_live_slot_refuses_without_adopt_live_and_is_captured_with_
 /// Test 32. With no upstream active profile, a regular slot whose refresh
 /// token equals a store's is that store's detached duplicate: relinked to
 /// it, one inode left.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_detached_duplicate_with_no_active_profile_is_relinked_to_its_store() {
     let env = Env::new();
@@ -192,6 +197,7 @@ fn a_detached_duplicate_with_no_active_profile_is_relinked_to_its_store() {
 
 /// Test 33. An independent login, or no slot at all, is left exactly as it
 /// is.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_independent_or_missing_live_slot_is_untouched() {
     let env = Env::new();
@@ -220,6 +226,7 @@ fn an_independent_or_missing_live_slot_is_untouched() {
 
 /// Test 34. A slot linking anywhere the import does not move — a
 /// non-carrier upstream file, or outside both trees — refuses.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_live_link_to_a_non_carrier_is_refused() {
     let env = Env::new();
@@ -244,6 +251,7 @@ fn a_live_link_to_a_non_carrier_is_refused() {
 
 /// Test 35. A codex slot linked into a codex store moves and repoints in
 /// one step, while the fence holds that profile's upstream rotation lock.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_codex_symlink_slot_moves_and_repoints_under_its_rotation_lock() {
     let env = Env::new();
@@ -293,6 +301,7 @@ fn a_codex_symlink_slot_moves_and_repoints_under_its_rotation_lock() {
 
 /// Test 36. A regular `~/.codex/auth.json` carrying a store's chain is a
 /// second carrier: refused.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_codex_regular_copy_of_a_store_chain_is_refused() {
     let env = Env::new();
@@ -313,6 +322,7 @@ fn a_codex_regular_copy_of_a_store_chain_is_refused() {
 }
 
 /// Test 37. An independent codex login (this machine's case) is untouched.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_independent_codex_login_is_untouched() {
     let env = Env::new();
@@ -329,6 +339,7 @@ fn an_independent_codex_login_is_untouched() {
 /// A diverged slot adopted onto a profile that stores no login at all (an
 /// api-key profile): the live inode becomes its store, and a rollback puts
 /// that same inode back as the regular slot it was.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_adopted_slot_with_no_store_to_replace_rolls_back_to_the_regular_slot() {
     let env = Env::new();
@@ -359,6 +370,7 @@ fn an_adopted_slot_with_no_store_to_replace_rolls_back_to_the_regular_slot() {
 /// profile's login is never adopted onto the active one (that would leave
 /// the chain in two stores), not even under `--adopt-live`; a slot older
 /// than the store it would supersede is refused under `--adopt-live` too.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn adopt_live_never_moves_another_profiles_login_or_a_spent_one() {
     let env = Env::new();
@@ -409,6 +421,7 @@ fn adopt_live_never_moves_another_profiles_login_or_a_spent_one() {
 /// and a rollback puts both back: the slot as the regular file it was, the
 /// store at its path, both on their own inodes and byte for byte — even
 /// when the slot's `mcpOAuth` differs from the store's.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_adopted_slot_keeps_the_superseded_store_and_rolls_back_byte_identical() {
     let env = Env::new();
@@ -450,6 +463,7 @@ fn an_adopted_slot_keeps_the_superseded_store_and_rolls_back_byte_identical() {
     assert!(!env.p(".tollgate/profiles/a").exists());
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn adopted_slot_rotation_returns_the_new_chain_and_keeps_the_superseded_one() {
     let env = Env::new();
@@ -483,6 +497,7 @@ fn adopted_slot_rotation_returns_the_new_chain_and_keeps_the_superseded_one() {
     assert!(result.warnings.iter().any(|w| w.code == "quarantine_kept"));
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_adopts_a_diverged_regular_slot_with_an_existing_capture_quarantine() {
     let env = Env::new();
@@ -516,6 +531,7 @@ fn rollback_adopts_a_diverged_regular_slot_with_an_existing_capture_quarantine()
     assert_eq!(std::fs::read(&q).expect("quarantine"), original_superseded);
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_slot_adoption_does_not_put_the_current_chain_under_rollback_superseded() {
     let env = Env::new();
@@ -551,6 +567,7 @@ fn rollback_slot_adoption_does_not_put_the_current_chain_under_rollback_supersed
     );
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_keeps_an_upstream_empty_quarantine_carrier() {
     let env = Env::new();
@@ -581,6 +598,7 @@ fn rollback_keeps_an_upstream_empty_quarantine_carrier() {
     );
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn session_token_relink_preserves_an_upstream_empty_quarantine_carrier() {
     let env = Env::new();
@@ -611,6 +629,7 @@ fn session_token_relink_preserves_an_upstream_empty_quarantine_carrier() {
 /// slot's copy is kept in the profile's quarantine (its `mcpOAuth` and
 /// refresh token exist nowhere else), and a rollback puts that inode back
 /// as the regular slot.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_relinked_session_token_slot_is_quarantined_and_restored_by_rollback() {
     let env = Env::new();

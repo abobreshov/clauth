@@ -2240,7 +2240,8 @@ pub(crate) struct Toast {
 const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 
 #[cfg(target_os = "macos")]
-const ROTATE_ALL_DETAIL: &str = "accounts with a live tollgate start session are skipped.";
+const ROTATE_ALL_DETAIL: &str =
+    "accounts with a live tollgate start or background session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 

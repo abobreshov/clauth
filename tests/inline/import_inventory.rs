@@ -18,6 +18,7 @@ fn entry_lines(r: &txn::Report) -> Vec<String> {
 /// link of the home as it was, and creates nothing — not even a lock file
 /// (the reference tree has no `clauthd.lock`, and `~/.tollgate/.lock` does
 /// not exist yet).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn dry_run_changes_no_byte_and_creates_no_lock_file() {
     let env = Env::new();
@@ -36,6 +37,7 @@ fn dry_run_changes_no_byte_and_creates_no_lock_file() {
 /// Test 2. The reference tree (the owner machine's shape) classifies
 /// exactly as spec §3.4 says, every entry and every action, `clauth.log`
 /// skipped; the slots, the roster and the step count come out with it.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn dry_run_classifies_the_reference_inventory() {
     let env = Env::new();
@@ -109,6 +111,7 @@ fn dry_run_classifies_the_reference_inventory() {
 
 /// Test 3. Anything the table does not name refuses, at the top level and
 /// inside a profile: it may carry a credential.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_unknown_top_level_or_profile_entry_is_refused() {
     let env = Env::new();
@@ -135,6 +138,7 @@ fn an_unknown_top_level_or_profile_entry_is_refused() {
 /// Upstream 0.16.0 keeps the per-model throughput samples inside each
 /// profile (`throughput.rs` writes them with `write_profile_cache`): a
 /// profile cache, copied, not an unknown entry.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_profile_throughput_cache_is_copied_not_refused() {
     let env = Env::new();
@@ -153,6 +157,7 @@ fn a_profile_throughput_cache_is_copied_not_refused() {
 
 /// Test 4. A crashed rotation's staged chain and a crashed write's staging
 /// file each refuse with the remedy that lets upstream adopt it.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_pending_rotation_or_stray_temp_is_refused_with_its_remedy() {
     let env = Env::new();
@@ -179,6 +184,7 @@ fn a_pending_rotation_or_stray_temp_is_refused_with_its_remedy() {
 
 /// Test 5. A chain with a second hard link, or a store that is a symlink,
 /// has no single inode to move: refused.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_hardlinked_or_symlinked_carrier_is_refused() {
     let env = Env::new();
@@ -198,6 +204,7 @@ fn a_hardlinked_or_symlinked_carrier_is_refused() {
 
 /// Test 6. A codex home holding an `auth.json` at any depth is a second
 /// carrier: refused. Without one it is copied.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn codex_home_holding_auth_json_is_refused() {
     let env = Env::new();
@@ -219,6 +226,7 @@ fn codex_home_holding_auth_json_is_refused() {
 
 /// Test 7. A stale per-session tree is skipped, but a regular-file chain
 /// copy inside it refuses; a symlink there is fine.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_carrier_copy_in_a_stale_runtime_tree_is_refused_and_a_symlink_there_is_not() {
     let env = Env::new();
@@ -245,6 +253,7 @@ fn a_carrier_copy_in_a_stale_runtime_tree_is_refused_and_a_symlink_there_is_not(
 
 /// Test 8. A name tollgate's claude roster, its codex roster or a bare
 /// profile dir already holds refuses, whatever the case.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_name_colliding_with_either_roster_or_a_profile_dir_is_refused_case_insensitively() {
     let env = Env::new();
@@ -308,6 +317,7 @@ fn a_name_colliding_with_either_roster_or_a_profile_dir_is_refused_case_insensit
 /// Test 51c. The uniqueness check is `actions::validate_profile_name`'s own,
 /// so the message names the harness whose roster holds the name — and a
 /// rename to a name some roster holds refuses the same way.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_name_held_by_any_roster_refuses_through_validate_profile_name() {
     let env = Env::new();
@@ -354,6 +364,7 @@ fn a_name_held_by_any_roster_refuses_through_validate_profile_name() {
 
 /// Test 10 (M-1 half). A source whose filesystem differs from its
 /// destination's refuses before anything moves; nothing is copied.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn cross_device_source_and_destination_are_refused_without_a_copy() {
     let env = Env::new();
@@ -382,6 +393,7 @@ fn cross_device_source_and_destination_are_refused_without_a_copy() {
 
 /// Test 11. No fixture token reaches the text report, the JSON report, the
 /// journal or the backups — dry-run, run and rollback.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn import_report_never_echoes_a_fixture_secret() {
     let env = Env::new();
@@ -421,6 +433,7 @@ fn import_report_never_echoes_a_fixture_secret() {
 /// Test 12. The dry-run probes every fence file read-only: one held
 /// elsewhere reads `held` and blocks, a free one `free`, a missing one
 /// `absent` (and stays missing).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn dry_run_reports_held_free_and_absent_locks() {
     let env = Env::new();
@@ -451,10 +464,26 @@ fn dry_run_reports_held_free_and_absent_locks() {
     assert!(!env.p(".clauth/clauthd.lock").exists());
 }
 
-/// Test 13. A completed import, a home without `~/.clauth`, and any
-/// platform but Linux all refuse at M-1.
+/// Test 13a. Any platform but Linux refuses at M-1: the seam poses one on
+/// Linux, and every other host takes the real check.
 #[test]
-fn already_complete_no_upstream_and_non_linux_are_refused() {
+fn a_platform_other_than_linux_is_refused() {
+    let env = Env::new();
+    env.tree.reference();
+    if cfg!(target_os = "linux") {
+        env.seams.set(|s| s.not_linux = true);
+    }
+    assert_eq!(
+        codes(&survey(&Options::default())),
+        ["unsupported_platform"]
+    );
+}
+
+/// Test 13. A completed import and a home without `~/.clauth` both refuse
+/// at M-1.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
+#[test]
+fn already_complete_and_no_upstream_are_refused() {
     let env = Env::new();
     env.tree.reference();
     std::fs::write(env.paths().journal(), "{\"state\":\"complete\"}").expect("journal");
@@ -464,12 +493,6 @@ fn already_complete_no_upstream_and_non_linux_are_refused() {
     assert!(codes(&s).contains(&"journal_pending".to_string()));
     assert_eq!(exit_of(txn::blocked_outcome(&s, true)), 4);
     std::fs::remove_file(env.paths().journal()).expect("rm journal");
-    env.seams.set(|s| s.not_linux = true);
-    assert_eq!(
-        codes(&survey(&Options::default())),
-        ["unsupported_platform"]
-    );
-    env.seams.set(|s| s.not_linux = false);
     std::fs::remove_dir_all(env.p(".clauth")).expect("rm clauth");
     let s = survey(&Options::default());
     assert_eq!(codes(&s), ["upstream_absent"]);
@@ -478,6 +501,7 @@ fn already_complete_no_upstream_and_non_linux_are_refused() {
 
 /// Test 51a. A tollgate that is not the first `tollgate` on `PATH` (a
 /// `cargo run` build) refuses; the installed one passes.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_dev_build_exe_is_refused_and_the_installed_path_passes() {
     let env = Env::new();
@@ -512,6 +536,7 @@ fn a_dev_build_exe_is_refused_and_the_installed_path_passes() {
 /// Test 51b. An upstream build off `PATH` (`<src>/target/*/clauth`, `<src>`
 /// read from the cargo install record) is listed as a warning, and never
 /// executed: its sentinel stays absent.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn offpath_upstream_builds_are_listed_as_warnings_without_exec() {
     let env = Env::new();
@@ -581,6 +606,7 @@ fn install_source_in_follows_the_content_aware_rule() {
 /// upstream claude or codex profile whose name `hermes-profiles.toml` holds
 /// (any case) refuses naming the Hermes roster, `--rename` clears it, and an
 /// unreadable Hermes roster blocks the whole check.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn import_refuses_a_name_held_by_a_hermes_profile() {
     let env = Env::new();
@@ -643,6 +669,7 @@ fn import_refuses_a_name_held_by_a_hermes_profile() {
 /// named `clauth` is never an F1 target: the survey refuses with
 /// `upstream_binary_is_tollgate` and plans no `retire_bin`, so tollgate never
 /// renames itself and writes the shim over its own name.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_clauth_alias_to_tollgate_is_never_retired() {
     let env = Env::new();
@@ -694,6 +721,7 @@ fn a_clauth_alias_to_tollgate_is_never_retired() {
 /// Review lens credentials #9. A symlinked slot whose store is refused as
 /// `cross_device` is not also reported as `live_link_foreign` (whose
 /// "relink it with clauth first" is the wrong remedy).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_cross_device_store_does_not_also_call_its_symlinked_slot_foreign() {
     let env = Env::new();

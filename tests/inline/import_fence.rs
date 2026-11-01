@@ -56,6 +56,7 @@ fn each_fence_lock_held_elsewhere_refuses_within_three_seconds_and_changes_nothi
 
 /// Test 15. A parked upstream standby holds `clauthd-standby.lock`: the
 /// dry-run blocks on it and the fence refuses it.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_parked_upstream_standby_refuses() {
     let env = Env::new();
@@ -73,6 +74,7 @@ fn a_parked_upstream_standby_refuses() {
 
 /// Test 16. A Claude Code session (native or node-hosted) and every
 /// upstream clauth process — its MCP server included — refuse, each named.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn claude_node_claude_and_clauth_mcp_processes_refuse_and_are_named() {
     let env = Env::new();
@@ -112,6 +114,7 @@ fn claude_node_claude_and_clauth_mcp_processes_refuse_and_are_named() {
 
 /// Test 17. A codex process only warns while no codex chain is in scope,
 /// and blocks once one is.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_codex_process_blocks_only_when_codex_carriers_are_in_scope() {
     let env = Env::new();
@@ -135,6 +138,7 @@ fn a_codex_process_blocks_only_when_codex_carriers_are_in_scope() {
 
 /// Test 18. Any other tollgate process — the daemon, an MCP server, a TUI —
 /// refuses, named with its role.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn another_tollgate_process_refuses() {
     let env = Env::new();
@@ -165,6 +169,7 @@ fn another_tollgate_process_refuses() {
 
 /// Test 20a. A `tollgate start` supervisor — a Hermes session included —
 /// blocks the import (spec §4.3, the Hermes spec §6.2).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_tollgate_hermes_supervisor_blocks() {
     let env = Env::new();
@@ -185,6 +190,7 @@ fn a_tollgate_hermes_supervisor_blocks() {
 
 /// Test 19. A live-session row whose pid lives refuses, upstream's and
 /// tollgate's; a stale row only warns.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_live_session_row_with_a_live_pid_refuses_and_a_stale_one_warns() {
     let env = Env::new();
@@ -235,6 +241,7 @@ fn a_live_session_row_with_a_live_pid_refuses_and_a_stale_one_warns() {
 
 /// Test 20. A held session marker refuses: upstream's bare and per-profile
 /// markers, and every tollgate `sessions-*` marker, a Hermes one included.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_held_session_marker_refuses() {
     let env = Env::new();
@@ -282,6 +289,7 @@ fn a_held_session_marker_refuses() {
 /// Test 20b. The read-only tollgate subcommands the herdr scripts and status
 /// bars run only warn — at M1 and in a per-carrier rescan — and the import
 /// still commits.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn exempt_read_only_tollgate_runs_warn_and_never_abort() {
     let env = Env::new();
@@ -326,6 +334,7 @@ fn exempt_read_only_tollgate_runs_warn_and_never_abort() {
 
 /// Test 20c. A fence file held at M-1 is a blocker there: the run refuses
 /// with exit 3 and changes nothing.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_held_fence_file_at_m_minus_1_is_a_blocker() {
     let env = Env::new();
@@ -349,6 +358,7 @@ fn a_held_fence_file_at_m_minus_1_is_a_blocker() {
 
 /// Test 20d. A Claude Code session started while the prompt was open is
 /// caught by the post-confirmation recheck: exit 3, nothing written.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_post_confirmation_recheck_refuses_a_session_started_during_the_prompt() {
     let env = Env::new();
@@ -373,6 +383,7 @@ fn the_post_confirmation_recheck_refuses_a_session_started_during_the_prompt() {
 /// 9, and no rank below `State` after it — never `Rotation`, `Config` or
 /// `ProfileTtl` (spec §4.2).
 #[cfg(debug_assertions)]
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_fence_holds_rank_import_fence_and_enters_no_rank_below_state_after_item_9() {
     use crate::lockorder::{rank, record_entries, value_of};
@@ -415,6 +426,7 @@ fn the_fence_holds_rank_import_fence_and_enters_no_rank_below_state_after_item_9
 /// Test 23. While the transaction is paused mid-M5, upstream's state lock,
 /// its daemon lock, tollgate's daemon and state locks are all taken, and a
 /// tollgate refresher reads upstream as active.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_paused_transaction_blocks_upstream_state_and_daemon_lock_takers() {
     let env = Env::new();

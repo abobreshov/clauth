@@ -16,6 +16,7 @@ fn slot(env: &Env) -> std::path::PathBuf {
 
 /// Test 45. A full import then rollback puts every carrier back at its
 /// path on its own inode, and the whole tree as it was; guest mode is back.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_restores_carriers_to_their_paths_and_inodes() {
     let env = Env::new();
@@ -53,6 +54,7 @@ fn rollback_restores_carriers_to_their_paths_and_inodes() {
 
 /// Test 46. After tollgate rotated a store (a new inode), the rollback moves
 /// the CURRENT store back, never the journaled one.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_after_a_tollgate_rotation_moves_the_current_store_back() {
     let env = Env::new();
@@ -77,6 +79,7 @@ fn rollback_after_a_tollgate_rotation_moves_the_current_store_back() {
 /// Test 47. A slot tollgate detached into a regular file after the import
 /// (its TUI exit, I18) comes back as a link to the restored store — never a
 /// copy; a diverged one refuses unless `--adopt-live`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_relinks_a_detached_live_slot_as_a_link_never_a_copy() {
     let env = Env::new();
@@ -113,6 +116,7 @@ fn rollback_relinks_a_detached_live_slot_as_a_link_never_a_copy() {
 
 /// Test 48. A rollback refuses while tollgate, Claude Code or the clauth
 /// shim runs, and while codex runs once codex was imported.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_refuses_while_tollgate_claude_or_codex_lives() {
     let env = Env::new();
@@ -144,6 +148,7 @@ fn rollback_refuses_while_tollgate_claude_or_codex_lives() {
 /// Test 49. The stores go home before the upstream binary comes back (the
 /// reinstall-order rule); a vanished retired binary leaves the shim and
 /// prints the manual step.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_restores_stores_before_the_upstream_binary() {
     let env = Env::new();
@@ -199,6 +204,7 @@ fn rollback_restores_stores_before_the_upstream_binary() {
 /// Test 50. Profiles created after the import stay in tollgate, only the
 /// imported names leave its roster, and upstream's roster comes back
 /// byte-identical — tollgate's roster is never written into `~/.clauth`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_keeps_post_import_profiles_and_never_writes_the_fork_roster_into_clauth() {
     let env = Env::new();
@@ -240,6 +246,7 @@ fn rollback_keeps_post_import_profiles_and_never_writes_the_fork_roster_into_cla
 
 /// Test 51. A slot on a profile created after the import refuses the
 /// rollback, naming the way out.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_refuses_a_live_slot_on_a_post_import_profile() {
     let env = Env::new();
@@ -269,6 +276,7 @@ fn rollback_refuses_a_live_slot_on_a_post_import_profile() {
 /// `.config.toml.tmp.*` holding a copy of an API key) never blocks the
 /// rollback as a `pending_rotation` — only a chain's staging file does — and
 /// the copy's revert sweeps it, so the profile dir goes too.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_crashed_copy_temp_is_swept_by_the_rollback_not_reported_as_a_staged_chain() {
     let env = Env::new();

@@ -110,6 +110,7 @@ fn import_status_reports_every_journal_state() {
 /// removals come back byte for byte, R2 uninstalls the plugin it installed,
 /// R3 uninstalls with the config choice it installed with, R4 puts the
 /// completion line (and its comment) back. A second retire is a no-op.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn retire_steps_are_journaled_and_each_reverses() {
     let env = Env::new();
@@ -202,6 +203,7 @@ fn retire_steps_are_journaled_and_each_reverses() {
 /// Test 63. A rollback after retire undoes the retire section first (before
 /// its fence is taken), then the import: every global file is back as it
 /// was before the import.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rollback_after_retire_reverses_retire_first() {
     let env = Env::new();
@@ -237,6 +239,7 @@ fn rollback_after_retire_reverses_retire_first() {
 /// Test 65. A guest-mode conversation stays listed and resumable after the
 /// import turns guest mode off: the M5.2 copy puts it in `~/.claude/projects`,
 /// where `sessions` lists it once and `--resume` finds it.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_guest_conversation_is_listed_and_resumable_after_import() {
     let env = Env::new();
@@ -313,6 +316,7 @@ fn g2_env(env: &Env) -> (FakeHerdr, EnvPin<'_>) {
 /// herdr's own plugin state is the documented residual; the reinstall argv
 /// names the recorded commit. A regular-file slot comes back as a link to
 /// its restored store (spec I4/I22), so only that one path differs there.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_full_reference_import_then_rollback_leaves_every_file_tollgate_restores_byte_identical() {
     for regular in [false, true] {
@@ -380,6 +384,7 @@ fn a_full_reference_import_then_rollback_leaves_every_file_tollgate_restores_byt
 /// error; while a Claude Code session runs it refuses (R1 rewrites files a
 /// live session rewrites); and an upstream entry that carries an `env`
 /// block is left in place and named, never journaled.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn retire_refuses_before_complete_while_claude_runs_and_keeps_a_secret_bearing_entry() {
     let env = Env::new();
@@ -420,6 +425,7 @@ fn retire_refuses_before_complete_while_claude_runs_and_keeps_a_secret_bearing_e
 /// Self-review: the rollback's prompt is unbounded too, so a session that
 /// starts while it is open refuses before the first write, exactly as the
 /// import's own post-confirmation recheck does.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_rollback_recheck_refuses_a_session_started_during_its_prompt() {
     let env = Env::new();

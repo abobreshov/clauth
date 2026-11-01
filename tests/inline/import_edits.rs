@@ -60,6 +60,7 @@ fn busy(path: &Path) -> bool {
 /// is held, so no upstream writer can lose-update `settings.json`. The
 /// plugin is off afterwards, every other key as it was, and a rollback puts
 /// the file back byte for byte.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn g1_turns_the_upstream_plugin_off_inside_the_fence_and_rollback_restores_it() {
     let env = Env::new();
@@ -113,6 +114,7 @@ fn g1_turns_the_upstream_plugin_off_inside_the_fence_and_rollback_restores_it() 
 /// upstream's three opt-outs (a secret in this process's env never reaches
 /// it), after backing up herdr's config and journaling upstream's plugin
 /// record. The `pre` entry records the argv, the env NAMES and both digests.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn g2_runs_upstream_herdr_uninstall_scrubbed_before_any_lock_with_a_config_backup_and_the_plugin_record()
  {
@@ -190,6 +192,7 @@ fn refuse_at_m4(env: &Env) {
 /// is released; offline, the reinstall fails and the exact command, plus
 /// upstream's own fallback, is printed. Nothing is spawned while the fence
 /// is held.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn g2_undo_reinstalls_at_the_recorded_commit_after_the_fence_and_prints_the_command_on_failure() {
     let env = Env::new();
@@ -252,6 +255,7 @@ fn g2_undo_reinstalls_at_the_recorded_commit_after_the_fence_and_prints_the_comm
     assert_eq!(std::fs::read(&config).expect("config"), config_before);
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn herdr_reinstall_receives_only_the_g2_environment_allowlist() {
     let env = Env::new();
@@ -284,6 +288,7 @@ fn rewrite_facts_refuses_secret_bearing_values_at_the_journal_boundary() {
     assert!(!err.to_string().contains("FIXTURE-secret"));
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn dry_run_g2_change_has_no_accidental_whitespace_run() {
     let env = Env::new();
@@ -304,6 +309,7 @@ fn dry_run_g2_change_has_no_accidental_whitespace_run() {
 /// same (renamed) profile and renames each allowed upstream MCP tool; the
 /// foreign rule and `env` stay put, and a rollback reverses both edits byte
 /// for byte. The `env` secret never reaches the journal or the report.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn g3_rewrites_the_upstream_helper_and_permissions_allow_and_rollback_reverses_both() {
     let env = Env::new();
@@ -359,6 +365,7 @@ fn g3_rewrites_the_upstream_helper_and_permissions_allow_and_rollback_reverses_b
 /// the tollgate copy of content the import brings over, else to the
 /// `~/.claude/plugins` twin, else it stays and a warning names it. A
 /// rollback puts every spelling back.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn g4_remaps_registry_paths_to_tollgate_then_the_twin_then_warns() {
     let env = Env::new();
@@ -416,6 +423,7 @@ fn g4_remaps_registry_paths_to_tollgate_then_the_twin_then_warns() {
 /// Test 56. A refusal after M0 (here M4's revalidation) reverses `pre` and
 /// records `aborted`: `pre` held only G2, now undone; `settings.json` was
 /// never touched (G1 is an M7 edit); exit 3.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_refusal_after_m0_undoes_pre_and_records_aborted() {
     let env = Env::new();
@@ -442,6 +450,7 @@ fn a_refusal_after_m0_undoes_pre_and_records_aborted() {
 
 /// Test 57. An M-1 refusal (dry-run or real run) writes nothing anywhere:
 /// no journal, no global file, and upstream's binary is never run.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_m_minus_1_refusal_touches_no_global_file() {
     let env = Env::new();
@@ -467,6 +476,7 @@ fn an_m_minus_1_refusal_touches_no_global_file() {
 /// Self-review: G2's own failure paths. A non-zero exit and a child that
 /// outlives its deadline both refuse with exit 3, put herdr's config back
 /// and record the journal `aborted`; nothing moved.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_failing_or_hung_g2_refuses_with_exit_3_and_restores_the_config() {
     for hang in [false, true] {
@@ -512,6 +522,7 @@ fn a_failing_or_hung_g2_refuses_with_exit_3_and_restores_the_config() {
 /// settles it without running upstream's uninstall again; after it was
 /// marked done, `import rollback` undoes `pre` alone (config bytes back,
 /// the plugin reinstalled at its commit) and the journal is `rolled_back`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_crash_in_pre_resumes_to_the_commit_or_rolls_back_pre() {
     let crash_run = |env: &Env| {
@@ -602,6 +613,7 @@ fn a_crash_in_pre_resumes_to_the_commit_or_rolls_back_pre() {
 /// edits are raw read-modify-writes, never a guest-gated or config-ranked
 /// helper).
 #[cfg(debug_assertions)]
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_global_edits_enter_no_rank_below_state() {
     use crate::lockorder::{rank, record_entries, value_of};
@@ -640,6 +652,7 @@ fn the_global_edits_enter_no_rank_below_state() {
 /// Self-review: the process scan names a process by its program and
 /// subcommand only; an argument value on its command line (a key passed on
 /// argv) never reaches a finding or the report.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_process_scan_never_echoes_an_argument_value() {
     let env = Env::new();
@@ -666,6 +679,7 @@ fn the_process_scan_never_echoes_an_argument_value() {
 /// its plugin dirs and `.plugins.lock` when asked for its config dir or its
 /// plugin list): G2 is still planned from herdr's config read in place, and
 /// without upstream's marked block it is named "planned at run time".
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_dry_run_plans_g2_without_spawning_herdr() {
     let env = Env::new();

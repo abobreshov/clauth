@@ -94,6 +94,7 @@ fn target(home: &std::path::Path) -> MonitorTarget {
         toml::from_str("id='agy'\nkind='antigravity'\n").unwrap();
     super::super::source::resolve_target(&cfg, home, 100, &|_| None)
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_does_not_fall_through_hosts_on_auth_or_rate_limits() {
     let home = crate::testutil::HomeSandbox::new();
@@ -123,6 +124,7 @@ fn agy_does_not_fall_through_hosts_on_auth_or_rate_limits() {
         }
     }
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_tries_production_on_404_and_plan_once_per_day() {
     let home = crate::testutil::HomeSandbox::new();
@@ -281,7 +283,7 @@ fn cli_spawn_has_no_display_or_browser() {
             .collect::<Vec<_>>(),
         vec!["-p", "/usage", "--output-format", "json"]
     );
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt;
         let program = home.home().join("fixture-agy");
@@ -403,6 +405,7 @@ wait
         Some(libc::ESRCH)
     );
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn cli_path_stays_disabled_before_owner_gate() {
     let home = crate::testutil::HomeSandbox::new();
@@ -487,6 +490,7 @@ fn cli_probes_memoize_for_60_seconds_and_invalidate_on_binary_change() {
     assert_eq!(runner.inner.calls.lock().unwrap().len(), 10);
 }
 // Slice-1 review: distinguish undated borrowed credentials from expired ones.
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_missing_expiry_has_distinct_message_without_any_http_call() {
     let home = crate::testutil::HomeSandbox::new();
@@ -517,6 +521,7 @@ fn agy_missing_expiry_has_distinct_message_without_any_http_call() {
     );
     assert!(http.calls().is_empty());
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_subscription_required_is_subscription_inactive_without_host_fallthrough() {
     let home = crate::testutil::HomeSandbox::new();
@@ -542,6 +547,7 @@ fn agy_subscription_required_is_subscription_inactive_without_host_fallthrough()
     assert_eq!(failure.message, "free plan: no quota summary");
     assert_eq!(http.calls().len(), 1);
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_falls_through_daily_host_on_5xx_and_transport_error() {
     let home = crate::testutil::HomeSandbox::new();
@@ -595,6 +601,7 @@ fn agy_falls_through_daily_host_on_5xx_and_transport_error() {
         );
     }
 }
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_load_code_assist_resolves_project_for_paid_tier_and_quota_summary() {
     let home = crate::testutil::HomeSandbox::new();
@@ -759,6 +766,7 @@ fn cli_bare_official_oauth_url_on_stderr_is_usage_auth_required() {
     assert!(!sign_in_flow("https://accounts.google.com/help/login"));
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_usage_adopts_one_official_keyring_login_and_skips_locked_or_multiple() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -829,6 +837,7 @@ fn agy_usage_adopts_one_official_keyring_login_and_skips_locked_or_multiple() {
     });
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_load_code_assist_extracts_plan_from_allowed_tiers_and_g1_tier() {
     let home = crate::testutil::HomeSandbox::new();
@@ -960,6 +969,7 @@ fn agy_map_summary_orders_5h_before_7d_within_each_group() {
     assert_eq!(hourly.windows[1].window_secs, Some(604800));
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_sends_cli_user_agent_and_keeps_consumer_on_daily_endpoint() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1022,6 +1032,7 @@ fn agy_sends_cli_user_agent_and_keeps_consumer_on_daily_endpoint() {
     assert_eq!(http.calls().len(), 2);
 }
 
+#[cfg_attr(not(target_os = "linux"), ignore = "the agy fetch is Linux-only")]
 #[test]
 fn agy_gcp_and_adc_auth_methods_route_directly_to_production_endpoint() {
     let home = crate::testutil::HomeSandbox::new();

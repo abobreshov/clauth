@@ -25,11 +25,3 @@ comment:
   hideCoverageLink: true
 summary:
   if: true
-report:
-  if: is_default_branch
-  datastores:
-    - github://abobreshov/clauth@coverage/reports
-diff:
-  if: is_pull_request
-  datastores:
-    - github://abobreshov/clauth@coverage/reports

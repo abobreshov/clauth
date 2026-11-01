@@ -46,6 +46,7 @@ fn crash_fixture(env: &Env) {
 /// Test 24. OAuth, rolling and static profiles move by rename: every store
 /// keeps its inode and link count 1, and tollgate's install source for each
 /// names the same file upstream's did.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn oauth_rolling_and_static_sets_move_by_rename_and_keep_their_install_source() {
     let env = Env::new();
@@ -98,6 +99,7 @@ fn files_containing(root: &Path, needle: &str) -> Vec<String> {
 
 /// Test 25. A quarantine dir and parked MCP logins move whole, by rename;
 /// no carrier-shaped file is copied anywhere.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn quarantine_and_mcp_logins_move_and_nothing_carrier_shaped_is_copied() {
     let env = Env::new();
@@ -127,6 +129,7 @@ fn quarantine_and_mcp_logins_move_and_nothing_carrier_shaped_is_copied() {
 
 /// Test 26. A codex store, its belt and its quarantine verdict move by
 /// rename; no copy of the chain appears anywhere the import wrote.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_codex_store_lkg_and_quarantine_move_and_each_chain_has_one_inode() {
     let env = Env::new();
@@ -151,6 +154,7 @@ fn a_codex_store_lkg_and_quarantine_move_and_each_chain_has_one_inode() {
 
 /// Test 27. A secret-bearing `config.toml` lands 0600, byte-identical, and
 /// its journal entry records its size and nothing derived from its bytes.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn config_toml_copies_are_0600_and_the_journal_records_only_their_size() {
     let env = Env::new();
@@ -178,6 +182,7 @@ fn config_toml_copies_are_0600_and_the_journal_records_only_their_size() {
 
 /// Test 28. Every upstream file the import COPIES stays exactly as it was
 /// (same inode, same bytes).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn upstream_originals_of_copied_entries_stay_byte_identical() {
     let env = Env::new();
@@ -214,6 +219,7 @@ fn upstream_originals_of_copied_entries_stay_byte_identical() {
 /// Test 38. The claude roster merge appends upstream's names to tollgate's,
 /// extends the chain, keeps every key tollgate sets, takes the ones it
 /// leaves unset, and never imports `[serve]`/`[update]`/`[local_api]`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn roster_merge_appends_names_keeps_set_tollgate_keys_and_takes_unset_upstream_keys() {
     let env = Env::new();
@@ -272,6 +278,7 @@ fn roster_merge_appends_names_keeps_set_tollgate_keys_and_takes_unset_upstream_k
 
 /// Test 39. Session owners merge as a union; one session two profiles own
 /// becomes `contested`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn session_owners_merge_and_conflicts_become_contested() {
     let env = Env::new();
@@ -299,6 +306,7 @@ fn session_owners_merge_and_conflicts_become_contested() {
 
 /// Test 40. `complete` is the very last durable write, and with it guest
 /// mode ends.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn commit_writes_complete_last_and_upstream_active_turns_false() {
     let env = Env::new();
@@ -337,6 +345,7 @@ fn commit_writes_complete_last_and_upstream_active_turns_false() {
 /// Test 41. After the commit: upstream's rosters name no active profile,
 /// its binary is the shim (the original kept, renamed, never run), the
 /// tombstone is written and the claude slot links into tollgate's store.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn after_commit_upstream_has_no_active_profile_its_binary_is_the_shim_and_the_slot_links_into_tollgate()
  {
@@ -374,6 +383,7 @@ fn after_commit_upstream_has_no_active_profile_its_binary_is_the_shim_and_the_sl
 /// Test 22. A Claude Code session that appears before a carrier move makes
 /// the engine reverse everything it did: exit 1, journal `aborted`, the
 /// tree as it was (carriers by inode).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_process_appearing_before_a_carrier_move_reverses_the_transaction() {
     let env = Env::new();
@@ -401,6 +411,7 @@ fn a_process_appearing_before_a_carrier_move_reverses_the_transaction() {
 /// Test 10 (run half). An `EXDEV` rename fails the step with no copy
 /// fallback: the engine reverses, exit 1, naming the cross-device refusal,
 /// and no copy of the chain exists.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn an_exdev_rename_reverses_without_a_copy() {
     let env = Env::new();
@@ -423,6 +434,7 @@ fn an_exdev_rename_reverses_without_a_copy() {
 /// Test 51e. A reversal once M5 started exits 1; a refusal at M4 (the tree
 /// changed between the check and the fence) exits 3, and its journal holds
 /// only the undone `pre` section, `aborted` (spec §2.2, test 56).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_reversal_after_m5_started_exits_1_and_an_m4_refusal_exits_3() {
     let env = Env::new();
@@ -448,6 +460,7 @@ fn a_reversal_after_m5_started_exits_1_and_an_m4_refusal_exits_3() {
 /// Test 9. `--rename` maps a name everywhere the import writes it — the
 /// profile dir, the roster, the chain, the active marker, the session
 /// owners, the slot — and a rollback maps every one back.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn rename_maps_a_name_in_dirs_rosters_chain_session_owners_and_rollback_maps_it_back() {
     let env = Env::new();
@@ -498,6 +511,7 @@ fn rename_maps_a_name_in_dirs_rosters_chain_session_owners_and_rollback_maps_it_
 /// Test 51d. The guest transcript store is copied into `~/.claude/projects`
 /// (a name already there wins), and a rollback deletes only what the copy
 /// created.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn the_guest_store_is_copied_into_the_global_store_and_rollback_deletes_only_created() {
     let env = Env::new();
@@ -570,6 +584,7 @@ fn final_view(snap: &TreeSnapshot) -> TreeSnapshot {
 /// (which must reach exactly the tree an uninterrupted import leaves, every
 /// carrier on its original inode) or a rollback (which must restore the
 /// original tree, inodes included). No relink temp survives either way.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_crash_at_every_step_resumes_to_the_uninterrupted_tree_or_rolls_back_to_the_original() {
     let (want, steps) = {
@@ -646,6 +661,7 @@ fn a_crash_at_every_step_resumes_to_the_uninterrupted_tree_or_rolls_back_to_the_
 /// Test 43. A journal that disagrees with disk — a planned move whose
 /// source and destination are both gone — stops a resume and a rollback
 /// with exit 4 and changes nothing more.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_journal_disagreeing_with_disk_stops_with_exit_4() {
     let env = Env::new();
@@ -676,6 +692,7 @@ fn a_journal_disagreeing_with_disk_stops_with_exit_4() {
 /// Test 44. Write-ahead: every op runs only after a durable journal write
 /// that lists it `planned`, and the next journal write after it marks it
 /// `done`.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn every_journal_write_is_fsynced_before_its_op() {
     let env = Env::new();
@@ -730,6 +747,7 @@ fn every_journal_write_is_fsynced_before_its_op() {
 /// sidecar keeps its inode in the second) and leave no temp. A rollback of
 /// either is covered by the rollback suite: past the capture it restores a
 /// link, not the regular copy, by design (I4, I22).
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_crash_at_every_step_of_a_regular_slot_import_resumes_to_the_uninterrupted_tree() {
     fn capture_fixture(env: &Env) {
@@ -793,6 +811,7 @@ fn a_crash_at_every_step_of_a_regular_slot_import_resumes_to_the_uninterrupted_t
 /// store moved but before the slot was renamed to its temp. The rollback
 /// leaves the untouched live file exactly as it is (never replaces it with a
 /// link), and a resume finishes the step.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn a_crash_between_the_store_move_and_the_slot_rename_never_destroys_the_live_file() {
     fn fixture(env: &Env) -> std::path::PathBuf {
@@ -857,6 +876,7 @@ fn a_crash_between_the_store_move_and_the_slot_rename_never_destroys_the_live_fi
 /// ones the report already listed are not repeated, and a repeat inside the
 /// commit's own list is dropped. The `journal_pending` blocker carries no
 /// second `tollgate:` prefix of its own.
+#[cfg_attr(not(target_os = "linux"), ignore = "import refuses off Linux")]
 #[test]
 fn commit_warnings_print_once_and_journal_pending_has_one_prefix() {
     let w = |c: &str, m: &str| super::Finding::new(c, m.to_string());
