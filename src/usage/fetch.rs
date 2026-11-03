@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
@@ -411,16 +412,34 @@ impl UsageInfo {
 /// Canonical account tier, computed once at fetch time. The single source of
 /// truth that `format::account_tier` renders from — collapses the old
 /// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
-/// in the `usage_cache.json` shape; a field rename simply misses → refetches.
+/// in the `usage_cache.json` shape; a value this build cannot read (a newer
+/// tollgate's variant) arrives as `Unknown` and costs the label alone.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) enum PlanTier {
     Max(#[serde(default)] Option<u16>),
+    Ultra,
     Pro,
     Team,
     Enterprise,
     Free,
     #[default]
     Unknown,
+}
+
+/// The plan name Claude Code 2.1.314 displays off `/profile`
+/// `organization.plan_display_name`: 1 to 40 characters, a Unicode letter or
+/// digit at each end (a `+` may also end it), and only letters, digits, space,
+/// `.`, `+` and `-` between. Anything else would render a stray control
+/// character or an unbounded label.
+#[allow(clippy::expect_used, reason = "the plan-name pattern is a literal")]
+static PLAN_DISPLAY_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[\p{L}\p{N}](?:[\p{L}\p{N} .+-]{0,38}[\p{L}\p{N}+])?$")
+        .expect("the plan-name pattern is a literal")
+});
+
+/// The one plan-name check: the wire read and the cache read both go through it.
+fn is_plan_display_name(name: &str) -> bool {
+    PLAN_DISPLAY_NAME.is_match(name)
 }
 
 impl PlanTier {
@@ -432,7 +451,11 @@ impl PlanTier {
         has_pro: bool,
         rate_limit_tier: Option<&str>,
     ) -> Self {
-        match org_type.unwrap_or("") {
+        let org_type = org_type.unwrap_or("");
+        if org_type.contains("ultra") {
+            return PlanTier::Ultra;
+        }
+        match org_type {
             "claude_max" => PlanTier::Max(max_multiplier(rate_limit_tier)),
             "claude_pro" => PlanTier::Pro,
             "claude_team" | "claude_teams" => PlanTier::Team,
@@ -457,14 +480,20 @@ impl PlanTier {
     /// fabricated paid tier: `Unknown` renders neutrally (both `short_label` and
     /// `display` omit it) instead of a "Pro" out of thin air.
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
+        let Some(s) = s else {
+            return PlanTier::Unknown;
+        };
+        if s.contains("ultra") {
+            return PlanTier::Ultra;
+        }
         match s {
-            Some("pro") => PlanTier::Pro,
-            Some("max") => PlanTier::Max(None),
-            Some("team") | Some("teams") => PlanTier::Team,
-            Some("enterprise") => PlanTier::Enterprise,
+            "pro" => PlanTier::Pro,
+            "max" => PlanTier::Max(None),
+            "team" | "teams" => PlanTier::Team,
+            "enterprise" => PlanTier::Enterprise,
             // `login_profile_from_raw` mints this token for a `Free` account, so
             // without the arm tollgate fails to read back its own write.
-            Some("free") => PlanTier::Free,
+            "free" => PlanTier::Free,
             _ => PlanTier::Unknown,
         }
     }
@@ -473,14 +502,19 @@ impl PlanTier {
     /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
     /// as a real plan the account never claimed, so each surface renders its own
     /// no-data form instead.
+    ///
+    /// The wire still sends `default_claude_max_20x` / `default_claude_max_5x`
+    /// for the plans whose labels here read `Ultra` / `Max`.
     pub(crate) fn display(&self) -> Option<String> {
         Some(match self {
+            PlanTier::Max(Some(20)) => "Claude Ultra".to_string(),
+            PlanTier::Max(Some(5)) | PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Max(Some(n)) => format!("Claude Max {n}x"),
-            PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Pro => "Claude Pro".to_string(),
             PlanTier::Team => "Claude Team".to_string(),
             PlanTier::Enterprise => "Claude Enterprise".to_string(),
             PlanTier::Free => "Claude Free".to_string(),
+            PlanTier::Ultra => "Claude Ultra".to_string(),
             PlanTier::Unknown => return None,
         })
     }
@@ -490,15 +524,73 @@ impl PlanTier {
     /// `None` for an unknown tier so callers can omit it entirely.
     pub(crate) fn short_label(&self) -> Option<String> {
         Some(match self {
+            PlanTier::Max(Some(20)) => "Ultra".to_string(),
+            PlanTier::Max(Some(5)) | PlanTier::Max(None) => "Max".to_string(),
             PlanTier::Max(Some(n)) => format!("Max {n}x"),
-            PlanTier::Max(None) => "Max".to_string(),
             PlanTier::Pro => "Pro".to_string(),
             PlanTier::Team => "Team".to_string(),
             PlanTier::Enterprise => "Enterprise".to_string(),
             PlanTier::Free => "Free".to_string(),
+            PlanTier::Ultra => "Ultra".to_string(),
             PlanTier::Unknown => return None,
         })
     }
+}
+
+impl PlanInfo {
+    /// The server's own plan name, kept only when it passes the rule Claude
+    /// Code applies: a value read back off a hand-edited cache gets the same
+    /// check the wire did.
+    fn display_name(&self) -> Option<&str> {
+        self.plan_display_name
+            .as_deref()
+            .filter(|name| is_plan_display_name(name))
+    }
+
+    /// Whether this plan names a plan at all: a classified tier or the server's
+    /// own valid name. An unclassified bare tier is no answer, so a surface
+    /// falls through to the OAuth token claim the way its sibling does.
+    pub(crate) fn is_classified(&self) -> bool {
+        self.tier != PlanTier::Unknown || self.display_name().is_some()
+    }
+
+    /// The server's own name, when it may name the plan: never on a `Free`
+    /// tier, whatever the subscription status. The tier is the organization's
+    /// own answer that no paid plan is live (a canceled subscription drops it
+    /// to `claude_free`), so a name beside it never outranks it.
+    fn server_label(&self) -> Option<&str> {
+        self.display_name().filter(|_| self.tier != PlanTier::Free)
+    }
+
+    /// Compact plan label for this fetched plan: the server's own name wins over
+    /// the local map, except where [`Self::server_label`] keeps it out.
+    pub(crate) fn short_label(&self) -> Option<String> {
+        match self.server_label() {
+            Some(name) => Some(name.to_string()),
+            None => self.tier.short_label(),
+        }
+    }
+
+    /// The long `Claude <plan>` label for this fetched plan: the server's own
+    /// name wins over the local map, except where [`Self::server_label`] keeps
+    /// it out.
+    pub(crate) fn display(&self) -> Option<String> {
+        match self.server_label() {
+            Some(name) => Some(format!("Claude {name}")),
+            None => self.tier.display(),
+        }
+    }
+}
+
+/// A tier this build does not know reads `Unknown` instead of failing the whole
+/// `usage_cache.json` parse: a newer tollgate's variant, or a known name with a
+/// payload this build cannot read, costs the tier label and no other field.
+fn lenient_tier<'de, D>(deserializer: D) -> Result<PlanTier, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
 }
 
 /// Pull the trailing `Nx` multiplier out of a rate-limit tier like
@@ -515,8 +607,14 @@ fn max_multiplier(tier: Option<&str>) -> Option<u16> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct PlanInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_tier")]
     pub(crate) tier: PlanTier,
+    /// `/profile` `organization.plan_display_name`, the server's own name for
+    /// the plan. The fetch keeps it only when it passes
+    /// [`is_plan_display_name`]; every read re-checks it, since the cache is a
+    /// file the user can edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_display_name: Option<String>,
     /// `/profile` `organization.subscription_status` verbatim (`active`,
     /// `trialing`, `canceled`, …). A canceled subscription drops the org to the
     /// `claude_free` tier while its 5h window stays cached, so the raw status is
@@ -639,6 +737,18 @@ pub(crate) struct UsageInfo {
     /// STALE with no age published rather than fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
+    /// The account's plan carries no 5h limit at all: a live `/usage` body sent
+    /// neither a `session` limit nor a top-level `five_hour` object while it did
+    /// carry a weekly window (the aggregate one or a per-model `weekly_scoped`
+    /// one). Absence alone is ordinary (an unread body, a header reading, a cold
+    /// cache), so this is a verdict about the PLAN, not about a reading. The
+    /// `/usage` body assembly ([`body_plan_verdict`]) sets it from the body's own
+    /// windows — `true` with no 5h window but a weekly one, `false` with a 5h
+    /// window — and the landing keeps the stored value for a body that states
+    /// none; a header reading never moves it, and every other writer carries the
+    /// stored value forward.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) no_five_hour_limit: bool,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -988,6 +1098,29 @@ fn windows_from_raw(raw: &RawUsage) -> DerivedWindows {
     }
 }
 
+/// The plan verdict a `/usage` body states, read off the windows it carries:
+/// `Some(true)` when it has no 5h window while it does carry a weekly one —
+/// the aggregate `weekly_all` entry or any per-model `weekly_scoped` one —
+/// `Some(false)` when it carries a 5h window, and `None` when it carries no
+/// window at all, which states nothing about the plan.
+///
+/// One predicate for both readers, so they cannot disagree: [`assemble_usage`]
+/// stores it as [`UsageInfo::no_five_hour_limit`], and the scheduler's landing
+/// keeps the stored mark for the `None` case.
+pub(crate) fn body_plan_verdict(
+    five_hour: Option<&UsageWindow>,
+    seven_day: Option<&UsageWindow>,
+    weekly_scoped: &[ScopedWindow],
+) -> Option<bool> {
+    if five_hour.is_some() {
+        Some(false)
+    } else if seven_day.is_some() || !weekly_scoped.is_empty() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 struct RawProfile {
     #[serde(default)]
@@ -1022,6 +1155,8 @@ struct RawProfileOrg {
     rate_limit_tier: Option<String>,
     #[serde(default)]
     subscription_status: Option<String>,
+    #[serde(default)]
+    plan_display_name: Option<String>,
 }
 
 /// Retain only bounded, display-safe optional details. The binding uuid is
@@ -1085,9 +1220,11 @@ pub(crate) enum FetchError {
     /// has been observed to keep 429ing `/usage` (one sample), so the profile
     /// leg is the only place its cancellation has been observed. `None` from the
     /// low-level `get_json` (no profile context there); populated by [`fetch_raw`].
+    /// Boxed so a plan field this build grows again never inflates every
+    /// `Result<_, FetchError>` into `clippy::result_large_err`.
     RateLimited {
         retry_after: Option<Duration>,
-        plan: Option<PlanInfo>,
+        plan: Option<Box<PlanInfo>>,
     },
     Network,
     Parse,
@@ -1493,9 +1630,10 @@ pub(crate) struct ProfileFetchDecision {
     pub(crate) reanchored: bool,
 }
 
-/// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier + raw
-/// subscription status). The single place the fetch path turns `/profile` into a
-/// plan, shared by the normal leg and the 429-bail leg.
+/// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier, the server's
+/// own plan name and the raw subscription status). The single place the fetch
+/// path turns `/profile` into a plan, shared by the normal leg and the 429-bail
+/// leg.
 fn plan_from_profile(p: &RawProfile) -> PlanInfo {
     let org = p.organization.as_ref();
     PlanInfo {
@@ -1505,6 +1643,10 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
             p.account.as_ref().is_some_and(|a| a.has_claude_pro),
             org.and_then(|o| o.rate_limit_tier.as_deref()),
         ),
+        plan_display_name: org
+            .and_then(|o| o.plan_display_name.as_deref())
+            .filter(|name| is_plan_display_name(name))
+            .map(str::to_string),
         // Verbatim, but never tollgate's own word for an organization's refusal:
         // only the usage probe's landing may write that.
         subscription_status: org
@@ -1595,6 +1737,18 @@ fn assemble_usage(
             let plan = fetch_plan().or(prev_plan);
             let windows = windows_from_raw(&raw);
             let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
+            // The body's own plan verdict: no 5h window while a weekly one is
+            // present is a plan without a 5h limit, not an unread 5h window. A
+            // body carrying neither window states nothing about the plan; the
+            // landing keeps the stored mark for it.
+            let no_five_hour_limit = matches!(
+                body_plan_verdict(
+                    windows.five_hour.as_ref(),
+                    windows.seven_day.as_ref(),
+                    &windows.weekly_scoped,
+                ),
+                Some(true)
+            );
             Ok(UsageInfo {
                 plan,
                 five_hour: windows.five_hour,
@@ -1613,11 +1767,12 @@ fn assemble_usage(
                 codex_additional_windows: Vec::new(),
                 open_at: None,
                 fetched_at: None,
+                no_five_hour_limit,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
             retry_after,
-            plan: fetch_plan(),
+            plan: fetch_plan().map(Box::new),
         }),
         Err(e) => Err(e),
     }
@@ -1992,7 +2147,7 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
             PlanTier::Team => Some("team".to_string()),
             PlanTier::Enterprise => Some("enterprise".to_string()),
             PlanTier::Free => Some("free".to_string()),
-            PlanTier::Unknown => None,
+            PlanTier::Ultra | PlanTier::Unknown => None,
         },
         identity: identity_from_raw(&p, now_ms()),
         // The one mapping the fetch path uses, so the login seed is the same
@@ -2196,6 +2351,17 @@ pub(crate) fn seed_plan_cache(
     if let Err(e) = crate::profile::atomic_write_600(&path, json) {
         logline!("tollgate: {name}: could not save the login's plan: {e}");
     }
+}
+
+/// Whether `name`'s stored `/usage` body says its plan has no 5h limit. Reads
+/// the cache file, not an in-memory store: the CLI's one-shot paths
+/// (`tollgate switch`'s window prime) have no scheduler behind them.
+pub(crate) fn no_five_hour_limit_cached(name: &ProfileName) -> bool {
+    crate::profile_cache::load_profile_cache::<UsageInfo>(
+        name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .is_some_and(|info| info.no_five_hour_limit)
 }
 
 /// Remove a profile's durable `/profile` stamp — the cross-process half of

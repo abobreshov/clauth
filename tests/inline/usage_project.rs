@@ -33,7 +33,7 @@ fn skeleton(source: SourceId) -> AccountObservation {
     )
 }
 
-/// A Max 5x account's `usage_cache.json`: both shared windows, two per-model
+/// A Max (5x) account's `usage_cache.json`: both shared windows, two per-model
 /// weekly windows (one already lapsed), a visible `spend` block, the legacy
 /// `extra_usage` object and one `window_dollars` row.
 const OAUTH_CACHE: &str = r#"{
@@ -159,7 +159,7 @@ fn apply_oauth_usage_sets_plan_and_flags_a_canceled_subscription() {
     let usage: UsageInfo = serde_json::from_str(OAUTH_CACHE).unwrap();
     let mut obs = skeleton(SourceId::AnthropicOauth);
     apply_oauth_usage(&mut obs, &usage, NOW);
-    assert_eq!(obs.plan.as_deref(), Some("Max 5x"));
+    assert_eq!(obs.plan.as_deref(), Some("Max"));
     assert_eq!(obs.windows.len(), 3);
     assert!(obs.failure.is_none());
 
@@ -177,6 +177,28 @@ fn apply_oauth_usage_sets_plan_and_flags_a_canceled_subscription() {
         obs.failure.as_ref().unwrap().kind,
         FailureKind::SubscriptionInactive
     );
+}
+
+/// The projected plan is the fetched plan's own label (`PlanInfo::short_label`),
+/// so the server's plan name wins over the local tier map here the way it does
+/// on every other surface: a cached `{"Max": 5}` tier beside a server name must
+/// not read `Max` on waybar while the Usage tab says `Ultra`.
+#[test]
+fn apply_oauth_usage_prefers_the_server_plan_name_over_the_tier_map() {
+    let mut usage: UsageInfo = serde_json::from_str(OAUTH_CACHE).unwrap();
+    usage.plan.as_mut().unwrap().plan_display_name = Some("Ultra".to_string());
+    let mut obs = skeleton(SourceId::AnthropicOauth);
+    apply_oauth_usage(&mut obs, &usage, NOW);
+    assert_eq!(obs.plan.as_deref(), Some("Ultra"));
+
+    // An unclassified tier with a server name is still a named plan.
+    let mut unclassified: UsageInfo = serde_json::from_str(OAUTH_CACHE).unwrap();
+    let plan = unclassified.plan.as_mut().unwrap();
+    plan.tier = crate::usage::PlanTier::Unknown;
+    plan.plan_display_name = Some("Ultra".to_string());
+    let mut obs = skeleton(SourceId::AnthropicOauth);
+    apply_oauth_usage(&mut obs, &unclassified, NOW);
+    assert_eq!(obs.plan.as_deref(), Some("Ultra"));
 }
 
 /// A codex `usage_cache.json`: the plan in `codex_plan`, a blocked account, two

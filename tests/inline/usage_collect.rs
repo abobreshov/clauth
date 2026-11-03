@@ -347,7 +347,7 @@ fn claude_oauth_profile_projects_from_its_usage_cache() {
     assert_eq!(o.provider, "Anthropic");
     assert_eq!(o.label, "work");
     assert!(o.active);
-    assert_eq!(o.plan.as_deref(), Some("Max 20x"));
+    assert_eq!(o.plan.as_deref(), Some("Ultra"));
     assert_eq!(o.freshness, Freshness::Fresh);
     assert_eq!(o.observed_at, Some(Timestamp::from_ms(now - 60_000)));
     assert_eq!(

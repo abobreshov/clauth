@@ -20,7 +20,7 @@
 
 **Can Claude Code switch accounts automatically when I hit the 5-hour limit?** Put the accounts in the fallback chain. tollgate switches to the next member with headroom the moment the active one crosses its threshold, from the TUI or from `tollgate daemon` with the TUI closed. [Auto-switch](Auto-Switch).
 
-**Does it work with Pro, Max, Team, and Enterprise?** Yes, plan tier detected automatically, Max 5x and 20x included. Endpoint profiles cover the Anthropic API and any compatible proxy.
+**Does it work with Pro, Max, Ultra, Team, and Enterprise?** Yes, plan tier detected automatically: the label is the plan name Anthropic's own profile sends when it sends one, else tollgate's map of Pro, Max, Ultra, Team, and Enterprise. Endpoint profiles cover the Anthropic API and any compatible proxy.
 
 **Where does tollgate store my credentials?** Under `~/.tollgate/`, owner-only on Unix. Claude tokens go to Anthropic and codex tokens to OpenAI, nowhere else. [Security](Security).
 
@@ -36,7 +36,7 @@
 
 ## When something looks wrong
 
-**An account shows 0% but I have been using it.** The 5h window opens on a real inference call, and a usage poll does not trip it. On an account the usage probe reads, each usage read is a probe, which is inference and may open the window. Either the window genuinely has not started, or the reading is cached. The refresh countdown on the Overview tab turns yellow on last-known numbers and red when the last fetch failed.
+**An account shows 0% but I have been using it.** The 5h window opens on a real inference call, and a usage poll does not trip it. On an account the usage probe reads, each usage read is a probe, which is inference and may open the window (a plan with no 5h limit has none to open). Either the window genuinely has not started, or the reading is cached. The refresh countdown on the Overview tab turns yellow on last-known numbers and red when the last fetch failed.
 
 **Usage numbers are stuck.** Only one tollgate instance fetches at a time. If a daemon holds the lease, an open TUI reads its results instead of polling itself, and picks the lease back up within a tick of the daemon exiting. `tollgate daemon --status` says whether one is up.
 

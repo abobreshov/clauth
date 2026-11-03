@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2 — 2026-11-03
+
+### Upstream port
+
+- Ported upstream clauth's Ultra-plan fixes on their own: `c8eefc39`, `4fb38153` and `cea23aac` with their docs commits `ab351395`, `de9a8666` and `30f605b1` (upstream 0.18.1 and 0.18.2). The rest of the backlog since `d01f99cb` waits for a later release.
+  - **Plan names** follow what Anthropic sells since 2026-10-30: the 20x plan reads `Ultra` and the 5x plan `Max`, on every surface (Overview, Usage, Setup, `tollgate list`, `status.json`, the `profiles` MCP tool, and the observation model behind `tollgate usage`, waybar and the agent API). A valid `plan_display_name` from `/profile` wins over the local map, except on a Free tier. A stored tier this build cannot read no longer drops the whole usage cache.
+  - **A plan with no 5h limit** (a verified Ultra account): a `/usage` body with a weekly window and no 5h window marks the plan; the mark rides `usage_cache.json` and only a later body clears it. A marked account gets no auto-start kick, no `switch` prime and no auto-start queue slot. The Usage tab's 5h row reads `no limit on this plan` instead of `—`, with no bar and no `usage auto-start` countdown, and the Setup tab's auto-start and usage-probe hints say so.
+  - Not yet: the Overview's 5h column still shows `—` for such an account, and the observation model behind `tollgate usage`, waybar and the agent API leaves the window out without naming the plan; a tollgate-only follow-up covers both.
+  - After installing 0.5.2, restart the daemon (`systemctl --user restart tollgate-daemon.service`): only a 0.5.2 process's usage fetch writes the mark, and a 0.5.1 daemon left running keeps writing caches without it, so `tollgate switch` would keep priming.
+
 ## 0.5.1 — 2026-10-31
 
 ### Security

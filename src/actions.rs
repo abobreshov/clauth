@@ -758,10 +758,11 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
         switch_profile(&config, canonical)?;
     }
 
-    // Prime the 5h window if opted in. Kicks with the current access token and
-    // rotates once on a 401/429. One-shot — the CLI has no scheduler tick to
-    // re-arm against, so no side channels.
-    {
+    // Prime the 5h window if opted in, unless the stored body says the plan has
+    // no 5h limit (there is no window to open). Kicks with the current access
+    // token and rotates once on a 401/429. One-shot — the CLI has no scheduler
+    // tick to re-arm against, so no side channels.
+    if !crate::usage::no_five_hour_limit_cached(canonical) {
         let _spinner = Spinner::start("tollgate: priming usage window");
         let _ = oauth::prime_window(&config, canonical);
     }

@@ -8,7 +8,7 @@
 //! then one card per quota window and money meter:
 //!
 //! ```text
-//! work · Anthropic · Max 20x · ● active
+//! work · Anthropic · Ultra · ● active
 //!   Session · 5h                                 resets in 3h 05m (13:53)
 //!   ████████████████│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         42% ↑
 //!   40% elapsed · 2 pts ahead

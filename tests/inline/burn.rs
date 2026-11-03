@@ -79,6 +79,7 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         codex_additional_windows: Vec::new(),
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     }
 }
 

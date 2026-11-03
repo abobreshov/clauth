@@ -1199,11 +1199,13 @@ fn plan_from_profile_reads_tier_and_canceled_status() {
 fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     let prev_pro = PlanInfo {
         tier: PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
     };
@@ -1244,16 +1246,373 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     );
 }
 
+/// The `/usage` body of a plan with no 5h limit, trimmed from a real capture
+/// (2026-10-31): `five_hour` is null and `limits[]` holds no `session` entry.
+const NO_FIVE_HOUR_BODY: &str = r#"{
+  "five_hour": null,
+  "seven_day": {"utilization": 1.0, "resets_at": "2026-11-07T16:00:00.207828+00:00"},
+  "limits": [
+    {"kind": "weekly_all", "group": "weekly", "percent": 1, "resets_at": "2026-11-07T16:00:00.207828+00:00", "scope": null, "is_active": true},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+  ]
+}"#;
+
 #[test]
-fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
-    assert_eq!(
-        PlanTier::Max(Some(5)).short_label().as_deref(),
-        Some("Max 5x")
+fn a_body_with_no_five_hour_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let info = assemble_usage(Ok(NO_FIVE_HOUR_BODY.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.no_five_hour_limit,
+        "a null five_hour with no session limit marks the plan as having no 5h limit"
     );
+    assert_eq!(
+        info.seven_day.as_ref().map(|w| w.utilization),
+        Some(1.0),
+        "the weekly window still reads"
+    );
+}
+
+#[test]
+fn an_idle_five_hour_window_is_not_a_missing_one() {
+    // An idle account's window: 0% with a reset ~5h ahead, as `limits[]` sends it.
+    let idle = r#"{
+      "five_hour": {"utilization": 0.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"},
+      "limits": [
+        {"kind": "session", "percent": 0, "resets_at": "2026-10-31T21:00:00+00:00"},
+        {"kind": "weekly_all", "percent": 3, "resets_at": "2026-11-07T16:00:00+00:00"}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(idle.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a 0% session window is a 5h limit"
+    );
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(0.0));
+
+    // The legacy shape: a top-level five_hour object and no limits[] at all.
+    let legacy = r#"{
+      "five_hour": {"utilization": 12.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"}
+    }"#;
+    let info = assemble_usage(Ok(legacy.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a legacy five_hour object is a 5h limit"
+    );
+
+    // A session limit with the top-level field null still counts.
+    let session_only = r#"{
+      "five_hour": null,
+      "limits": [{"kind": "session", "percent": 40, "resets_at": "2026-10-31T21:00:00+00:00"}]
+    }"#;
+    let info = assemble_usage(Ok(session_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a session limit alone is a 5h limit"
+    );
+
+    // A body naming no window at all says nothing about the plan.
+    let info = assemble_usage(Ok("{}".to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a body with no weekly window either is no evidence of a plan without a 5h limit"
+    );
+}
+
+/// The verdict keys on any weekly window, not on the aggregate one: a body
+/// whose only weekly limits are per-model (`weekly_scoped`) entries still says
+/// the plan has no 5h limit.
+#[test]
+fn a_body_with_only_a_scoped_weekly_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let scoped_only = r#"{
+      "five_hour": null,
+      "limits": [
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(scoped_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.seven_day.is_none(),
+        "the body sends no aggregate weekly window"
+    );
+    assert_eq!(
+        info.weekly_scoped.len(),
+        1,
+        "the per-model weekly window still reads"
+    );
+    assert!(
+        info.no_five_hour_limit,
+        "a per-model weekly window is a weekly window: the plan has no 5h limit"
+    );
+}
+
+/// The mark is a field of the stored body, so it rides `usage_cache.json`'s
+/// serde: a marked entry round-trips marked, and an unmarked one writes no key
+/// at all (a cold cache file never grows a false verdict).
+#[test]
+fn a_marked_usage_info_round_trips_through_the_cache_serde_and_an_unmarked_one_writes_no_key() {
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&marked).expect("a marked body serializes");
+    assert_eq!(
+        json.get("no_five_hour_limit"),
+        Some(&serde_json::Value::Bool(true)),
+        "a marked body writes the key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("a marked body parses");
+    assert!(back.no_five_hour_limit, "the mark survives the round trip");
+
+    let json = serde_json::to_value(UsageInfo::default()).expect("an unmarked body serializes");
+    assert!(
+        json.get("no_five_hour_limit").is_none(),
+        "an unmarked body writes no key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("an unmarked body parses");
+    assert!(!back.no_five_hour_limit, "an absent key reads unmarked");
+}
+
+#[test]
+fn short_label_drops_claude_prefix() {
     assert_eq!(PlanTier::Max(None).short_label().as_deref(), Some("Max"));
     assert_eq!(PlanTier::Pro.short_label().as_deref(), Some("Pro"));
     // an unknown tier carries no label so the MCP omits it entirely.
     assert_eq!(PlanTier::Unknown.short_label(), None);
+}
+
+/// The wire still sends `claude_max` + `default_claude_max_20x` for the plan
+/// this label names Ultra, and `_5x` for the one it names Max.
+#[test]
+fn the_twenty_x_max_tier_reads_as_ultra() {
+    assert_eq!(
+        PlanTier::Max(Some(20)).short_label().as_deref(),
+        Some("Ultra")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(20)).display().as_deref(),
+        Some("Claude Ultra")
+    );
+}
+
+#[test]
+fn the_five_x_max_tier_reads_as_max() {
+    assert_eq!(PlanTier::Max(Some(5)).short_label().as_deref(), Some("Max"));
+    assert_eq!(
+        PlanTier::Max(Some(5)).display().as_deref(),
+        Some("Claude Max")
+    );
+    assert_eq!(PlanTier::Max(None).display().as_deref(), Some("Claude Max"));
+}
+
+/// Only the two renamed multipliers move; any other figure the wire sends
+/// keeps naming itself.
+#[test]
+fn another_max_multiplier_keeps_its_figure() {
+    assert_eq!(
+        PlanTier::Max(Some(50)).short_label().as_deref(),
+        Some("Max 50x")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(50)).display().as_deref(),
+        Some("Claude Max 50x")
+    );
+}
+
+#[test]
+fn an_ultra_organization_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_profile(
+            Some("claude_ultra"),
+            false,
+            false,
+            Some("default_claude_ultra")
+        ),
+        PlanTier::Ultra
+    );
+    assert_eq!(PlanTier::Ultra.short_label().as_deref(), Some("Ultra"));
+    assert_eq!(PlanTier::Ultra.display().as_deref(), Some("Claude Ultra"));
+}
+
+#[test]
+fn an_ultra_token_stamp_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_subscription_type(Some("ultra")),
+        PlanTier::Ultra
+    );
+}
+
+/// Claude Code 2.1.314 maps no `claude_ultra` organization to a
+/// `subscriptionType` (its map holds max, pro, enterprise and team only), so a
+/// login mints no stamp Claude Code would not mint itself.
+#[test]
+fn an_ultra_login_classifies_its_plan_and_mints_no_subscription_stamp() {
+    let raw: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"uuid-ultra","has_claude_max":false,"has_claude_pro":false},
+            "organization":{"organization_type":"claude_ultra","rate_limit_tier":"default_claude_ultra"}}"#,
+    )
+    .expect("fixture parses");
+    let probe = login_profile_from_raw(raw);
+    assert_eq!(probe.plan.tier, PlanTier::Ultra);
+    assert_eq!(probe.subscription_type, None);
+    assert_eq!(
+        probe.rate_limit_tier.as_deref(),
+        Some("default_claude_ultra"),
+        "the raw tier still rides through verbatim"
+    );
+}
+
+fn max_body_named(display_name: &str) -> RawProfile {
+    serde_json::from_value(serde_json::json!({
+        "organization": {
+            "organization_type": "claude_max",
+            "rate_limit_tier": "default_claude_max_5x",
+            "plan_display_name": display_name,
+        }
+    }))
+    .expect("fixture parses")
+}
+
+/// The server's own plan name outranks the local map, on both label forms.
+#[test]
+fn the_server_plan_name_wins_over_the_local_map() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    assert_eq!(plan.tier, PlanTier::Max(Some(5)));
+    assert_eq!(plan.short_label().as_deref(), Some("Ultra Lite"));
+    assert_eq!(plan.display().as_deref(), Some("Claude Ultra Lite"));
+}
+
+/// The name Claude Code accepts: 1 to 40 characters, letters and digits at
+/// both ends (a `+` may also end it), letters, digits, space, `.`, `+` and `-`
+/// between.
+#[test]
+fn a_server_plan_name_at_the_validators_edges_is_kept() {
+    let forty = "A".repeat(40);
+    for name in [
+        "U",
+        "Max 20x",
+        "Pro+",
+        "Ultra 2.0",
+        "Team-Plus",
+        "Ültra",
+        forty.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some(name),
+            "{name:?} is a valid plan name"
+        );
+        assert_eq!(
+            plan.display(),
+            Some(format!("Claude {name}")),
+            "{name:?} is a valid plan name"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_server_plan_name_falls_back_to_the_local_map() {
+    let forty_one = "A".repeat(41);
+    for name in [
+        "",
+        "   ",
+        " Ultra",
+        "Ultra ",
+        "-Ultra",
+        "Ultra.",
+        "Max!",
+        "Ultra\u{1b}[31m",
+        "Ultra\nMax",
+        "Ultra\u{e000}",
+        forty_one.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some("Max"),
+            "{name:?} is not a plan name"
+        );
+        assert_eq!(
+            plan.display().as_deref(),
+            Some("Claude Max"),
+            "{name:?} is not a plan name"
+        );
+    }
+}
+
+/// The server's name is part of the cached plan: a read back off
+/// `usage_cache.json` still carries it.
+#[test]
+fn the_server_plan_name_survives_the_cache_round_trip() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    let text = serde_json::to_string(&plan).expect("serializes");
+    let back: PlanInfo = serde_json::from_str(&text).expect("reads back");
+    assert_eq!(back.short_label().as_deref(), Some("Ultra Lite"));
+}
+
+/// A tier this build does not know (a newer tollgate's variant, in either serde
+/// shape) reads as `Unknown` and keeps the rest of the plan, instead of failing
+/// the whole `usage_cache.json` read.
+#[test]
+fn an_unknown_stored_tier_reads_unknown_and_keeps_the_rest() {
+    for tier in [serde_json::json!("Mega"), serde_json::json!({"Mega": 3})] {
+        let mut v = serde_json::to_value(UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Pro,
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("serializes");
+        v["plan"]["tier"] = tier.clone();
+        let read = serde_json::from_value::<UsageInfo>(v);
+        assert!(read.is_ok(), "{tier} fails the whole read: {read:?}");
+        let plan = read.expect("checked").plan.expect("the plan survives");
+        assert_eq!(plan.tier, PlanTier::Unknown, "{tier}");
+        assert_eq!(
+            plan.subscription_status.as_deref(),
+            Some("active"),
+            "{tier}"
+        );
+    }
+}
+
+#[test]
+fn an_ultra_tier_round_trips_through_the_cache() {
+    let plan = PlanInfo {
+        tier: PlanTier::Ultra,
+        ..Default::default()
+    };
+    let back: PlanInfo =
+        serde_json::from_str(&serde_json::to_string(&plan).expect("serializes")).expect("reads");
+    assert_eq!(back.tier, PlanTier::Ultra);
+}
+
+/// The free tier is the organization's own word that no paid plan is live (a
+/// canceled subscription drops to it): a paid name beside it never wins,
+/// whatever the subscription status says.
+#[test]
+fn a_free_tier_outranks_a_server_plan_name() {
+    for status in [Some("canceled"), Some("active"), None] {
+        let plan = PlanInfo {
+            tier: PlanTier::Free,
+            plan_display_name: Some("Ultra".to_string()),
+            subscription_status: status.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(plan.short_label().as_deref(), Some("Free"), "{status:?}");
+        assert_eq!(plan.display().as_deref(), Some("Claude Free"), "{status:?}");
+    }
 }
 
 /// A credential-less / no-claim profile must NOT fabricate a paid tier: `None`

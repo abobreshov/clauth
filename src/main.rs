@@ -1573,7 +1573,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         .map_err(cli_err)?;
     outln!(
         "tollgate: login complete.\n{}",
-        oauth_login::login_summary(&outcome.credentials)
+        oauth_login::login_summary(&outcome.credentials, outcome.plan.as_ref())
     );
     if let Some(identity) = &outcome.identity
         && let Some(email) = &identity.email

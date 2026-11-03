@@ -436,7 +436,7 @@ pub(crate) struct AccountObservation {
     /// Provider display name (`Anthropic`, `OpenRouter`, `OpenAI`), from
     /// [`SourceId::display_name`] unless the producer knows better.
     pub(crate) provider: String,
-    /// The plan / tier label (`Max 5x`, `plus`, `pro-legacy`), provider value
+    /// The plan / tier label (`Ultra`, `plus`, `pro-legacy`), provider value
     /// first, else a user-configured label; `None` when neither exists.
     pub(crate) plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

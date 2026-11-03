@@ -15,7 +15,7 @@ An account reaches tollgate one of three ways:
 
 | Provider | `source` | Auth kind | As a profile | As a monitor | What is measured | Chain-eligible windows |
 |----------|----------|-----------|--------------|--------------|------------------|------------------------|
-| Anthropic (Claude Pro / Max / Team / Enterprise) | `anthropic_oauth` | subscription | yes | no | 5h, 7d, per-model 7d windows; extra-usage spend and cap | 5h, 7d |
+| Anthropic (Claude Pro / Max / Ultra / Team / Enterprise) | `anthropic_oauth` | subscription | yes | no | 5h, 7d, per-model 7d windows; extra-usage spend and cap | 5h, 7d |
 | OpenAI codex (ChatGPT login) | `codex` | subscription | codex profile | no | 5h, 7d; banked usage-limit resets | 5h, 7d, on the codex chain |
 | Ollama Cloud | `ollama_cloud` | api key | yes | `ollama_cloud`, or `provider` with `OllamaCloud` | legacy plans: 5h and 7d; new pricing: one `month` window; spend over the last 4 weeks; per-model request counts | 5h, 7d (legacy only); `month` never |
 | Ollama daemon (`127.0.0.1:11434`) | `ollama` | native login | yes | no | nothing: the daemon has no usage route | none |
@@ -34,7 +34,7 @@ An account reaches tollgate one of three ways:
 
 ## Anthropic
 
-Claude Pro, Max, Team and Enterprise logins. Leave `base_url` blank and add the account with `tollgate capture <name>` or `tollgate login <name>` ([Quickstart](Quickstart)). tollgate polls `api.anthropic.com/api/oauth/usage` with the profile's access token on the refresh interval and reads the plan tier from `/api/oauth/profile`. Behaviour is unchanged from clauth: see [Configuration](Configuration#account-types) and [Auto-switch](Auto-Switch).
+Claude Pro, Max, Ultra, Team and Enterprise logins. Leave `base_url` blank and add the account with `tollgate capture <name>` or `tollgate login <name>` ([Quickstart](Quickstart)). tollgate polls `api.anthropic.com/api/oauth/usage` with the profile's access token on the refresh interval and reads the plan tier from `/api/oauth/profile`. Behaviour is unchanged from clauth: see [Configuration](Configuration#account-types) and [Auto-switch](Auto-Switch).
 
 In guest mode a profile is still created by `tollgate login`, but it is never linked into `~/.claude`; run it with `tollgate start <name>`.
 

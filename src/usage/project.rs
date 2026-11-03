@@ -198,7 +198,7 @@ pub(crate) fn apply_oauth_usage(obs: &mut AccountObservation, usage: &UsageInfo,
     obs.windows = usage_windows(usage, now_secs);
     obs.money = usage_money(usage);
     if obs.plan.is_none() {
-        obs.plan = usage.plan.as_ref().and_then(|p| p.tier.short_label());
+        obs.plan = usage.plan.as_ref().and_then(|p| p.short_label());
     }
     if obs.failure.is_none() && usage.plan.as_ref().is_some_and(|p| p.is_canceled()) {
         obs.failure = Some(Failure::new(

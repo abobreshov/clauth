@@ -2,6 +2,7 @@
 //! breakdown on the right: a header (plan, active marker, per-account refresh
 //! status / countdown), then every window, reset timers, and extra credits.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use ratatui::Frame;
@@ -15,8 +16,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{
-    NO_DATA, ResetFmt, activity_verb, is_past_reset, relative_age, reset_in_secs_at, reset_phrase,
-    spinner_frame, spinner_style, truncate,
+    NO_DATA, ResetFmt, activity_verb, grapheme_cells, is_past_reset, relative_age,
+    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
@@ -29,9 +30,10 @@ use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
-    WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
-    now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh, switch_grade_kick_lifts,
+    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
+    UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
+    kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
+    switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -40,6 +42,9 @@ const KEY_GUTTER: usize = 2;
 /// The fix for a third-party profile no leg will ever fetch — the status
 /// block's `[ no key ]` hint and the empty body share these exact words.
 const KEYLESS_FIX: &str = "no api key set, add one on the setup tab";
+/// The 5h row's value on a plan with no 5h limit: the plan's shape in place of
+/// a figure tollgate never read.
+const NO_FIVE_HOUR_LIMIT: &str = "no limit on this plan";
 
 /// Config-derived diagnostic flags for the shown profile, gathered under the
 /// config guard in [`draw_usage_detail`] so [`status_lines`] stays lock-free.
@@ -312,9 +317,13 @@ fn draw_usage_detail(
                 credit_refused_at: app.credit_refusals.get(&profile.name).map(|r| r.at_ms),
             }
         },
-        queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor, |n| {
-            crate::fallback::refuses_service_from_usage(n, &readings.oauth)
-        })
+        queue_slot: QueueView::new(
+            &cfg,
+            &kick_lifts,
+            queue_anchor,
+            |n| crate::fallback::refuses_service_from_usage(n, &readings.oauth),
+            |n| readings.no_five_hour_limit(n.as_str()),
+        )
         .slot(&profile.name),
         peak: app.peak_state_for(profile),
     };
@@ -628,9 +637,11 @@ fn build_usage_lines(
     }
 
     // Fill the 5h recent-burn rate; the 7d average pace is already set by
-    // collect_stats.
+    // collect_stats. A phrase-valued row takes none: history can still carry a
+    // `5h` series under the plan verdict, and `· X %/h` beside `no limit on this
+    // plan` would read as a window the plan does not have.
     for stat in &mut stats {
-        if !stat.label.starts_with("7d") {
+        if stat.value.is_none() && !stat.label.starts_with("7d") {
             stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r);
         }
     }
@@ -708,6 +719,10 @@ struct Stat {
     /// and no `%`/`$` figures — the billing-off spend block, whose stale cap
     /// must not read as live.
     note: Option<&'static str>,
+    /// A phrase standing where the `%` would print (`no limit on this plan`),
+    /// in `TEXT_DIM` with no bar and no figure — a window the plan does not
+    /// have, never one tollgate failed to read.
+    value: Option<&'static str>,
 }
 
 /// Seconds until the window hits 100% at the current burn rate.
@@ -757,7 +772,10 @@ impl Stat {
         // Natural width — `header_pad` right-aligns the whole block to `pct_col`,
         // so the `%` lands in the same column every row without padding the
         // number. (A fixed `{:>3.0}` width added stray spaces after the amount.)
-        let pct_str = self.pct.map_or_else(|| NO_DATA.to_string(), format_pct);
+        let pct_str: Cow<'static, str> = match self.value {
+            Some(value) => Cow::Borrowed(value),
+            None => Cow::Owned(self.pct.map_or_else(|| NO_DATA.to_string(), format_pct)),
+        };
 
         // The amount sits in its own right-aligned column just left of the %,
         // with a 2-space gap when present.
@@ -775,7 +793,9 @@ impl Stat {
         let filled = self.pct.map_or(0, |p| {
             (((p / 100.0) * bar_width as f64).round() as usize).min(bar_width)
         });
-        let pct_style = if unread {
+        let pct_style = if self.value.is_some() {
+            theme::dim()
+        } else if unread {
             theme::faint()
         } else {
             self.color.add_modifier(Modifier::BOLD)
@@ -845,7 +865,7 @@ impl Stat {
             label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
-        let pct_cells = Span::raw(&pct_str).width();
+        let pct_cells = Span::raw(pct_str.as_ref()).width();
         let fits =
             Span::raw(&self.label).width() + max_rate_w + amount_section_w + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
@@ -888,7 +908,9 @@ impl Stat {
             dropped.push(Span::styled(pct_str, pct_style));
             out.push(Line::from(dropped));
         }
-        out.push(Line::from(bar_line));
+        if self.value.is_none() {
+            out.push(Line::from(bar_line));
+        }
         out
     }
 }
@@ -975,6 +997,7 @@ fn make_window_stat(
         pace_pct,
         reset_secs,
         note: None,
+        value: None,
     }
 }
 
@@ -997,7 +1020,28 @@ fn fmt_credit_amt(sym: &str, v: Option<f64>) -> String {
 fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<Stat> {
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
+    // The 5h row STAYS on a plan with no 5h limit: its value names the plan in
+    // the figure's place. Any 5h window a stored body still carries under the
+    // mark is not shown — the plan verdict is what the account's own body said.
+    if usage.no_five_hour_limit {
+        stats.push(Stat {
+            label: LABEL_5H.to_string(),
+            pct: None,
+            color: theme::dim(),
+            trailing: String::new(),
+            amount: String::new(),
+            burn_rate: None,
+            rate_unit: "h",
+            pace_pct: None,
+            reset_secs: None,
+            note: None,
+            value: Some(NO_FIVE_HOUR_LIMIT),
+        });
+    }
     for (label, w) in usage.windows() {
+        if usage.no_five_hour_limit && label == LABEL_5H {
+            continue;
+        }
         let trailing = reset_in_secs_at(w, now_secs)
             .map(|secs| format!("  {}", reset_phrase(secs, reset_fmt)))
             .unwrap_or_default();
@@ -1062,6 +1106,7 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
             pace_pct: None,
             reset_secs: None,
             note: None,
+            value: None,
         });
     }
     // Per-period extra-credit breakdowns (`daily`/`weekly`) — shape
@@ -1104,6 +1149,7 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
                 pace_pct: None,
                 reset_secs: None,
                 note: None,
+                value: None,
             });
         }
     }
@@ -1135,6 +1181,7 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
                 pace_pct: None,
                 reset_secs: None,
                 note: None,
+                value: None,
             });
         } else if spend.is_visible() {
             // Billing is off but the wire left a stale cap behind; render only a
@@ -1150,6 +1197,7 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
                 pace_pct: None,
                 reset_secs: None,
                 note: Some("billing off"),
+                value: None,
             });
         }
     }
@@ -1228,7 +1276,7 @@ fn header_lines(
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
     // as a real plan on the one row an operator checks their plan from.
-    let plan_w = plan.as_deref().map(|s| s.chars().count()).unwrap_or(1);
+    let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
@@ -1236,7 +1284,10 @@ fn header_lines(
     let plan_key = key_span("plan");
     let left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
-    if profile.auto_start {
+    // A plan with no 5h limit has no window the kick could open, so the
+    // countdown would name a kick that never fires.
+    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
+    if profile.auto_start && !no_five_hour_limit {
         plan_spans.extend(kick_spans(
             &kick_text(profile, header, readings),
             left_w,
@@ -1412,7 +1463,8 @@ fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
 }
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into
-/// `auto_start`, queue toggle on or off. The value is THIS account's next
+/// `auto_start` except one whose plan has no 5h limit (there is no window the
+/// kick could open), queue toggle on or off. The value is THIS account's next
 /// kick: with a queue slot, the LATER of the queue's next-opening estimate
 /// and the account's own 5h window reset — the kick fires once the queue
 /// gate has cleared AND this window has lapsed, so either clock can delay

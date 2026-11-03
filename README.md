@@ -20,9 +20,9 @@ tollgate monitors and manages your AI subscriptions and spending from one termin
 
 ## Features
 
-- **Switch** Claude Code accounts in one keypress or `tollgate <name>`: OAuth (Pro / Max / Team / Enterprise) or a custom API endpoint, plan tier detected for you
+- **Switch** Claude Code accounts in one keypress or `tollgate <name>`: OAuth (Pro / Max / Ultra / Team / Enterprise) or a custom API endpoint, plan tier detected for you
 - **Monitor** live 5h / 7d rate-limit bars, provider balances and quotas, a token dashboard with API-equivalent cost, and the Claude status-incident feed
-- **Auto-switch** down a fallback chain when an account hits its limit, with weekly-window and spend-ceiling gates; opted-in accounts queue their auto-start so their 5h windows open apart
+- **Auto-switch** down a fallback chain when an account hits its limit, with weekly-window and spend-ceiling gates; opted-in accounts on a plan with a 5h limit queue their auto-start so their 5h windows open apart
 - **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins or hooks
 - **From inside Claude**: the MCP plugin lets a live session list accounts, switch, or delegate a prompt to another account, tells it when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a paired phone
 - **Headless**: `tollgate daemon` runs the refresh and auto-switch loop with no TUI, publishes `status.json`, and can serve that feed, the account switch, herdr panes, Claude Code session history, and prompts and interrupts into a session to another machine over HTTPS with `--listen`
@@ -112,7 +112,7 @@ Every command and flag: [Quickstart](wiki/Quickstart.md).
 
 | Provider | `source` | Auth | Measured | Chain-eligible windows |
 |----------|----------|------|----------|------------------------|
-| Claude Pro / Max / Team / Enterprise | `anthropic_oauth` | subscription OAuth | 5h, 7d, per-model 7d, extra-usage spend | 5h, 7d |
+| Claude Pro / Max / Ultra / Team / Enterprise | `anthropic_oauth` | subscription OAuth | 5h, 7d, per-model 7d, extra-usage spend | 5h, 7d |
 | codex (ChatGPT) | `codex` | subscription OAuth | 5h, 7d, banked usage-limit resets | 5h, 7d (codex chain) |
 | Ollama Cloud | `ollama_cloud` | api key | legacy 5h / 7d, or a monthly pool; 4-week spend; per-model requests | 5h, 7d (legacy only) |
 | Ollama daemon | `ollama` | the daemon's own login | nothing (no usage route) | none |

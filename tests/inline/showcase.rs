@@ -294,6 +294,7 @@ fn oauth_profile(
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
         }),
@@ -311,6 +312,7 @@ fn oauth_profile(
         codex_additional_windows: Vec::new(),
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     };
     (
         Profile {

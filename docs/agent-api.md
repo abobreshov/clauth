@@ -158,7 +158,7 @@ Additive `key_health`, `note`, and window `attribution` are omitted when absent.
   "auth": "subscription",
   "label": "work",
   "provider": "Anthropic",
-  "plan": "Max 20x",
+  "plan": "Ultra",
   "active": true,
   "disabled": false,
   "origin": "profile",
